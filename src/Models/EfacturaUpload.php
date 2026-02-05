@@ -48,6 +48,12 @@ use Illuminate\Support\Carbon;
  */
 class EfacturaUpload extends Model
 {
+    protected $attributes = [
+        'is_extern' => false,
+        'is_self_billed' => false,
+        'is_b2c' => false,
+    ];
+
     protected $fillable = [
         'efactura_token_id',
         'uploadable_type',

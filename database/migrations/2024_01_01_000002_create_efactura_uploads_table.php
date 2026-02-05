@@ -39,7 +39,6 @@ return new class extends Migration
             $table->timestamp('processed_at')->nullable();
             $table->timestamps();
 
-            $table->index(['uploadable_type', 'uploadable_id']);
             $table->index('status');
             $table->index('upload_index');
         });

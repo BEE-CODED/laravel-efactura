@@ -8,8 +8,6 @@ parameters:
     ignoreErrors:
         # SDK methods/classes not defined in SDK's PHPStan stubs
         - '#Call to an undefined static method BeeCoded\\EFacturaSdk\\Facades\\EFactura::#'
-        - '#Instantiated class BeeCoded\\EFacturaSdk\\Data\\Messages\\ListMessagesParamsData not found#'
-        - '#Parameter .* of method .* expects BeeCoded\\EFacturaSdk\\Data\\Invoice\\ListMessagesParamsData#'
         - '#Access to an undefined property BeeCoded\\EFacturaSdk\\Data\\Response\\ListMessagesResponseData::#'
         # Trait analysis (expected)
         -

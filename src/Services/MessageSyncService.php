@@ -13,7 +13,7 @@ namespace BeeCoded\EFactura\Services;
 
 use BeeCoded\EFactura\Models\EfacturaMessage;
 use BeeCoded\EFactura\Models\EfacturaToken;
-use BeeCoded\EFacturaSdk\Data\Messages\ListMessagesParamsData;
+use BeeCoded\EFacturaSdk\Data\Invoice\ListMessagesParamsData;
 use BeeCoded\EFacturaSdk\Enums\MessageFilter;
 use BeeCoded\EFacturaSdk\Support\Validators\VatNumberValidator;
 use Illuminate\Support\Facades\Log;
@@ -31,6 +31,7 @@ class MessageSyncService
     {
         try {
             $params = new ListMessagesParamsData(
+                cif: $token->cui,
                 days: 60,
                 filter: $filter,
             );
