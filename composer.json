@@ -1,0 +1,52 @@
+{
+    "name": "bee-coded/laravel-efactura",
+    "description": "Laravel wrapper for e-Factura SDK with token storage, job scheduling, and easy model integration",
+    "keywords": ["laravel", "efactura", "anaf", "romania", "invoice", "ubl"],
+    "license": "Apache-2.0",
+    "authors": [
+        {
+            "name": "BEE CODED",
+            "email": "dev.ttl@beecoded.ro",
+            "homepage": "https://www.beecoded.io/",
+            "role": "Developer"
+        }
+    ],
+    "require": {
+        "php": "^8.4",
+        "bee-coded/laravel-efactura-sdk": "^0.2",
+        "illuminate/contracts": "^11.0|^12.0",
+        "illuminate/database": "^11.0|^12.0",
+        "illuminate/support": "^11.0|^12.0"
+    },
+    "require-dev": {
+        "larastan/larastan": "^3.0",
+        "laravel/pint": "^1.18",
+        "orchestra/testbench": "^9.0|^10.0",
+        "phpunit/phpunit": "^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "BeeCoded\\EFactura\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "BeeCoded\\EFactura\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "BeeCoded\\EFactura\\EfacturaServiceProvider"
+            ],
+            "aliases": {
+                "EFactura": "BeeCoded\\EFactura\\Facades\\EFactura"
+            }
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

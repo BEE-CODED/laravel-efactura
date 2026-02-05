@@ -1,0 +1,20 @@
+includes:
+    - vendor/larastan/larastan/extension.neon
+
+parameters:
+    paths:
+        - src
+    level: 5
+    ignoreErrors:
+        # SDK methods/classes not defined in SDK's PHPStan stubs
+        - '#Call to an undefined static method BeeCoded\\EFacturaSdk\\Facades\\EFactura::#'
+        - '#Instantiated class BeeCoded\\EFacturaSdk\\Data\\Messages\\ListMessagesParamsData not found#'
+        - '#Parameter .* of method .* expects BeeCoded\\EFacturaSdk\\Data\\Invoice\\ListMessagesParamsData#'
+        - '#Access to an undefined property BeeCoded\\EFacturaSdk\\Data\\Response\\ListMessagesResponseData::#'
+        # Trait analysis (expected)
+        -
+            identifier: trait.unused
+        # Interface method from Model
+        - '#Call to an undefined method BeeCoded\\EFactura\\Contracts\\EFacturaUploadableInterface::getKey#'
+    excludePaths:
+        - vendor
