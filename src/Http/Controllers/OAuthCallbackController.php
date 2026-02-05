@@ -13,7 +13,7 @@ namespace BeeCoded\EFactura\Http\Controllers;
 
 use BeeCoded\EFactura\Events\TokenStored;
 use BeeCoded\EFactura\Services\TokenService;
-use BeeCoded\EFacturaSdk\Facades\EFactura as EFacturaSdk;
+use BeeCoded\EFacturaSdk\Facades\EFacturaSdkAuth;
 use BeeCoded\EFacturaSdk\Support\Validators\VatNumberValidator;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -81,7 +81,7 @@ class OAuthCallbackController extends Controller
 
         try {
             // Exchange code for tokens using SDK
-            $tokens = EFacturaSdk::exchangeCodeForTokens($code);
+            $tokens = EFacturaSdkAuth::exchangeCodeForToken($code);
 
             // Store tokens
             $token = $this->tokenService->storeToken($cui, $tokens);

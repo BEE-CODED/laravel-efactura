@@ -6,8 +6,7 @@ parameters:
         - src
     level: 5
     ignoreErrors:
-        # SDK methods/classes not defined in SDK's PHPStan stubs
-        - '#Call to an undefined static method BeeCoded\\EFacturaSdk\\Facades\\EFactura::#'
+        # SDK response properties accessed dynamically
         - '#Access to an undefined property BeeCoded\\EFacturaSdk\\Data\\Response\\ListMessagesResponseData::#'
         # Trait analysis (expected)
         -

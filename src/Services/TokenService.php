@@ -14,7 +14,7 @@ namespace BeeCoded\EFactura\Services;
 use BeeCoded\EFactura\Events\TokenRefreshed;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFacturaSdk\Data\Auth\OAuthTokensData;
-use BeeCoded\EFacturaSdk\Facades\EFactura as EFacturaSdk;
+use BeeCoded\EFacturaSdk\Facades\EFacturaSdkAuth;
 use BeeCoded\EFacturaSdk\Services\ApiClients\EFacturaClient;
 use BeeCoded\EFacturaSdk\Support\Validators\VatNumberValidator;
 use Illuminate\Support\Facades\Cache;
@@ -71,7 +71,7 @@ class TokenService
             'created_at' => now()->timestamp,
         ]);
 
-        return EFacturaSdk::getAuthorizationUrl(
+        return EFacturaSdkAuth::getAuthorizationUrl(
             new \BeeCoded\EFacturaSdk\Data\Auth\AuthUrlSettingsData(
                 state: [
                     'cui' => $cui,
