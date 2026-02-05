@@ -52,7 +52,6 @@ class EfacturaServiceProvider extends ServiceProvider
             $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
 
             $this->commands([
-                Console\Commands\EfacturaScheduleCommand::class,
                 Console\Commands\EfacturaUploadCommand::class,
                 Console\Commands\EfacturaStatusCommand::class,
                 Console\Commands\EfacturaSyncCommand::class,

@@ -5,7 +5,7 @@ A Laravel package that wraps [bee-coded/laravel-efactura-sdk](https://packagist.
 ## Features
 
 - **Token Management** - OAuth token storage per CUI with automatic refresh
-- **Job Scheduling** - Configurable cron schedules for invoice uploads, status checks, and message syncing
+- **Background Jobs** - Ready-to-use jobs for invoice uploads, status checks, and message syncing
 - **Model Integration** - Simple interface + trait pattern for your invoice models
 - **Event-Driven** - Events for all key operations (uploads, failures, received invoices)
 - **Minimal Setup** - Auto-discovery, publishable config and migrations
@@ -51,12 +51,8 @@ EFACTURA_SYNC_MESSAGES=true
 EFACTURA_STORAGE_DISK=local
 EFACTURA_STORAGE_PATH=efactura
 
-# Schedule (cron expressions)
-EFACTURA_SCHEDULE_UPLOAD="*/5 * * * *"
-EFACTURA_SCHEDULE_STATUS="*/10 * * * *"
-EFACTURA_SCHEDULE_RESPONSES="*/15 * * * *"
-EFACTURA_SCHEDULE_RECEIVED="0 */4 * * *"
-EFACTURA_SCHEDULE_SYNC="0 * * * *"
+# Queue (null = default queue)
+EFACTURA_QUEUE=null
 
 # Routes
 EFACTURA_ROUTES_ENABLED=true
@@ -168,8 +164,14 @@ $invoice->getEfacturaResponsePath(); // ?string
 $invoice->getEfacturaErrors();       // ?array
 
 // Query scopes
-Invoice::notUploadedToEfactura()->get();
-Invoice::withEfacturaStatus(UploadStatus::Completed)->get();
+Invoice::notUploadedToEfactura()->get();           // Not yet queued
+Invoice::efacturaPending()->get();                  // Queued, awaiting upload
+Invoice::efacturaInProgress()->get();               // Currently uploading/processing
+Invoice::efacturaCompleted()->get();                // Successfully processed
+Invoice::efacturaFailed()->get();                   // Failed
+Invoice::efacturaProcessed()->get();                // Terminal state (completed or failed)
+Invoice::efacturaAwaitingResponse()->get();         // Completed but response not downloaded
+Invoice::withEfacturaStatus(UploadStatus::Pending)->get(); // Specific status
 ```
 
 ## Usage
@@ -278,25 +280,48 @@ Event::listen(TokenStored::class, function (TokenStored $event) {
 });
 ```
 
-## Scheduled Jobs
+## Job Scheduling (Required)
 
-### Register the Scheduler
+**Important:** This package provides jobs but does NOT schedule them automatically. You must register the job schedules in your application.
 
-In your `routes/console.php` (Laravel 11+):
+### Register Jobs in Your Scheduler
+
+Add the following to your `routes/console.php` (Laravel 11+):
 
 ```php
-use BeeCoded\EFactura\Console\Commands\EfacturaScheduleCommand;
+use BeeCoded\EFactura\Jobs\ProcessPendingUploads;
+use BeeCoded\EFactura\Jobs\CheckUploadStatuses;
+use BeeCoded\EFactura\Jobs\DownloadResponses;
+use BeeCoded\EFactura\Jobs\DownloadReceivedInvoices;
+use BeeCoded\EFactura\Jobs\SyncMessages;
 use Illuminate\Support\Facades\Schedule;
 
-Schedule::command(EfacturaScheduleCommand::class)->everyMinute();
+// Upload pending invoices to ANAF
+Schedule::job(new ProcessPendingUploads)->everyFiveMinutes();
+
+// Check processing status at ANAF
+Schedule::job(new CheckUploadStatuses)->everyTenMinutes();
+
+// Download response ZIPs for completed uploads
+Schedule::job(new DownloadResponses)->everyFifteenMinutes();
+
+// Download received invoices (if feature enabled)
+Schedule::job(new DownloadReceivedInvoices)->everyFourHours();
+
+// Sync message list from ANAF
+Schedule::job(new SyncMessages)->hourly();
 ```
 
-The package will dispatch jobs based on your configured cron expressions.
+Adjust the schedules to fit your application's needs. All jobs accept an optional `$cui` parameter to process only a specific CUI:
+
+```php
+Schedule::job(new ProcessPendingUploads('12345678'))->everyFiveMinutes();
+```
 
 ### Available Jobs
 
-| Job | Purpose | Default Schedule |
-|-----|---------|------------------|
+| Job | Purpose | Suggested Schedule |
+|-----|---------|-------------------|
 | `ProcessPendingUploads` | Upload pending invoices to ANAF | Every 5 minutes |
 | `CheckUploadStatuses` | Check processing status at ANAF | Every 10 minutes |
 | `DownloadResponses` | Download response ZIPs | Every 15 minutes |
@@ -309,6 +334,28 @@ All jobs have built-in retry logic:
 - **Tries**: 3
 - **Timeout**: 120 seconds
 - **Backoff**: 60s, 180s, 300s (progressive)
+
+### Queue Configuration
+
+Jobs are dispatched to the queue specified in `config/efactura.php`:
+
+```php
+'queue' => env('EFACTURA_QUEUE', null), // null = default queue
+```
+
+Set `EFACTURA_QUEUE=efactura` in your `.env` to use a dedicated queue. This allows you to run a separate worker for e-Factura jobs:
+
+```bash
+php artisan queue:work --queue=efactura
+```
+
+### Queue Worker
+
+Ensure your queue worker is running:
+
+```bash
+php artisan queue:work
+```
 
 ## Artisan Commands
 

@@ -36,6 +36,17 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Queue Configuration
+    |--------------------------------------------------------------------------
+    |
+    | Specify which queue the e-Factura jobs should be dispatched to.
+    | Set to null to use the default queue.
+    |
+    */
+    'queue' => env('EFACTURA_QUEUE', null),
+
+    /*
+    |--------------------------------------------------------------------------
     | File Storage
     |--------------------------------------------------------------------------
     |
@@ -45,22 +56,6 @@ return [
     'storage' => [
         'disk' => env('EFACTURA_STORAGE_DISK', 'local'),
         'path' => env('EFACTURA_STORAGE_PATH', 'efactura'),
-    ],
-
-    /*
-    |--------------------------------------------------------------------------
-    | Job Schedules
-    |--------------------------------------------------------------------------
-    |
-    | Cron expressions for scheduled jobs. Set to null to disable a job.
-    |
-    */
-    'schedule' => [
-        'upload_invoices' => env('EFACTURA_SCHEDULE_UPLOAD', '*/5 * * * *'),
-        'check_statuses' => env('EFACTURA_SCHEDULE_STATUS', '*/10 * * * *'),
-        'download_responses' => env('EFACTURA_SCHEDULE_RESPONSES', '*/15 * * * *'),
-        'download_received' => env('EFACTURA_SCHEDULE_RECEIVED', '0 */4 * * *'),
-        'sync_messages' => env('EFACTURA_SCHEDULE_SYNC', '0 * * * *'),
     ],
 
     /*

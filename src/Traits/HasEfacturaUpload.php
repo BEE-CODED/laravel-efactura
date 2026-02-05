@@ -110,7 +110,7 @@ trait HasEfacturaUpload
     }
 
     /**
-     * Scope: Exclude already uploaded models.
+     * Scope: Models not yet queued for e-Factura upload.
      */
     public function scopeNotUploadedToEfactura(Builder $query): Builder
     {
@@ -118,10 +118,67 @@ trait HasEfacturaUpload
     }
 
     /**
-     * Scope: Get models with specific e-Factura status.
+     * Scope: Models with specific e-Factura status.
      */
     public function scopeWithEfacturaStatus(Builder $query, UploadStatus $status): Builder
     {
         return $query->whereHas('efacturaUpload', fn ($q) => $q->where('status', $status));
+    }
+
+    /**
+     * Scope: Models queued but not yet uploaded (pending status).
+     */
+    public function scopeEfacturaPending(Builder $query): Builder
+    {
+        return $query->whereHas('efacturaUpload', fn ($q) => $q->where('status', UploadStatus::Pending));
+    }
+
+    /**
+     * Scope: Models currently being processed (uploading or processing at ANAF).
+     */
+    public function scopeEfacturaInProgress(Builder $query): Builder
+    {
+        return $query->whereHas('efacturaUpload', fn ($q) => $q->whereIn('status', [
+            UploadStatus::Uploading,
+            UploadStatus::Processing,
+        ]));
+    }
+
+    /**
+     * Scope: Models successfully processed by ANAF.
+     */
+    public function scopeEfacturaCompleted(Builder $query): Builder
+    {
+        return $query->whereHas('efacturaUpload', fn ($q) => $q->where('status', UploadStatus::Completed));
+    }
+
+    /**
+     * Scope: Models that failed upload or processing.
+     */
+    public function scopeEfacturaFailed(Builder $query): Builder
+    {
+        return $query->whereHas('efacturaUpload', fn ($q) => $q->where('status', UploadStatus::Failed));
+    }
+
+    /**
+     * Scope: Models with terminal status (completed or failed).
+     */
+    public function scopeEfacturaProcessed(Builder $query): Builder
+    {
+        return $query->whereHas('efacturaUpload', fn ($q) => $q->whereIn('status', [
+            UploadStatus::Completed,
+            UploadStatus::Failed,
+        ]));
+    }
+
+    /**
+     * Scope: Models awaiting response download (completed but no response file yet).
+     */
+    public function scopeEfacturaAwaitingResponse(Builder $query): Builder
+    {
+        return $query->whereHas('efacturaUpload', fn ($q) => $q
+            ->where('status', UploadStatus::Completed)
+            ->whereNotNull('download_id')
+            ->whereNull('response_path'));
     }
 }

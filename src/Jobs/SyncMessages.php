@@ -34,7 +34,9 @@ class SyncMessages implements ShouldQueue
 
     public function __construct(
         public ?string $cui = null,
-    ) {}
+    ) {
+        $this->onQueue(config('efactura.queue'));
+    }
 
     public function handle(MessageSyncService $messageSyncService, TokenService $tokenService): void
     {

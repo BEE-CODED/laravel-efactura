@@ -32,7 +32,9 @@ class CheckUploadStatuses implements ShouldQueue
 
     public function __construct(
         public ?string $cui = null,
-    ) {}
+    ) {
+        $this->onQueue(config('efactura.queue'));
+    }
 
     public function handle(DownloadService $downloadService): void
     {
