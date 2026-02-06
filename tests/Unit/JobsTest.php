@@ -1,11 +1,14 @@
 <?php
 
+use BeeCoded\EFactura\Jobs\CheckSingleUploadStatus;
 use BeeCoded\EFactura\Jobs\CheckUploadStatuses;
 use BeeCoded\EFactura\Jobs\DownloadReceivedInvoices;
 use BeeCoded\EFactura\Jobs\DownloadResponses;
 use BeeCoded\EFactura\Jobs\ProcessPendingUploads;
+use BeeCoded\EFactura\Jobs\ProcessSingleUpload;
 use BeeCoded\EFactura\Jobs\SyncMessages;
 use BeeCoded\EFactura\Models\EfacturaToken;
+use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\DownloadService;
 use BeeCoded\EFactura\Services\MessageSyncService;
 use BeeCoded\EFactura\Services\TokenService;
@@ -300,6 +303,185 @@ describe('SyncMessages Job', function () {
 
         $job = new SyncMessages('99999999');
         $job->handle($messageSyncService, $tokenService);
+    });
+});
+
+describe('ProcessSingleUpload Job', function () {
+    it('implements ShouldQueue', function () {
+        $upload = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => 'pending',
+            'standard' => 'UBL',
+        ]);
+
+        expect(new ProcessSingleUpload($upload))->toBeInstanceOf(ShouldQueue::class);
+    });
+
+    it('has correct queue configuration', function () {
+        $upload = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => 'pending',
+            'standard' => 'UBL',
+        ]);
+
+        $job = new ProcessSingleUpload($upload);
+
+        expect($job->tries)->toBe(3);
+        expect($job->timeout)->toBe(120);
+        expect($job->backoff)->toBe([60, 180, 300]);
+        expect($job->maxExceptions)->toBe(3);
+    });
+
+    it('does nothing when efactura is disabled', function () {
+        config(['efactura.enabled' => false]);
+
+        $upload = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => 'pending',
+            'standard' => 'UBL',
+        ]);
+
+        $uploadService = Mockery::mock(UploadService::class);
+        $uploadService->shouldNotReceive('processUpload');
+
+        $job = new ProcessSingleUpload($upload);
+        $job->handle($uploadService);
+    });
+
+    it('does nothing when upload_invoices feature is disabled', function () {
+        config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => false]);
+
+        $upload = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => 'pending',
+            'standard' => 'UBL',
+        ]);
+
+        $uploadService = Mockery::mock(UploadService::class);
+        $uploadService->shouldNotReceive('processUpload');
+
+        $job = new ProcessSingleUpload($upload);
+        $job->handle($uploadService);
+    });
+
+    it('calls processUpload with the upload when enabled', function () {
+        config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true]);
+
+        $upload = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => 'pending',
+            'standard' => 'UBL',
+        ]);
+
+        $uploadService = Mockery::mock(UploadService::class);
+        $uploadService->shouldReceive('processUpload')
+            ->once()
+            ->with(Mockery::on(fn ($arg) => $arg->id === $upload->id));
+
+        $job = new ProcessSingleUpload($upload);
+        $job->handle($uploadService);
+    });
+});
+
+describe('CheckSingleUploadStatus Job', function () {
+    it('implements ShouldQueue', function () {
+        $upload = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => 'processing',
+            'standard' => 'UBL',
+            'upload_index' => 'INDEX123',
+        ]);
+
+        expect(new CheckSingleUploadStatus($upload))->toBeInstanceOf(ShouldQueue::class);
+    });
+
+    it('has correct queue configuration', function () {
+        $upload = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => 'processing',
+            'standard' => 'UBL',
+            'upload_index' => 'INDEX123',
+        ]);
+
+        $job = new CheckSingleUploadStatus($upload);
+
+        expect($job->tries)->toBe(3);
+        expect($job->timeout)->toBe(120);
+        expect($job->backoff)->toBe([60, 180, 300]);
+        expect($job->maxExceptions)->toBe(3);
+    });
+
+    it('does nothing when efactura is disabled', function () {
+        config(['efactura.enabled' => false]);
+
+        $upload = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => 'processing',
+            'standard' => 'UBL',
+            'upload_index' => 'INDEX123',
+        ]);
+
+        $downloadService = Mockery::mock(DownloadService::class);
+        $downloadService->shouldNotReceive('checkStatus');
+
+        $job = new CheckSingleUploadStatus($upload);
+        $job->handle($downloadService);
+    });
+
+    it('does nothing when upload_invoices feature is disabled', function () {
+        config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => false]);
+
+        $upload = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => 'processing',
+            'standard' => 'UBL',
+            'upload_index' => 'INDEX123',
+        ]);
+
+        $downloadService = Mockery::mock(DownloadService::class);
+        $downloadService->shouldNotReceive('checkStatus');
+
+        $job = new CheckSingleUploadStatus($upload);
+        $job->handle($downloadService);
+    });
+
+    it('calls checkStatus with the upload when enabled', function () {
+        config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true]);
+
+        $upload = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => 'processing',
+            'standard' => 'UBL',
+            'upload_index' => 'INDEX123',
+        ]);
+
+        $downloadService = Mockery::mock(DownloadService::class);
+        $downloadService->shouldReceive('checkStatus')
+            ->once()
+            ->with(Mockery::on(fn ($arg) => $arg->id === $upload->id));
+
+        $job = new CheckSingleUploadStatus($upload);
+        $job->handle($downloadService);
     });
 });
 

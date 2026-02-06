@@ -83,6 +83,8 @@ class UploadService
             return;
         }
 
+        $upload->loadMissing(['token', 'uploadable']);
+
         if (!$upload->token) {
             Log::error('EFactura: Upload has no associated token', ['upload_id' => $upload->id]);
             $this->markUploadAsFailed($upload, ['No associated token found for upload']);
@@ -195,7 +197,7 @@ class UploadService
      */
     public function processPendingUploads(?string $cui = null): void
     {
-        $query = EfacturaUpload::pending()->with('token');
+        $query = EfacturaUpload::pending()->with(['token', 'uploadable']);
 
         if ($cui) {
             $token = $this->tokenService->getToken($cui);

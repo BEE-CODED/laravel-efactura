@@ -35,6 +35,8 @@ class DownloadService
             return;
         }
 
+        $upload->loadMissing('token');
+
         if (!$upload->token) {
             Log::error('EFactura: Upload has no associated token', ['upload_id' => $upload->id]);
 
@@ -72,6 +74,8 @@ class DownloadService
             return;
         }
 
+        $upload->loadMissing('token');
+
         if (!$upload->token) {
             Log::error('EFactura: Upload has no associated token', ['upload_id' => $upload->id]);
 
@@ -107,6 +111,8 @@ class DownloadService
         if ($message->is_downloaded || !$message->download_id) {
             return;
         }
+
+        $message->loadMissing('token');
 
         if (!$message->token) {
             Log::error('EFactura: Message has no associated token', ['message_id' => $message->id]);

@@ -318,15 +318,40 @@ Adjust the schedules to fit your application's needs. All jobs accept an optiona
 Schedule::job(new ProcessPendingUploads('12345678'))->everyFiveMinutes();
 ```
 
+### Dispatch a Single Upload or Status Check
+
+For immediate processing of a single upload, dispatch the single-model jobs:
+
+```php
+use BeeCoded\EFactura\Jobs\ProcessSingleUpload;
+use BeeCoded\EFactura\Jobs\CheckSingleUploadStatus;
+
+// Queue and dispatch a single upload immediately
+$upload = EFactura::queueUpload($invoice);
+ProcessSingleUpload::dispatch($upload);
+
+// Check status for a specific upload
+CheckSingleUploadStatus::dispatch($upload);
+```
+
 ### Available Jobs
+
+#### Batch Jobs (Scheduled)
 
 | Job | Purpose | Suggested Schedule |
 |-----|---------|-------------------|
-| `ProcessPendingUploads` | Upload pending invoices to ANAF | Every 5 minutes |
+| `ProcessPendingUploads` | Upload all pending invoices to ANAF | Every 5 minutes |
 | `CheckUploadStatuses` | Check processing status at ANAF | Every 10 minutes |
 | `DownloadResponses` | Download response ZIPs | Every 15 minutes |
 | `DownloadReceivedInvoices` | Download received invoices | Every 4 hours |
 | `SyncMessages` | Sync message list from ANAF | Every hour |
+
+#### Single-Model Jobs (On-Demand)
+
+| Job | Purpose |
+|-----|---------|
+| `ProcessSingleUpload` | Process a single upload immediately |
+| `CheckSingleUploadStatus` | Check status for a single upload |
 
 ### Job Configuration
 
