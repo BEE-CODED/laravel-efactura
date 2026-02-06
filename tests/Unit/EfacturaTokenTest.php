@@ -40,8 +40,8 @@ describe('EfacturaToken Model', function () {
     });
 
     describe('getVatNumber', function () {
-        it('returns normalized CUI with RO prefix', function () {
-            expect($this->token->getVatNumber())->toBe('RO12345678');
+        it('returns CUI without RO prefix', function () {
+            expect($this->token->getVatNumber())->toBe('12345678');
         });
     });
 

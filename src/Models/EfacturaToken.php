@@ -69,7 +69,7 @@ class EfacturaToken extends Model
 
     public function getVatNumber(): string
     {
-        return VatNumberValidator::normalize($this->cui);
+        return VatNumberValidator::stripPrefix($this->cui);
     }
 
     public function isExpired(): bool
