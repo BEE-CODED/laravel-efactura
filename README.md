@@ -107,8 +107,8 @@ class Invoice extends Model implements EFacturaUploadableInterface
                 registrationName: $this->company->name,
                 companyId: $this->company->vat_number,
                 address: new AddressData(
-                    streetName: $this->company->address,
-                    cityName: $this->company->city,
+                    street: $this->company->address,
+                    city: $this->company->city,
                     postalZone: $this->company->postal_code,
                     countryCode: $this->company->country_code,
                 ),
@@ -118,8 +118,8 @@ class Invoice extends Model implements EFacturaUploadableInterface
                 registrationName: $this->customer->name,
                 companyId: $this->customer->vat_number,
                 address: new AddressData(
-                    streetName: $this->customer->address,
-                    cityName: $this->customer->city,
+                    street: $this->customer->address,
+                    city: $this->customer->city,
                     postalZone: $this->customer->postal_code,
                     countryCode: $this->customer->country_code,
                 ),
@@ -468,6 +468,25 @@ Pending → Uploading → Processing → Completed
 - **Processing**: Uploaded, waiting for ANAF to process
 - **Completed**: Successfully processed, response available
 - **Failed**: Upload or processing failed
+
+## Logging
+
+The SDK logs all API calls to a dedicated logging channel. Add the following channel to your `config/logging.php`:
+
+```php
+'channels' => [
+    // ... other channels
+
+    'efactura-sdk' => [
+        'driver' => 'daily',
+        'path' => storage_path('logs/efactura-sdk.log'),
+        'level' => 'debug',
+        'days' => 30,
+    ],
+],
+```
+
+You can customize the channel name via the `EFACTURA_LOG_CHANNEL` environment variable (defaults to `efactura-sdk`).
 
 ## Testing
 
