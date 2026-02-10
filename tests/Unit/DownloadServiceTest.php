@@ -138,6 +138,8 @@ describe('DownloadService', function () {
                 }
 
                 public array $errors = ['Processing error'];
+
+                public ?string $idDescarcare = 'ERROR_DL_123';
             };
 
             $this->tokenService->shouldReceive('executeWithClient')
@@ -146,7 +148,7 @@ describe('DownloadService', function () {
 
             $this->uploadService->shouldReceive('markUploadAsFailed')
                 ->once()
-                ->with($upload, ['Processing error']);
+                ->with($upload, ['Processing error'], 'ERROR_DL_123');
 
             $this->downloadService->checkStatus($upload);
 

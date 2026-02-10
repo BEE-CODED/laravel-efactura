@@ -183,13 +183,19 @@ class UploadService
     /**
      * Mark upload as failed with errors.
      */
-    public function markUploadAsFailed(EfacturaUpload $upload, array $errors): void
+    public function markUploadAsFailed(EfacturaUpload $upload, array $errors, ?string $downloadId = null): void
     {
-        $upload->update([
+        $data = [
             'status' => UploadStatus::Failed,
             'errors' => $errors,
             'processed_at' => now(),
-        ]);
+        ];
+
+        if ($downloadId !== null) {
+            $data['download_id'] = $downloadId;
+        }
+
+        $upload->update($data);
     }
 
     /**

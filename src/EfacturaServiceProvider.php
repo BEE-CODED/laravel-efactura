@@ -40,6 +40,8 @@ class EfacturaServiceProvider extends ServiceProvider
 
     public function boot(): void
     {
+        $this->loadTranslationsFrom(__DIR__.'/../resources/lang', 'efactura');
+
         if ($this->app->runningInConsole()) {
             $this->publishes([
                 __DIR__.'/../config/efactura.php' => config_path('efactura.php'),
@@ -48,6 +50,10 @@ class EfacturaServiceProvider extends ServiceProvider
             $this->publishes([
                 __DIR__.'/../database/migrations' => database_path('migrations'),
             ], 'efactura-migrations');
+
+            $this->publishes([
+                __DIR__.'/../resources/lang' => $this->app->langPath('vendor/efactura'),
+            ], 'efactura-translations');
 
             $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
 

@@ -135,7 +135,7 @@ class EfacturaUpload extends Model
 
     public function scopeNeedsResponseDownload(Builder $query): Builder
     {
-        return $query->where('status', UploadStatus::Completed)
+        return $query->whereIn('status', [UploadStatus::Completed, UploadStatus::Failed])
             ->whereNotNull('download_id')
             ->whereNull('response_path');
     }

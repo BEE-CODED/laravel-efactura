@@ -13,7 +13,7 @@
     ],
     "require": {
         "php": "^8.4",
-        "bee-coded/laravel-efactura-sdk": "^0.10",
+        "bee-coded/laravel-efactura-sdk": "^1.0",
         "illuminate/contracts": "^11.0|^12.0",
         "illuminate/database": "^11.0|^12.0",
         "illuminate/support": "^11.0|^12.0"

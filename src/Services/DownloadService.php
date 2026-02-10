@@ -11,6 +11,7 @@
 
 namespace BeeCoded\EFactura\Services;
 
+use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Events\InvoiceFailed;
 use BeeCoded\EFactura\Events\InvoiceProcessed;
 use BeeCoded\EFactura\Events\InvoiceReceived;
@@ -52,7 +53,8 @@ class DownloadService
             if ($response->isReady()) {
                 $this->uploadService->markUploadAsCompleted($upload, $response->idDescarcare);
             } elseif ($response->isFailed()) {
-                $this->uploadService->markUploadAsFailed($upload, $response->errors ?? ['Processing failed at ANAF']);
+                $errors = $response->errors ?? [__('efactura::messages.processing_failed_at_anaf')];
+                $this->uploadService->markUploadAsFailed($upload, $errors, $response->idDescarcare);
                 event(new InvoiceFailed($upload, $response->errors ?? []));
             }
             // If still in progress, do nothing
@@ -93,7 +95,10 @@ class DownloadService
                 'response_path' => $path,
             ]);
 
-            event(new InvoiceProcessed($upload));
+            // Only fire InvoiceProcessed for successful uploads, not error report downloads
+            if ($upload->status === UploadStatus::Completed) {
+                event(new InvoiceProcessed($upload));
+            }
 
         } catch (\Throwable $e) {
             Log::error('EFactura response download failed', [
