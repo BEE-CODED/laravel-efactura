@@ -53,9 +53,9 @@ class EfacturaManager
         return $this->uploadService->queueUpload($model, $options);
     }
 
-    public function queueB2CUpload(EFacturaUploadableInterface $model): EfacturaUpload
+    public function queueB2CUpload(EFacturaUploadableInterface $model, ?array $options = null): EfacturaUpload
     {
-        return $this->uploadService->queueB2CUpload($model);
+        return $this->uploadService->queueB2CUpload($model, $options);
     }
 
     public function processUpload(EfacturaUpload $upload): void

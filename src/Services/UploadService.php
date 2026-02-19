@@ -55,7 +55,7 @@ class UploadService
     /**
      * Queue a model for B2C e-Factura upload.
      */
-    public function queueB2CUpload(EFacturaUploadableInterface $model): EfacturaUpload
+    public function queueB2CUpload(EFacturaUploadableInterface $model, ?array $options = null): EfacturaUpload
     {
         $cui = $model->getEfacturaCui();
         $token = $this->tokenService->getToken($cui);
@@ -70,6 +70,8 @@ class UploadService
             'uploadable_id' => $model->getKey(),
             'status' => UploadStatus::Pending,
             'standard' => 'UBL',
+            'is_extern' => $options['extern'] ?? false,
+            'is_self_billed' => $options['self_billed'] ?? false,
             'is_b2c' => true,
         ]);
     }
