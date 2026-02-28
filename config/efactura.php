@@ -47,6 +47,27 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Rate Limit Handling
+    |--------------------------------------------------------------------------
+    |
+    | Configure how rate-limited uploads are handled. The SDK's RateLimiter
+    | provides client-side pre-flight checks against ANAF quotas.
+    |
+    | retry_window_hours: How long a single upload job can keep retrying
+    |                     before failing permanently (default: 24 hours).
+    | retry_batch_size:   How many failed rate-limited uploads to reset
+    |                     per RetryRateLimitedUploads run (default: 250).
+    | retry_max_age_days: Don't retry uploads older than this (default: 7 days).
+    |
+    */
+    'rate_limit' => [
+        'retry_window_hours' => env('EFACTURA_RATE_LIMIT_RETRY_HOURS', 24),
+        'retry_batch_size' => env('EFACTURA_RATE_LIMIT_RETRY_BATCH', 250),
+        'retry_max_age_days' => env('EFACTURA_RATE_LIMIT_RETRY_MAX_DAYS', 7),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | File Storage
     |--------------------------------------------------------------------------
     |

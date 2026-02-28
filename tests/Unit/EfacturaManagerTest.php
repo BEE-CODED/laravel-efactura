@@ -134,7 +134,7 @@ describe('EfacturaManager', function () {
             $upload = new EfacturaUpload(['id' => 3, 'is_b2c' => true]);
 
             $this->uploadService->shouldReceive('queueB2CUpload')
-                ->with($invoice)
+                ->with($invoice, null)
                 ->once()
                 ->andReturn($upload);
 

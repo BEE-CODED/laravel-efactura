@@ -54,6 +54,11 @@ EFACTURA_STORAGE_PATH=efactura
 # Queue (null = default queue)
 EFACTURA_QUEUE=null
 
+# Rate Limit Handling
+EFACTURA_RATE_LIMIT_RETRY_HOURS=24
+EFACTURA_RATE_LIMIT_RETRY_BATCH=250
+EFACTURA_RATE_LIMIT_RETRY_MAX_DAYS=7
+
 # Routes
 EFACTURA_ROUTES_ENABLED=true
 EFACTURA_ROUTES_PREFIX=efactura
@@ -286,7 +291,7 @@ Event::listen(TokenStored::class, function (TokenStored $event) {
 
 ### Register Jobs in Your Scheduler
 
-Add the following to your `routes/console.php` (Laravel 11+):
+Add the following to your `bootstrap/app.php`:
 
 ```php
 use BeeCoded\EFactura\Jobs\ProcessPendingUploads;
@@ -294,22 +299,27 @@ use BeeCoded\EFactura\Jobs\CheckUploadStatuses;
 use BeeCoded\EFactura\Jobs\DownloadResponses;
 use BeeCoded\EFactura\Jobs\DownloadReceivedInvoices;
 use BeeCoded\EFactura\Jobs\SyncMessages;
-use Illuminate\Support\Facades\Schedule;
+use BeeCoded\EFactura\Jobs\RetryRateLimitedUploads;
 
-// Upload pending invoices to ANAF
-Schedule::job(new ProcessPendingUploads)->everyFiveMinutes();
+->withSchedule(function (Schedule $schedule): void {
+    // Upload pending invoices to ANAF
+    $schedule->job(new ProcessPendingUploads)->everyFiveMinutes();
 
-// Check processing status at ANAF
-Schedule::job(new CheckUploadStatuses)->everyTenMinutes();
+    // Check processing status at ANAF
+    $schedule->job(new CheckUploadStatuses)->everyTenMinutes();
 
-// Download response ZIPs for completed uploads
-Schedule::job(new DownloadResponses)->everyFifteenMinutes();
+    // Download response ZIPs for completed uploads
+    $schedule->job(new DownloadResponses)->everyFifteenMinutes();
 
-// Download received invoices (if feature enabled)
-Schedule::job(new DownloadReceivedInvoices)->everyFourHours();
+    // Retry uploads that failed due to rate limiting
+    $schedule->job(new RetryRateLimitedUploads)->everyTenMinutes();
 
-// Sync message list from ANAF
-Schedule::job(new SyncMessages)->hourly();
+    // Download received invoices (if feature enabled)
+    $schedule->job(new DownloadReceivedInvoices)->everyFourHours();
+
+    // Sync message list from ANAF
+    $schedule->job(new SyncMessages)->hourly();
+})
 ```
 
 Adjust the schedules to fit your application's needs. All jobs accept an optional `$cui` parameter to process only a specific CUI:
@@ -345,6 +355,7 @@ CheckSingleUploadStatus::dispatch($upload);
 | `DownloadResponses` | Download response ZIPs | Every 15 minutes |
 | `DownloadReceivedInvoices` | Download received invoices | Every 4 hours |
 | `SyncMessages` | Sync message list from ANAF | Every hour |
+| `RetryRateLimitedUploads` | Reset rate-limited failures back to pending | Every 10 minutes |
 
 #### Single-Model Jobs (On-Demand)
 
@@ -355,10 +366,19 @@ CheckSingleUploadStatus::dispatch($upload);
 
 ### Job Configuration
 
-All jobs have built-in retry logic:
+**Standard jobs** (batch processing, status checks, downloads):
 - **Tries**: 3
 - **Timeout**: 120 seconds
 - **Backoff**: 60s, 180s, 300s (progressive)
+
+**Upload jobs** (`ProcessSingleUpload`) have rate-limit-aware retry:
+- **Timeout**: 120 seconds
+- **Max Exceptions**: 3 (actual errors only — rate-limit releases don't count)
+- **Retry Window**: 24 hours (configurable via `EFACTURA_RATE_LIMIT_RETRY_HOURS`)
+- When the SDK's global rate limit quota is exhausted, the job releases itself
+  back to the queue with a delay matching the quota reset time, instead of failing
+- If a race condition causes a rate-limit failure during upload, the job resets
+  the upload to pending and releases with a 60-second delay
 
 ### Queue Configuration
 
@@ -372,6 +392,24 @@ Set `EFACTURA_QUEUE=efactura` in your `.env` to use a dedicated queue. This allo
 
 ```bash
 php artisan queue:work --queue=efactura
+```
+
+### Rate Limit Configuration
+
+The SDK provides client-side rate limiting to stay within ANAF quotas. Upload
+jobs are rate-limit-aware and will delay instead of failing when quotas are
+exhausted. For uploads that do fail due to rate limiting (e.g., race conditions),
+schedule `RetryRateLimitedUploads` to automatically reset them.
+
+```env
+# How long upload jobs can keep retrying (hours, default: 24)
+EFACTURA_RATE_LIMIT_RETRY_HOURS=24
+
+# Max failed uploads to reset per retry run (default: 250)
+EFACTURA_RATE_LIMIT_RETRY_BATCH=250
+
+# Don't retry uploads older than this many days (default: 7)
+EFACTURA_RATE_LIMIT_RETRY_MAX_DAYS=7
 ```
 
 ### Queue Worker

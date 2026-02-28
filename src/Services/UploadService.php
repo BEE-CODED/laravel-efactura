@@ -18,6 +18,7 @@ use BeeCoded\EFactura\Events\InvoiceUploaded;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFacturaSdk\Data\Invoice\UploadOptionsData;
 use BeeCoded\EFacturaSdk\Enums\StandardType;
+use BeeCoded\EFacturaSdk\Exceptions\RateLimitExceededException;
 use BeeCoded\EFacturaSdk\Facades\UblBuilder;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
@@ -81,10 +82,16 @@ class UploadService
      */
     public function processUpload(EfacturaUpload $upload): void
     {
-        if (!$upload->isPending()) {
-            return;
+        // Atomic claim — only one process can transition from Pending to Uploading
+        $claimed = EfacturaUpload::where('id', $upload->id)
+            ->where('status', UploadStatus::Pending)
+            ->update(['status' => UploadStatus::Uploading]);
+
+        if ($claimed === 0) {
+            return; // Already claimed by another process
         }
 
+        $upload->status = UploadStatus::Uploading;
         $upload->loadMissing(['token', 'uploadable']);
 
         if (!$upload->token) {
@@ -94,8 +101,6 @@ class UploadService
 
             return;
         }
-
-        $this->markUploadAsUploading($upload);
 
         try {
             $model = $upload->uploadable;
@@ -137,8 +142,17 @@ class UploadService
                 event(new InvoiceFailed($upload, $response->errors ?? []));
             }
 
+        } catch (RateLimitExceededException $e) {
+            Log::warning('EFactura: Rate limit hit during upload', [
+                'upload_id' => $upload->id,
+                'retry_after' => $e->retryAfterSeconds,
+                'error' => $e->getMessage(),
+            ]);
+
+            $this->markUploadAsFailed($upload, ['RATE_LIMIT_EXCEEDED: '.$e->getMessage()]);
+            event(new InvoiceFailed($upload, [$e->getMessage()]));
         } catch (\Throwable $e) {
-            Log::error('EFactura upload failed', [
+            Log::error('EFactura: Upload failed', [
                 'upload_id' => $upload->id,
                 'error' => $e->getMessage(),
             ]);
@@ -198,6 +212,21 @@ class UploadService
         }
 
         $upload->update($data);
+    }
+
+    /**
+     * Atomically reset a rate-limited upload back to pending.
+     * Returns true if the reset was applied (upload was still in Failed state).
+     */
+    public function resetForRateLimit(EfacturaUpload $upload): bool
+    {
+        return EfacturaUpload::where('id', $upload->id)
+            ->where('status', UploadStatus::Failed)
+            ->update([
+                'status' => UploadStatus::Pending,
+                'errors' => null,
+                'processed_at' => null,
+            ]) > 0;
     }
 
     /**

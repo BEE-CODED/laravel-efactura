@@ -320,6 +320,56 @@ describe('UploadService', function () {
         });
     });
 
+    describe('resetForRateLimit', function () {
+        beforeEach(function () {
+            $this->upload = EfacturaUpload::create([
+                'efactura_token_id' => $this->token->id,
+                'uploadable_type' => TestInvoice::class,
+                'uploadable_id' => $this->invoice->id,
+                'status' => UploadStatus::Failed,
+                'standard' => 'UBL',
+                'errors' => ['Rate limit exceeded'],
+                'processed_at' => now(),
+            ]);
+        });
+
+        it('resets a failed upload back to pending', function () {
+            $result = $this->uploadService->resetForRateLimit($this->upload);
+
+            expect($result)->toBeTrue();
+
+            $upload = $this->upload->fresh();
+            expect($upload->status)->toBe(UploadStatus::Pending)
+                ->and($upload->errors)->toBeNull()
+                ->and($upload->processed_at)->toBeNull();
+        });
+
+        it('returns false when upload is no longer in failed state', function () {
+            $this->upload->update(['status' => UploadStatus::Processing]);
+
+            $result = $this->uploadService->resetForRateLimit($this->upload);
+
+            expect($result)->toBeFalse();
+            expect($this->upload->fresh()->status)->toBe(UploadStatus::Processing);
+        });
+
+        it('returns false for pending uploads', function () {
+            $this->upload->update(['status' => UploadStatus::Pending]);
+
+            $result = $this->uploadService->resetForRateLimit($this->upload);
+
+            expect($result)->toBeFalse();
+        });
+
+        it('returns false for completed uploads', function () {
+            $this->upload->update(['status' => UploadStatus::Completed]);
+
+            $result = $this->uploadService->resetForRateLimit($this->upload);
+
+            expect($result)->toBeFalse();
+        });
+    });
+
     describe('processPendingUploads', function () {
         it('processes all pending uploads when no CUI specified', function () {
             Storage::fake('local');
