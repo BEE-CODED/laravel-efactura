@@ -200,6 +200,40 @@ $upload = EFactura::queueUpload($invoice, [
 $upload = EFactura::queueB2CUpload($invoice);
 ```
 
+### Queue a Credit Note for Upload
+
+Credit notes work the same way as invoices — just set `invoiceTypeCode` to `CreditNote` and reference the original invoice:
+
+```php
+use BeeCoded\EFacturaSdk\Data\Invoice\InvoiceData;
+use BeeCoded\EFacturaSdk\Data\Invoice\InvoiceLineData;
+use BeeCoded\EFacturaSdk\Enums\InvoiceTypeCode;
+
+$creditNote = new InvoiceData(
+    invoiceNumber: 'CN-2024-001',
+    issueDate: now(),
+    currency: 'RON',
+    invoiceTypeCode: InvoiceTypeCode::CreditNote,
+    precedingInvoiceNumber: 'INV-2024-001',
+    supplier: $supplier,
+    customer: $customer,
+    lines: [
+        new InvoiceLineData(
+            name: 'Returned product',
+            quantity: -3,        // negative = items being credited
+            unitPrice: 150.00,
+            taxPercent: 19,
+        ),
+    ],
+);
+```
+
+> **Note:** The SDK (v1.1+) automatically negates credit note line quantities before sending to ANAF (which expects positive values in `<CreditNote>` documents). Pass **negative** quantities for items being credited and **positive** for debit-back lines (e.g., discount reversals).
+
+```php
+$upload = EFactura::queueUpload($creditNoteModel);
+```
+
 ### Process Upload Immediately
 
 ```php
