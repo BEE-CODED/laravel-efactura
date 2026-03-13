@@ -8,3 +8,9 @@ phpunit.xml
 composer.lock
 .phpunit.cache/
 coverage/
+
+# MCP server
+mcp/node_modules/
+
+# Superpowers specs
+docs/superpowers/

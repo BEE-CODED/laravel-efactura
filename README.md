@@ -612,6 +612,41 @@ php artisan efactura:auth 12345678
 
 Check the `errors` column in `efactura_uploads` table or listen to the `InvoiceFailed` event.
 
+## AI Assistant Integration (MCP)
+
+This package and its SDK dependency both include MCP servers that help AI coding assistants understand the full e-Factura integration.
+
+**Setup:** Add both to your AI tool's MCP configuration:
+
+```json
+{
+  "mcpServers": {
+    "efactura-sdk": {
+      "command": "node",
+      "args": ["vendor/bee-coded/laravel-efactura-sdk/mcp/dist/index.js"]
+    },
+    "efactura": {
+      "command": "node",
+      "args": ["vendor/bee-coded/laravel-efactura/mcp/dist/index.js"]
+    }
+  }
+}
+```
+
+Requires Node.js 18+.
+
+The wrapper MCP server provides these tools:
+
+| Tool | Description |
+|------|-------------|
+| `get-wrapper-docs` | Documentation topics: overview, setup, upload-pipeline, token-management, commands |
+| `get-model-integration-guide` | Complete guide for integrating a model with e-Factura |
+| `get-event-reference` | All events: TokenStored, TokenRefreshed, InvoiceUploaded, InvoiceProcessed, InvoiceFailed, InvoiceReceived |
+| `get-job-reference` | All 8 background jobs with scheduling guidance |
+| `get-wrapper-config-reference` | Full configuration schema with env vars and defaults |
+
+The SDK MCP server (`efactura-sdk`) provides DTOs, enums, API reference, and SDK-level documentation.
+
 ## License
 
 This package is open-sourced software licensed under the [Apache 2.0 License](LICENSE).

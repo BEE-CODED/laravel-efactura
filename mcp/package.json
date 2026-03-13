@@ -1,0 +1,25 @@
+{
+  "name": "efactura-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Laravel e-Factura wrapper documentation",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --target node18 --clean",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0",
+    "tsup": "^8.0.0",
+    "vitest": "^3.1.0",
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
