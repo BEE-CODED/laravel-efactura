@@ -11,6 +11,7 @@ coverage/
 
 # MCP server
 mcp/node_modules/
+mcp/package-lock.json
 
 # Superpowers specs
 docs/superpowers/
