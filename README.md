@@ -134,6 +134,7 @@ class Invoice extends Model implements EFacturaUploadableInterface
                 name: $line->description,
                 quantity: $line->quantity,
                 unitPrice: $line->unit_price,
+                taxAmount: $line->vat_amount,  // Pre-computed VAT for this line
                 taxPercent: $line->vat_rate,
             ))->all(),
             paymentIban: $this->company->iban,
@@ -222,6 +223,7 @@ $creditNote = new InvoiceData(
             name: 'Returned product',
             quantity: -3,        // negative = items being credited
             unitPrice: 150.00,
+            taxAmount: -85.50,   // sign follows quantity: -3 * 150.00 * 0.19
             taxPercent: 19,
         ),
     ],
@@ -233,6 +235,27 @@ $creditNote = new InvoiceData(
 ```php
 $upload = EFactura::queueUpload($creditNoteModel);
 ```
+
+### The `taxAmount` Parameter (Required since SDK v2.0)
+
+Every `InvoiceLineData` requires a `taxAmount` — the pre-computed VAT amount for that line. The SDK uses this value directly in the XML instead of recalculating VAT internally.
+
+**Why this matters:** In v1.x, the SDK grouped lines by tax rate and recalculated VAT as `sum_of_bases × rate`. This caused rounding discrepancies (typically 0.01 RON) when your application used tax-included pricing, because extracting VAT by subtraction (`gross - net`) can produce different results than multiplying (`net × rate`) after rounding. By passing your pre-computed `taxAmount`, the XML total matches your application's total exactly.
+
+**How to compute it:**
+
+```php
+// Tax-exclusive pricing (you store the net unit price):
+$taxAmount = round(round($quantity * $unitPrice, 2) * $vatRate / 100, 2);
+
+// Tax-inclusive pricing (you store the gross price and extract the net):
+$basePrice = round($grossPrice / (1 + $vatRate / 100), 2);
+$taxAmount = $grossPrice - $basePrice; // This is what you should pass
+```
+
+**Sign convention:** The `taxAmount` sign follows the quantity — negative for credit note lines (negative qty), positive for regular lines.
+
+> **Upgrading from SDK v1.x:** Add `taxAmount` to every `InvoiceLineData` in your `toEfacturaData()` method. Pass the VAT amount your application already computes for each line item.
 
 ### Process Upload Immediately
 
