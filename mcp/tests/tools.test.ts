@@ -122,6 +122,12 @@ describe("get-job-reference", () => {
   it("covers scheduling recommendations", () => {
     expect(jobReferenceContent).toContain("Schedule");
   });
+
+  it("documents periodic batch-job backlog hardening", () => {
+    expect(jobReferenceContent).toContain("DiscardsWhenStale");
+    expect(jobReferenceContent).toContain("ShouldBeUniqueUntilProcessing");
+    expect(jobReferenceContent).toContain("jobs.max_staleness_seconds");
+  });
 });
 
 describe("get-wrapper-config-reference", () => {
@@ -138,5 +144,12 @@ describe("get-wrapper-config-reference", () => {
     expect(wrapperConfigContent).toContain("storage");
     expect(wrapperConfigContent).toContain("routes");
     expect(wrapperConfigContent).toContain("rate_limit");
+  });
+
+  it("documents the periodic job hardening config", () => {
+    expect(wrapperConfigContent).toContain("jobs.max_staleness_seconds");
+    expect(wrapperConfigContent).toContain("jobs.unique_for_seconds");
+    expect(wrapperConfigContent).toContain("EFACTURA_JOB_MAX_STALENESS");
+    expect(wrapperConfigContent).toContain("EFACTURA_JOB_UNIQUE_FOR");
   });
 });

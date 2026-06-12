@@ -21723,6 +21723,10 @@ All batch jobs (ProcessPendingUploads, CheckUploadStatuses, DownloadResponses, D
 - Run on the configured queue: \`config('efactura.queue')\`
 - Check \`config('efactura.enabled')\` and their feature flag before executing \u2014 if either is false, the job exits immediately
 
+The three high-frequency periodic jobs \u2014 **ProcessPendingUploads**, **CheckUploadStatuses**, **DownloadResponses** \u2014 additionally guard against a backlog that piles up while the queue worker is down and then drains all at once on recovery (which would re-scan the same rows and exhaust ANAF's per-message rate limits before processing can advance):
+- They implement \`ShouldBeUniqueUntilProcessing\`, keyed per-CUI via \`uniqueId()\`, so the scheduler will not enqueue a duplicate while one is still queued unprocessed. Lock TTL: \`jobs.unique_for_seconds\` (default 3600).
+- They self-discard when stale (\`DiscardsWhenStale\` trait): a job that waited in the queue longer than \`jobs.max_staleness_seconds\` (default 120) returns immediately without running. Safe because these jobs are idempotent all-rows scanners \u2014 the next scheduled run re-scans.
+
 ---
 
 ## Batch Jobs (for Scheduling)
@@ -21949,6 +21953,17 @@ Configuration for handling ANAF's daily upload quotas and retry behavior.
 
 ---
 
+## jobs
+
+Hardening for the periodic batch jobs so a backlog that accumulates while the queue worker is down does not drain all at once on recovery and overwhelm ANAF's per-message rate limits.
+
+| Config Key | Env Var | Type | Default | Description |
+|-----------|---------|------|---------|-------------|
+| \`jobs.max_staleness_seconds\` | \`EFACTURA_JOB_MAX_STALENESS\` | int | \`120\` | A periodic batch job (\`ProcessPendingUploads\`, \`CheckUploadStatuses\`, \`DownloadResponses\`) that has waited in the queue longer than this self-discards instead of running \u2014 the next scheduled run re-scans. Safe because these jobs are idempotent all-rows scanners. Set to \`0\` to disable. Default is 2x the typical 1-minute cadence. |
+| \`jobs.unique_for_seconds\` | \`EFACTURA_JOB_UNIQUE_FOR\` | int | \`3600\` | Lock TTL (seconds) for \`ShouldBeUniqueUntilProcessing\` on those three batch jobs \u2014 the ceiling after which a job stuck unprocessed in the queue stops blocking a fresh dispatch. |
+
+---
+
 ## storage
 
 Where generated XML files and ANAF response ZIPs are stored.
@@ -21992,6 +22007,10 @@ EFACTURA_QUEUE=efactura
 EFACTURA_RATE_LIMIT_RETRY_HOURS=24
 EFACTURA_RATE_LIMIT_RETRY_BATCH=250
 EFACTURA_RATE_LIMIT_RETRY_MAX_DAYS=7
+
+# Periodic job hardening
+EFACTURA_JOB_MAX_STALENESS=120
+EFACTURA_JOB_UNIQUE_FOR=3600
 
 # Storage
 EFACTURA_STORAGE_DISK=local

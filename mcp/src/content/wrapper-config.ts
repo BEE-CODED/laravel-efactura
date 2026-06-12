@@ -47,6 +47,17 @@ Configuration for handling ANAF's daily upload quotas and retry behavior.
 
 ---
 
+## jobs
+
+Hardening for the periodic batch jobs so a backlog that accumulates while the queue worker is down does not drain all at once on recovery and overwhelm ANAF's per-message rate limits.
+
+| Config Key | Env Var | Type | Default | Description |
+|-----------|---------|------|---------|-------------|
+| \`jobs.max_staleness_seconds\` | \`EFACTURA_JOB_MAX_STALENESS\` | int | \`120\` | A periodic batch job (\`ProcessPendingUploads\`, \`CheckUploadStatuses\`, \`DownloadResponses\`) that has waited in the queue longer than this self-discards instead of running — the next scheduled run re-scans. Safe because these jobs are idempotent all-rows scanners. Set to \`0\` to disable. Default is 2x the typical 1-minute cadence. |
+| \`jobs.unique_for_seconds\` | \`EFACTURA_JOB_UNIQUE_FOR\` | int | \`3600\` | Lock TTL (seconds) for \`ShouldBeUniqueUntilProcessing\` on those three batch jobs — the ceiling after which a job stuck unprocessed in the queue stops blocking a fresh dispatch. |
+
+---
+
 ## storage
 
 Where generated XML files and ANAF response ZIPs are stored.
@@ -90,6 +101,10 @@ EFACTURA_QUEUE=efactura
 EFACTURA_RATE_LIMIT_RETRY_HOURS=24
 EFACTURA_RATE_LIMIT_RETRY_BATCH=250
 EFACTURA_RATE_LIMIT_RETRY_MAX_DAYS=7
+
+# Periodic job hardening
+EFACTURA_JOB_MAX_STALENESS=120
+EFACTURA_JOB_UNIQUE_FOR=3600
 
 # Storage
 EFACTURA_STORAGE_DISK=local

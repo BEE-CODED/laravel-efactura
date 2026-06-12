@@ -10,6 +10,10 @@ All batch jobs (ProcessPendingUploads, CheckUploadStatuses, DownloadResponses, D
 - Run on the configured queue: \`config('efactura.queue')\`
 - Check \`config('efactura.enabled')\` and their feature flag before executing — if either is false, the job exits immediately
 
+The three high-frequency periodic jobs — **ProcessPendingUploads**, **CheckUploadStatuses**, **DownloadResponses** — additionally guard against a backlog that piles up while the queue worker is down and then drains all at once on recovery (which would re-scan the same rows and exhaust ANAF's per-message rate limits before processing can advance):
+- They implement \`ShouldBeUniqueUntilProcessing\`, keyed per-CUI via \`uniqueId()\`, so the scheduler will not enqueue a duplicate while one is still queued unprocessed. Lock TTL: \`jobs.unique_for_seconds\` (default 3600).
+- They self-discard when stale (\`DiscardsWhenStale\` trait): a job that waited in the queue longer than \`jobs.max_staleness_seconds\` (default 120) returns immediately without running. Safe because these jobs are idempotent all-rows scanners — the next scheduled run re-scans.
+
 ---
 
 ## Batch Jobs (for Scheduling)
