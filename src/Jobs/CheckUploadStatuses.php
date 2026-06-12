@@ -11,16 +11,18 @@
 
 namespace BeeCoded\EFactura\Jobs;
 
+use BeeCoded\EFactura\Jobs\Concerns\DiscardsWhenStale;
 use BeeCoded\EFactura\Services\DownloadService;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldBeUniqueUntilProcessing;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 
-class CheckUploadStatuses implements ShouldQueue
+class CheckUploadStatuses implements ShouldBeUniqueUntilProcessing, ShouldQueue
 {
-    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use DiscardsWhenStale, Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public int $tries = 3;
 
@@ -30,14 +32,27 @@ class CheckUploadStatuses implements ShouldQueue
 
     public int $maxExceptions = 3;
 
+    public int $uniqueFor;
+
     public function __construct(
         public ?string $cui = null,
     ) {
         $this->onQueue(config('efactura.queue'));
+        $this->markEnqueued();
+        $this->uniqueFor = (int) config('efactura.jobs.unique_for_seconds', 3600);
+    }
+
+    public function uniqueId(): string
+    {
+        return $this->cui ?? 'all';
     }
 
     public function handle(DownloadService $downloadService): void
     {
+        if ($this->isStale()) {
+            return;
+        }
+
         if (!config('efactura.enabled') || !config('efactura.features.upload_invoices')) {
             return;
         }

@@ -16,8 +16,10 @@ use BeeCoded\EFactura\Services\MessageSyncService;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFacturaSdk\Services\RateLimiter;
+use Illuminate\Contracts\Queue\Job;
 use Illuminate\Contracts\Queue\ShouldBeUniqueUntilProcessing;
 use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Queue;
 
 beforeEach(function () {
@@ -374,7 +376,7 @@ describe('ProcessSingleUpload Job', function () {
 
         expect($job->timeout)->toBe(120);
         expect($job->maxExceptions)->toBe(3);
-        expect($job->retryUntil())->toBeInstanceOf(\DateTime::class);
+        expect($job->retryUntil())->toBeInstanceOf(DateTime::class);
     });
 
     it('does nothing when efactura is disabled', function () {
@@ -548,7 +550,7 @@ describe('ProcessSingleUpload Rate Limiting', function () {
         $job = new ProcessSingleUpload($upload);
         $retryUntil = $job->retryUntil();
 
-        expect($retryUntil)->toBeInstanceOf(\DateTime::class);
+        expect($retryUntil)->toBeInstanceOf(DateTime::class);
         // Should be approximately 12 hours from now
         $diffHours = (int) round((now()->diffInMinutes($retryUntil)) / 60);
         expect($diffHours)->toBe(12);
@@ -574,7 +576,7 @@ describe('ProcessSingleUpload Rate Limiting', function () {
             ->with('global')
             ->andReturn(['remaining' => 0, 'resetsIn' => 30]);
 
-        $fakeQueueJob = Mockery::mock(\Illuminate\Contracts\Queue\Job::class);
+        $fakeQueueJob = Mockery::mock(Job::class);
         $fakeQueueJob->shouldReceive('release')->with(30)->once();
 
         $job = new ProcessSingleUpload($upload);
@@ -603,7 +605,7 @@ describe('ProcessSingleUpload Rate Limiting', function () {
             ->with('global')
             ->andReturn(['remaining' => 0, 'resetsIn' => 3]);
 
-        $fakeQueueJob = Mockery::mock(\Illuminate\Contracts\Queue\Job::class);
+        $fakeQueueJob = Mockery::mock(Job::class);
         $fakeQueueJob->shouldReceive('release')->with(10)->once();
 
         $job = new ProcessSingleUpload($upload);
@@ -687,7 +689,7 @@ describe('ProcessSingleUpload Rate Limiting', function () {
         $rateLimiter = Mockery::mock(RateLimiter::class);
         $rateLimiter->shouldReceive('isEnabled')->andReturn(false);
 
-        $fakeQueueJob = Mockery::mock(\Illuminate\Contracts\Queue\Job::class);
+        $fakeQueueJob = Mockery::mock(Job::class);
         $fakeQueueJob->shouldReceive('release')->with(60)->once();
 
         $job = new ProcessSingleUpload($upload);
@@ -723,7 +725,7 @@ describe('ProcessSingleUpload Rate Limiting', function () {
         $rateLimiter = Mockery::mock(RateLimiter::class);
         $rateLimiter->shouldReceive('isEnabled')->andReturn(false);
 
-        $fakeQueueJob = Mockery::mock(\Illuminate\Contracts\Queue\Job::class);
+        $fakeQueueJob = Mockery::mock(Job::class);
         $fakeQueueJob->shouldNotReceive('release');
 
         $job = new ProcessSingleUpload($upload);
@@ -801,12 +803,12 @@ describe('ProcessSingleUpload Failed Handler', function () {
 
         $job = new ProcessSingleUpload($upload);
 
-        Illuminate\Support\Facades\Log::shouldReceive('error')
+        Log::shouldReceive('error')
             ->once()
             ->with('EFactura: Upload job failed permanently', Mockery::on(fn ($ctx) => $ctx['upload_id'] === $upload->id
                 && $ctx['error'] === 'Something went wrong'));
 
-        $job->failed(new \RuntimeException('Something went wrong'));
+        $job->failed(new RuntimeException('Something went wrong'));
     });
 });
 
@@ -957,6 +959,78 @@ describe('RetryRateLimitedUploads Job', function () {
 
         // Only 2 should be dispatched (batch size limit)
         Queue::assertPushed(ProcessSingleUpload::class, 2);
+    });
+});
+
+describe('Batch jobs discard themselves when stale', function () {
+    it('CheckUploadStatuses skips checkAllStatuses when stale', function () {
+        config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true, 'efactura.jobs.max_staleness_seconds' => 120]);
+
+        $downloadService = Mockery::mock(DownloadService::class);
+        $downloadService->shouldNotReceive('checkAllStatuses');
+
+        $job = new CheckUploadStatuses;
+        $job->enqueuedAt = now()->subSeconds(200)->getTimestamp();
+        $job->handle($downloadService);
+    });
+
+    it('DownloadResponses skips downloadAllResponses when stale', function () {
+        config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true, 'efactura.jobs.max_staleness_seconds' => 120]);
+
+        $downloadService = Mockery::mock(DownloadService::class);
+        $downloadService->shouldNotReceive('downloadAllResponses');
+
+        $job = new DownloadResponses;
+        $job->enqueuedAt = now()->subSeconds(200)->getTimestamp();
+        $job->handle($downloadService);
+    });
+
+    it('ProcessPendingUploads skips work when stale', function () {
+        config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true, 'efactura.jobs.max_staleness_seconds' => 120]);
+
+        Queue::fake();
+
+        $tokenService = Mockery::mock(TokenService::class);
+
+        $job = new ProcessPendingUploads;
+        $job->enqueuedAt = now()->subSeconds(200)->getTimestamp();
+        $job->handle($tokenService);
+
+        Queue::assertNothingPushed();
+    });
+
+    it('CheckUploadStatuses still runs when fresh', function () {
+        config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true, 'efactura.jobs.max_staleness_seconds' => 120]);
+
+        $downloadService = Mockery::mock(DownloadService::class);
+        $downloadService->shouldReceive('checkAllStatuses')->once()->with(null);
+
+        $job = new CheckUploadStatuses; // fresh: enqueuedAt = now
+        $job->handle($downloadService);
+    });
+});
+
+describe('Batch jobs are unique until processing', function () {
+    it('CheckUploadStatuses implements ShouldBeUniqueUntilProcessing with configured TTL and per-CUI id', function () {
+        config(['efactura.jobs.unique_for_seconds' => 3600]);
+
+        $job = new CheckUploadStatuses('12345678');
+
+        expect($job)->toBeInstanceOf(ShouldBeUniqueUntilProcessing::class)
+            ->and($job->uniqueFor)->toBe(3600)
+            ->and($job->uniqueId())->toBe('12345678');
+    });
+
+    it('CheckUploadStatuses uniqueId falls back to "all" without a CUI', function () {
+        expect((new CheckUploadStatuses)->uniqueId())->toBe('all');
+    });
+
+    it('DownloadResponses implements ShouldBeUniqueUntilProcessing', function () {
+        expect(new DownloadResponses)->toBeInstanceOf(ShouldBeUniqueUntilProcessing::class);
+    });
+
+    it('ProcessPendingUploads implements ShouldBeUniqueUntilProcessing', function () {
+        expect(new ProcessPendingUploads)->toBeInstanceOf(ShouldBeUniqueUntilProcessing::class);
     });
 });
 

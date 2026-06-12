@@ -13,18 +13,20 @@ declare(strict_types=1);
 
 namespace BeeCoded\EFactura\Jobs;
 
+use BeeCoded\EFactura\Jobs\Concerns\DiscardsWhenStale;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\TokenService;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldBeUniqueUntilProcessing;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 
-class ProcessPendingUploads implements ShouldQueue
+class ProcessPendingUploads implements ShouldBeUniqueUntilProcessing, ShouldQueue
 {
-    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use DiscardsWhenStale, Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public int $tries = 3;
 
@@ -34,14 +36,27 @@ class ProcessPendingUploads implements ShouldQueue
 
     public int $maxExceptions = 3;
 
+    public int $uniqueFor;
+
     public function __construct(
         public ?string $cui = null,
     ) {
         $this->onQueue(config('efactura.queue'));
+        $this->markEnqueued();
+        $this->uniqueFor = (int) config('efactura.jobs.unique_for_seconds', 3600);
+    }
+
+    public function uniqueId(): string
+    {
+        return $this->cui ?? 'all';
     }
 
     public function handle(TokenService $tokenService): void
     {
+        if ($this->isStale()) {
+            return;
+        }
+
         if (!config('efactura.enabled') || !config('efactura.features.upload_invoices')) {
             return;
         }

@@ -68,6 +68,29 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Periodic Job Hardening
+    |--------------------------------------------------------------------------
+    |
+    | Protects the periodic batch jobs (CheckUploadStatuses, DownloadResponses,
+    | ProcessPendingUploads) from a backlog that accumulates while the queue
+    | worker is down and then drains all at once when it recovers.
+    |
+    | max_staleness_seconds: A batch job that has waited in the queue longer
+    |                        than this self-discards instead of running (the
+    |                        next scheduled run will re-scan). Set to 0 to
+    |                        disable. Default 120 (2x the 1-minute cadence).
+    | unique_for_seconds:    Lock TTL for ShouldBeUniqueUntilProcessing — the
+    |                        ceiling after which a job stuck unprocessed in the
+    |                        queue stops blocking a fresh dispatch. Default 3600.
+    |
+    */
+    'jobs' => [
+        'max_staleness_seconds' => env('EFACTURA_JOB_MAX_STALENESS', 120),
+        'unique_for_seconds' => env('EFACTURA_JOB_UNIQUE_FOR', 3600),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | File Storage
     |--------------------------------------------------------------------------
     |
