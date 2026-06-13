@@ -25,6 +25,12 @@ describe("get-wrapper-docs", () => {
     expect(content).toContain("EFactura");
   });
 
+  it("overview documents the ANAF lookup retry decorator", () => {
+    const content = wrapperDocsContent["overview"];
+    expect(content).toContain("RetryingAnafDetailsClient");
+    expect(content).toContain("RateLimitExceededException");
+  });
+
   it("setup covers installation steps", () => {
     expect(wrapperDocsContent["setup"]).toContain("composer require");
     expect(wrapperDocsContent["setup"]).toContain("vendor:publish");
@@ -151,5 +157,10 @@ describe("get-wrapper-config-reference", () => {
     expect(wrapperConfigContent).toContain("jobs.unique_for_seconds");
     expect(wrapperConfigContent).toContain("EFACTURA_JOB_MAX_STALENESS");
     expect(wrapperConfigContent).toContain("EFACTURA_JOB_UNIQUE_FOR");
+  });
+
+  it("documents the ANAF company-lookup retry config", () => {
+    expect(wrapperConfigContent).toContain("anaf_lookup.retry_attempts");
+    expect(wrapperConfigContent).toContain("EFACTURA_ANAF_LOOKUP_RETRY_ATTEMPTS");
   });
 });

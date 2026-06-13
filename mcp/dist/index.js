@@ -21050,6 +21050,10 @@ Three independent feature flags for granular control:
 - \`features.upload_invoices\` \u2014 Enable/disable upload pipeline
 - \`features.download_received\` \u2014 Enable/disable received invoice downloads (default: off)
 - \`features.sync_messages\` \u2014 Enable/disable ANAF message sync
+
+### ANAF Lookup Retry Decorator
+
+The wrapper decorates the SDK's \`AnafDetailsClientInterface\` binding with \`RetryingAnafDetailsClient\`. ANAF's public company-lookup endpoint is capped at 1 request/second and the SDK throws \`RateLimitExceededException\` without retrying; the decorator retries up to \`anaf_lookup.retry_attempts\` total attempts (default 5), sleeping the exception's \`retryAfterSeconds\` (>= 1s) between attempts, then re-throws. Synchronous/blocking; only the rate-limit exception is retried (a \`failure()\` result passes through). Resolving the interface or the \`AnafDetails\` facade yields the resilient client transparently \u2014 no app code change.
 `,
   setup: `# Laravel e-Factura Wrapper \u2014 Setup & Installation
 
@@ -21953,6 +21957,16 @@ Configuration for handling ANAF's daily upload quotas and retry behavior.
 
 ---
 
+## anaf_lookup
+
+Synchronous retry policy for the public ANAF **company-lookup** endpoint (capped at 1 request/second). The wrapper decorates the SDK's \`AnafDetailsClientInterface\` with \`RetryingAnafDetailsClient\`, which retries on \`RateLimitExceededException\`.
+
+| Config Key | Env Var | Type | Default | Description |
+|-----------|---------|------|---------|-------------|
+| \`anaf_lookup.retry_attempts\` | \`EFACTURA_ANAF_LOOKUP_RETRY_ATTEMPTS\` | int | \`5\` | Total attempts (1 initial + N\u22121 retries) before re-throwing \`RateLimitExceededException\`. Between attempts the decorator sleeps the exception's \`retryAfterSeconds\` (\u2265 1s) \u2014 synchronous/blocking, so a fully rate-limited lookup blocks up to ~\`(attempts \u2212 1)\` seconds. Only the rate-limit exception is retried; \`failure()\` results pass straight through. |
+
+---
+
 ## jobs
 
 Hardening for the periodic batch jobs so a backlog that accumulates while the queue worker is down does not drain all at once on recovery and overwhelm ANAF's per-message rate limits.
@@ -22007,6 +22021,9 @@ EFACTURA_QUEUE=efactura
 EFACTURA_RATE_LIMIT_RETRY_HOURS=24
 EFACTURA_RATE_LIMIT_RETRY_BATCH=250
 EFACTURA_RATE_LIMIT_RETRY_MAX_DAYS=7
+
+# ANAF company-lookup retry (1 req/sec endpoint)
+EFACTURA_ANAF_LOOKUP_RETRY_ATTEMPTS=5
 
 # Periodic job hardening
 EFACTURA_JOB_MAX_STALENESS=120

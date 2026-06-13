@@ -68,6 +68,21 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | ANAF Company Lookup
+    |--------------------------------------------------------------------------
+    |
+    | Synchronous retry policy for the public ANAF company-lookup endpoint
+    | (1 request/second). On a RateLimitExceededException the decorator retries
+    | up to `retry_attempts` TOTAL attempts (1 initial + N-1 retries), sleeping
+    | the exception's retryAfterSeconds (>= 1s) between attempts, then re-throws.
+    |
+    */
+    'anaf_lookup' => [
+        'retry_attempts' => env('EFACTURA_ANAF_LOOKUP_RETRY_ATTEMPTS', 5),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Periodic Job Hardening
     |--------------------------------------------------------------------------
     |

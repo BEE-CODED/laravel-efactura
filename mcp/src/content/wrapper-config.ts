@@ -47,6 +47,16 @@ Configuration for handling ANAF's daily upload quotas and retry behavior.
 
 ---
 
+## anaf_lookup
+
+Synchronous retry policy for the public ANAF **company-lookup** endpoint (capped at 1 request/second). The wrapper decorates the SDK's \`AnafDetailsClientInterface\` with \`RetryingAnafDetailsClient\`, which retries on \`RateLimitExceededException\`.
+
+| Config Key | Env Var | Type | Default | Description |
+|-----------|---------|------|---------|-------------|
+| \`anaf_lookup.retry_attempts\` | \`EFACTURA_ANAF_LOOKUP_RETRY_ATTEMPTS\` | int | \`5\` | Total attempts (1 initial + N−1 retries) before re-throwing \`RateLimitExceededException\`. Between attempts the decorator sleeps the exception's \`retryAfterSeconds\` (≥ 1s) — synchronous/blocking, so a fully rate-limited lookup blocks up to ~\`(attempts − 1)\` seconds. Only the rate-limit exception is retried; \`failure()\` results pass straight through. |
+
+---
+
 ## jobs
 
 Hardening for the periodic batch jobs so a backlog that accumulates while the queue worker is down does not drain all at once on recovery and overwhelm ANAF's per-message rate limits.
@@ -101,6 +111,9 @@ EFACTURA_QUEUE=efactura
 EFACTURA_RATE_LIMIT_RETRY_HOURS=24
 EFACTURA_RATE_LIMIT_RETRY_BATCH=250
 EFACTURA_RATE_LIMIT_RETRY_MAX_DAYS=7
+
+# ANAF company-lookup retry (1 req/sec endpoint)
+EFACTURA_ANAF_LOOKUP_RETRY_ATTEMPTS=5
 
 # Periodic job hardening
 EFACTURA_JOB_MAX_STALENESS=120

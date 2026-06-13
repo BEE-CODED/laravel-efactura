@@ -54,6 +54,7 @@ class TestInvoice extends Model implements EFacturaUploadableInterface
                     name: 'Test Product',
                     quantity: 1,
                     unitPrice: $this->total ?? 100,
+                    taxAmount: round(($this->total ?? 100) * 0.19, 2),
                     taxPercent: 19,
                 ),
             ],

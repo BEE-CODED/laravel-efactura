@@ -62,6 +62,10 @@ Three independent feature flags for granular control:
 - \`features.upload_invoices\` — Enable/disable upload pipeline
 - \`features.download_received\` — Enable/disable received invoice downloads (default: off)
 - \`features.sync_messages\` — Enable/disable ANAF message sync
+
+### ANAF Lookup Retry Decorator
+
+The wrapper decorates the SDK's \`AnafDetailsClientInterface\` binding with \`RetryingAnafDetailsClient\`. ANAF's public company-lookup endpoint is capped at 1 request/second and the SDK throws \`RateLimitExceededException\` without retrying; the decorator retries up to \`anaf_lookup.retry_attempts\` total attempts (default 5), sleeping the exception's \`retryAfterSeconds\` (>= 1s) between attempts, then re-throws. Synchronous/blocking; only the rate-limit exception is retried (a \`failure()\` result passes through). Resolving the interface or the \`AnafDetails\` facade yields the resilient client transparently — no app code change.
 `,
 
   setup: `# Laravel e-Factura Wrapper — Setup & Installation

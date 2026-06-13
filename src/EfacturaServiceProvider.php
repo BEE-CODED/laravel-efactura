@@ -13,8 +13,10 @@ namespace BeeCoded\EFactura;
 
 use BeeCoded\EFactura\Services\DownloadService;
 use BeeCoded\EFactura\Services\MessageSyncService;
+use BeeCoded\EFactura\Services\RetryingAnafDetailsClient;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
+use BeeCoded\EFacturaSdk\Contracts\AnafDetailsClientInterface;
 use Illuminate\Support\ServiceProvider;
 
 class EfacturaServiceProvider extends ServiceProvider
@@ -34,6 +36,16 @@ class EfacturaServiceProvider extends ServiceProvider
                 $app->make(UploadService::class),
                 $app->make(DownloadService::class),
                 $app->make(MessageSyncService::class),
+            );
+        });
+
+        // Wrap the SDK's ANAF lookup client with synchronous retry on the 1 req/sec
+        // rate limit. extend() decorates whatever the SDK provider bound, so the app
+        // injects the resilient client transparently via the SDK interface.
+        $this->app->extend(AnafDetailsClientInterface::class, function (AnafDetailsClientInterface $inner) {
+            return new RetryingAnafDetailsClient(
+                $inner,
+                (int) config('efactura.anaf_lookup.retry_attempts', 5),
             );
         });
     }

@@ -3,6 +3,7 @@
 namespace BeeCoded\EFactura\Tests;
 
 use BeeCoded\EFactura\EfacturaServiceProvider;
+use BeeCoded\EFactura\Facades\EFactura;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Orchestra\Testbench\TestCase as Orchestra;
 
@@ -20,6 +21,10 @@ abstract class TestCase extends Orchestra
     protected function getPackageProviders($app): array
     {
         return [
+            // The SDK provider binds AnafDetailsClientInterface; auto-discovered in
+            // a real app. Registered here so the wrapper's decorating extend() has a
+            // concrete to wrap (mirrors production wiring).
+            \BeeCoded\EFacturaSdk\EFacturaServiceProvider::class,
             EfacturaServiceProvider::class,
         ];
     }
@@ -27,7 +32,7 @@ abstract class TestCase extends Orchestra
     protected function getPackageAliases($app): array
     {
         return [
-            'EFactura' => \BeeCoded\EFactura\Facades\EFactura::class,
+            'EFactura' => EFactura::class,
         ];
     }
 

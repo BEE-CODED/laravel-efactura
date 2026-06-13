@@ -3,8 +3,10 @@
 use BeeCoded\EFactura\EfacturaManager;
 use BeeCoded\EFactura\Services\DownloadService;
 use BeeCoded\EFactura\Services\MessageSyncService;
+use BeeCoded\EFactura\Services\RetryingAnafDetailsClient;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
+use BeeCoded\EFacturaSdk\Contracts\AnafDetailsClientInterface;
 
 describe('EfacturaServiceProvider', function () {
     describe('Service Registration', function () {
@@ -54,6 +56,18 @@ describe('EfacturaServiceProvider', function () {
         });
     });
 
+    describe('ANAF Details Decorator', function () {
+        it('decorates AnafDetailsClientInterface with the retrying decorator', function () {
+            expect(app(AnafDetailsClientInterface::class))
+                ->toBeInstanceOf(RetryingAnafDetailsClient::class);
+        });
+
+        it('resolves the decorator as a shared singleton', function () {
+            expect(app(AnafDetailsClientInterface::class))
+                ->toBe(app(AnafDetailsClientInterface::class));
+        });
+    });
+
     describe('Configuration', function () {
         it('merges default config', function () {
             expect(config('efactura.enabled'))->not->toBeNull();
@@ -90,25 +104,25 @@ describe('EfacturaServiceProvider', function () {
 
     describe('Console Commands', function () {
         it('registers efactura:upload command', function () {
-            $commands = array_keys(\Artisan::all());
+            $commands = array_keys(Artisan::all());
 
             expect($commands)->toContain('efactura:upload');
         });
 
         it('registers efactura:status command', function () {
-            $commands = array_keys(\Artisan::all());
+            $commands = array_keys(Artisan::all());
 
             expect($commands)->toContain('efactura:status');
         });
 
         it('registers efactura:sync command', function () {
-            $commands = array_keys(\Artisan::all());
+            $commands = array_keys(Artisan::all());
 
             expect($commands)->toContain('efactura:sync');
         });
 
         it('registers efactura:auth command', function () {
-            $commands = array_keys(\Artisan::all());
+            $commands = array_keys(Artisan::all());
 
             expect($commands)->toContain('efactura:auth');
         });

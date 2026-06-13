@@ -295,6 +295,38 @@ $company = AnafDetails::getCompanyData('12345678');
 $companies = AnafDetails::batchGetCompanyData(['12345678', '87654321']);
 ```
 
+#### Automatic Retry on ANAF's Rate Limit
+
+ANAF's public company-lookup endpoint is capped at **1 request/second**. The SDK
+enforces this client-side and throws `RateLimitExceededException` when the limit
+is exceeded — it does **not** retry. This wrapper decorates the SDK's
+`AnafDetailsClientInterface` binding with `RetryingAnafDetailsClient`, which
+**retries up to 5 total attempts** (configurable), sleeping the exception's
+`retryAfterSeconds` (≥ 1s) between attempts, then re-throws if still limited.
+
+The retry is **synchronous and blocking** — a fully rate-limited lookup can block
+the request for up to ~`(attempts − 1)` seconds before re-throwing, so the
+consuming app can surface a "registry busy — retry" message. Only the rate-limit
+exception triggers a retry; a `failure()` result (invalid CUI, malformed
+response) passes straight through, and the SDK already retries transient
+5xx/connection errors internally.
+
+Because the binding is decorated, **no code change is needed** — anything
+resolving `AnafDetailsClientInterface` (or the `AnafDetails` facade) gets the
+resilient client transparently.
+
+```env
+# Total attempts before re-throwing RateLimitExceededException (default: 5)
+EFACTURA_ANAF_LOOKUP_RETRY_ATTEMPTS=5
+```
+
+```php
+// config/efactura.php
+'anaf_lookup' => [
+    'retry_attempts' => env('EFACTURA_ANAF_LOOKUP_RETRY_ATTEMPTS', 5),
+],
+```
+
 ## OAuth Flow
 
 ### 1. Redirect to ANAF
