@@ -21022,7 +21022,7 @@ EFactura::client($cui); // raw SDK client with token
 
 | Model | Purpose |
 |-------|---------|
-| \`EfacturaToken\` | Encrypted OAuth tokens per CUI (company), with \`is_active\` flag and \`last_used_at\` tracking |
+| \`EfacturaToken\` | OAuth tokens per CUI (company), with \`is_active\` flag and \`last_used_at\` tracking. Tokens are stored **unencrypted** \u2014 see Token Model |
 | \`EfacturaUpload\` | Polymorphic upload record tracking status, XML path, download ID, response path, errors |
 | \`EfacturaMessage\` | Synced ANAF messages (sent/received invoices, errors, buyer messages) |
 
@@ -21270,7 +21270,7 @@ GET /efactura/auth/{cui}      \u2192 Generate and redirect to ANAF OAuth URL
 GET /efactura/callback         \u2192 Handle OAuth callback, store token
 \`\`\`
 
-\`OAuthCallbackController\` handles the code exchange, stores encrypted tokens via \`TokenService::storeToken()\`, and fires \`TokenStored\` event.
+\`OAuthCallbackController\` handles the code exchange, stores the tokens via \`TokenService::storeToken()\`, and fires \`TokenStored\` event.
 
 ### Option B: Manual URL Generation
 
@@ -21324,11 +21324,26 @@ $result = EFactura::tokenService()->executeWithClient(
 
 The \`EfacturaToken\` model stores:
 - \`cui\` \u2014 Company identifier (without RO prefix)
-- \`access_token\` \u2014 Encrypted via Laravel's \`Crypt\`
-- \`refresh_token\` \u2014 Encrypted via Laravel's \`Crypt\`
+- \`access_token\` \u2014 Stored as-is, in a plain \`text\` column
+- \`refresh_token\` \u2014 Stored as-is, in a plain \`text\` column
 - \`expires_at\` \u2014 Token expiry timestamp
 - \`is_active\` \u2014 Boolean flag (deactivation doesn't delete)
 - \`last_used_at\` \u2014 Updated on every API call
+
+> **Tokens are NOT encrypted at rest.** Earlier revisions of this document claimed they were
+> encrypted via Laravel's \`Crypt\`; that was never true \u2014 no encryption exists anywhere in the
+> package. Both columns are plain \`text\` and \`TokenService::storeToken()\` writes the values
+> verbatim.
+>
+> The model does set \`$hidden\` for both fields, but that only keeps them out of \`toArray()\` /
+> \`toJson()\` output \u2014 it has no effect on what is written to the database. Anyone with read
+> access to the \`efactura_tokens\` table, a database backup, or a query log holds live ANAF
+> credentials.
+>
+> Treat the table as secret material: restrict database access, and consider adding
+> \`'access_token' => 'encrypted'\` / \`'refresh_token' => 'encrypted'\` to the model's \`$casts\`
+> in your own application if you need encryption at rest. Note that doing so requires migrating
+> any existing rows, since previously stored values are plaintext.
 
 ## Events
 
