@@ -34,13 +34,19 @@ jobs:
           - laravel: '13.*'
             testbench: '11.*'
         exclude:
-          # Laravel 13 is tested prefer-stable only: prefer-lowest would pull test
-          # deps (pest 3.0 / phpunit 11) that predate Laravel 13 and cannot resolve.
+          # Laravel 11 and 13 are tested prefer-stable only. Laravel 13's prefer-lowest
+          # cannot resolve test deps (pest 3.0 / phpunit 11) that predate it; Laravel 11's
+          # prefer-lowest pins the oldest 11.0 patch (advisory-flagged, an older pest with
+          # buggy duplicate-test detection, and a cache-state edge in the CLI OAuth flow).
+          # Real 11.x/13.x installs run current patches, which prefer-stable covers;
+          # Laravel 12 still runs a full prefer-lowest.
+          - laravel: '11.*'
+            dependency-version: prefer-lowest
           - laravel: '13.*'
             dependency-version: prefer-lowest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
@@ -97,7 +103,7 @@ jobs:
       DB_PASSWORD: postgres
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: shivammathur/setup-php@v2
         with:
           php-version: '8.4'
@@ -120,7 +126,7 @@ jobs:
     name: PHPStan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: shivammathur/setup-php@v2
         with:
           php-version: '8.4'
@@ -135,7 +141,7 @@ jobs:
     name: Pint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: shivammathur/setup-php@v2
         with:
           php-version: '8.4'
@@ -147,8 +153,8 @@ jobs:
     name: MCP server (docs)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: npm
