@@ -5,6 +5,7 @@ namespace BeeCoded\EFactura\Tests;
 use BeeCoded\EFactura\EfacturaServiceProvider;
 use BeeCoded\EFactura\Facades\EFactura;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
 use Orchestra\Testbench\TestCase as Orchestra;
 use Spatie\LaravelData\LaravelDataServiceProvider;
 
@@ -17,6 +18,14 @@ abstract class TestCase extends Orchestra
         parent::setUp();
 
         $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
+
+        // Safety net: on Postgres, never let a test hang on a lock. A cross-connection
+        // race test can leave one connection waiting on another's still-uncommitted row;
+        // fail the statement fast instead of hanging the whole CI job.
+        if (DB::connection()->getDriverName() === 'pgsql') {
+            DB::statement("SET lock_timeout = '10s'");
+            DB::statement("SET statement_timeout = '60s'");
+        }
     }
 
     protected function getPackageProviders($app): array

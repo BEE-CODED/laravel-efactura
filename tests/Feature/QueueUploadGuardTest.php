@@ -80,6 +80,10 @@ function raceWinnerTest(object $test, Closure $assertions): void
     $default = config('database.default');
     config(['database.connections.efactura_race_winner' => config("database.connections.{$default}")]);
     $winnerConnection = DB::connection('efactura_race_winner');
+    // Insurance: a cleanup query that ends up blocked on a lock the default connection
+    // still holds (its RefreshDatabase transaction stays open until teardown) must fail
+    // fast rather than hang the whole CI job. Postgres only.
+    $winnerConnection->statement("SET lock_timeout = '10s'");
 
     // The token from beforeEach lives in RefreshDatabase's uncommitted transaction on
     // the DEFAULT connection, so this second connection cannot see it — and the winning
@@ -103,13 +107,17 @@ function raceWinnerTest(object $test, Closure $assertions): void
         }
         $raced = true;
 
-        // Commits immediately on the second connection: durable, outside our
-        // savepoint — exactly a concurrent request that beat us to the insert.
+        // Commits immediately on the second connection: durable, outside our savepoint
+        // — a concurrent request that beat us to the insert and had already completed.
+        // Completed, not Pending, ON PURPOSE: queueFor()'s recovery reuses a Pending
+        // winner with an UPDATE, which row-locks it inside the default connection's
+        // still-open transaction and would deadlock the cleanup DELETE below forever.
+        // A Completed row is returned as-is with no write, so no lock is ever held.
         $winnerConnection->table('efactura_uploads')->insert([
             'efactura_token_id' => $winnerTokenId,
             'uploadable_type' => TestInvoice::class,
             'uploadable_id' => $test->invoice->id,
-            'status' => UploadStatus::Pending->value,
+            'status' => UploadStatus::Completed->value,
             'standard' => 'UBL',
             'is_extern' => false,
             'is_self_billed' => false,
@@ -196,7 +204,7 @@ describe('the create/constraint race', function () {
 
             expect($upload->exists)->toBeTrue()
                 ->and($upload->uploadable_id)->toBe($this->invoice->id)
-                ->and($upload->status)->toBe(UploadStatus::Pending);
+                ->and($upload->status)->toBe(UploadStatus::Completed);
 
             expect(EfacturaUpload::count())->toBe(1);
         });
@@ -210,13 +218,17 @@ describe('the create/constraint race', function () {
     it('rejects a second upload row for the same model outright', function () {
         $this->uploadService->queueUpload($this->invoice);
 
-        expect(fn () => EfacturaUpload::create([
+        // withSavepointIfNeeded contains the unique violation in a savepoint: on Postgres
+        // a bare failed statement poisons the whole (RefreshDatabase) transaction, so the
+        // count() below would then throw "current transaction is aborted". The constraint
+        // still fires regardless — that is what toThrow() asserts.
+        expect(fn () => EfacturaUpload::query()->withSavepointIfNeeded(fn () => EfacturaUpload::create([
             'efactura_token_id' => $this->token->id,
             'uploadable_type' => TestInvoice::class,
             'uploadable_id' => $this->invoice->id,
             'status' => UploadStatus::Pending,
             'standard' => 'UBL',
-        ]))->toThrow(QueryException::class);
+        ])))->toThrow(QueryException::class);
 
         expect(EfacturaUpload::count())->toBe(1);
     });
