@@ -5,6 +5,10 @@ use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFacturaSdk\Data\Auth\OAuthTokensData;
 use BeeCoded\EFacturaSdk\Services\ApiClients\EFacturaClient;
+use Carbon\Carbon as BaseCarbon;
+use Carbon\CarbonImmutable;
+use Illuminate\Support\DateFactory;
+use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\Event;
 
 beforeEach(function () {
@@ -224,6 +228,34 @@ describe('TokenService', function () {
                 // (otherwise RuntimeException would have been thrown)
                 expect(true)->toBeTrue();
             }
+        });
+    });
+
+    describe('createClient with immutable dates', function () {
+        // Date::use() sets a process-global static on DateFactory that Testbench does not
+        // reset, so it must be undone or the rest of the suite silently runs on immutable
+        // dates. afterEach runs even when the test fails.
+        beforeEach(function () {
+            Date::use(CarbonImmutable::class);
+        });
+
+        afterEach(function () {
+            DateFactory::useDefault();
+        });
+
+        it('creates a client from a token carrying an immutable expires_at', function () {
+            // This is the gate every upload, download and sync crosses:
+            // executeWithClient -> createClient -> toOAuthTokensData -> EFacturaClient.
+            // A CarbonImmutable expires_at threw a TypeError here before SDK v2.3.
+            $token = $this->token->fresh();
+
+            expect($token->expires_at)->toBeInstanceOf(CarbonImmutable::class);
+
+            $client = $this->tokenService->createClient($token);
+
+            expect($client)->toBeInstanceOf(EFacturaClient::class)
+                ->and($client->getTokens()->expiresAt)->toBeInstanceOf(BaseCarbon::class)
+                ->and($client->getTokens()->expiresAt->equalTo($token->expires_at))->toBeTrue();
         });
     });
 

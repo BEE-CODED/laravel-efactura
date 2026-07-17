@@ -2,7 +2,11 @@
 
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFacturaSdk\Data\Auth\OAuthTokensData;
+use Carbon\Carbon as BaseCarbon;
+use Carbon\CarbonImmutable;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\DateFactory;
+use Illuminate\Support\Facades\Date;
 
 beforeEach(function () {
     $this->token = EfacturaToken::create([
@@ -98,6 +102,35 @@ describe('EfacturaToken Model', function () {
             expect($dto)->toBeInstanceOf(OAuthTokensData::class);
             expect($dto->accessToken)->toBe('test_access_token');
             expect($dto->refreshToken)->toBe('test_refresh_token');
+            expect($dto->expiresAt->equalTo($this->token->expires_at))->toBeTrue();
+        });
+
+        describe('with immutable dates', function () {
+            // Date::use() writes a process-global static on DateFactory that Testbench does NOT
+            // reset between tests, so it must be undone here or the rest of the suite silently
+            // runs on immutable dates. afterEach runs even when the test fails.
+            beforeEach(function () {
+                Date::use(CarbonImmutable::class);
+            });
+
+            afterEach(function () {
+                DateFactory::useDefault();
+            });
+
+            it('hydrates expires_at as CarbonImmutable', function () {
+                // Guards the premise: if this stops being immutable, the tests below prove nothing.
+                expect($this->token->fresh()->expires_at)->toBeInstanceOf(CarbonImmutable::class);
+            });
+
+            it('builds the DTO without a TypeError', function () {
+                // CarbonImmutable is not a Carbon subclass, so before SDK v2.3 this threw
+                // TypeError on every upload, download and sync via TokenService.
+                $dto = $this->token->fresh()->toOAuthTokensData();
+
+                expect($dto)->toBeInstanceOf(OAuthTokensData::class)
+                    ->and($dto->expiresAt)->toBeInstanceOf(BaseCarbon::class)
+                    ->and($dto->expiresAt->equalTo($this->token->expires_at))->toBeTrue();
+            });
         });
     });
 

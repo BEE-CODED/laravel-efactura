@@ -151,6 +151,13 @@ class Invoice extends Model implements EFacturaUploadableInterface
 }
 ```
 
+> **Using `Date::use(CarbonImmutable::class)`?** Pass your `datetime` casts straight in, as above.
+> `CarbonImmutable` is not a `Carbon` subclass, so this required **SDK v2.3.0+** — on earlier
+> versions `issueDate: $this->issued_at` threw a `TypeError` (or, from a caller without
+> `declare(strict_types=1)`, silently stringified the date and lost its timezone). The SDK
+> normalises immutable dates to a mutable `Carbon` internally; nothing changes for apps on
+> mutable `Carbon`.
+
 ### 2. Available Trait Methods
 
 The `HasEfacturaUpload` trait provides:

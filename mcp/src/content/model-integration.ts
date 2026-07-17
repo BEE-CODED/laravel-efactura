@@ -58,6 +58,14 @@ class Invoice extends Model implements EFacturaUploadableInterface
 }
 \`\`\`
 
+> **Immutable dates:** apps calling \`Date::use(CarbonImmutable::class)\` can pass their \`datetime\`
+> casts (\`$this->issue_date\`, \`$this->due_date\`) straight into \`InvoiceData\` as shown. This
+> requires **SDK v2.3.0+**, because \`CarbonImmutable\` is not a \`Carbon\` subclass. On earlier
+> versions this model code — which, like most app code, has no \`declare(strict_types=1)\` — did
+> **not** throw: PHP coerced the date to a string via \`__toString()\`, silently dropping its
+> timezone and microseconds. Under \`strict_types\` it threw a \`TypeError\` instead. From v2.3.0
+> the SDK normalises immutable dates to a mutable \`Carbon\`, preserving the instant.
+
 ## Step 2: Add HasEfacturaUpload Trait
 
 \`\`\`php
