@@ -152,14 +152,17 @@ describe('UploadService', function () {
                 'total' => 100,
             ]);
 
-            // Create upload without token relationship
+            // token_id is NOT NULL behind a cascade FK, so a genuinely orphaned upload
+            // cannot exist. Create a valid row, then null the loaded relation to exercise
+            // processUpload()'s `if (! $upload->token)` guard without dangling data.
             $orphanUpload = EfacturaUpload::create([
-                'efactura_token_id' => 999, // Non-existent token
+                'efactura_token_id' => $this->token->id,
                 'uploadable_type' => TestInvoice::class,
                 'uploadable_id' => $orphanInvoice->id,
                 'status' => UploadStatus::Pending,
                 'standard' => 'UBL',
             ]);
+            $orphanUpload->setRelation('token', null);
 
             $this->uploadService->processUpload($orphanUpload);
 

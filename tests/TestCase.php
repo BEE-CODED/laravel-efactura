@@ -73,6 +73,11 @@ abstract class TestCase extends Orchestra
                 'driver' => 'sqlite',
                 'database' => ':memory:',
                 'prefix' => '',
+                // Enforce foreign keys on sqlite too (off by default), so a test that
+                // creates a dangling reference — e.g. an upload pointing at a token id
+                // that does not exist — fails here rather than only on Postgres, where
+                // the constraint is always enforced.
+                'foreign_key_constraints' => true,
             ];
 
         $app['config']->set('database.default', 'testing');

@@ -65,14 +65,18 @@ describe('DownloadService', function () {
         });
 
         it('skips upload with missing token', function () {
+            // token_id is NOT NULL behind a cascade FK, so a genuinely orphaned upload
+            // cannot exist. Create a valid row, then null the loaded relation to exercise
+            // the defensive `if (! $upload->token)` guard without inserting dangling data.
             $upload = EfacturaUpload::create([
-                'efactura_token_id' => 999, // Non-existent
+                'efactura_token_id' => $this->token->id,
                 'uploadable_type' => 'App\\Models\\Invoice',
                 'uploadable_id' => 1,
                 'status' => UploadStatus::Processing,
                 'upload_index' => 'INDEX123',
                 'standard' => 'UBL',
             ]);
+            $upload->setRelation('token', null);
 
             // Should not throw, just log and return
             $this->downloadService->checkStatus($upload);
@@ -252,14 +256,17 @@ describe('DownloadService', function () {
         });
 
         it('skips upload with missing token', function () {
+            // See the checkStatus case above: a real orphaned upload cannot exist, so
+            // create a valid row and null the loaded relation to hit the token guard.
             $upload = EfacturaUpload::create([
-                'efactura_token_id' => 999,
+                'efactura_token_id' => $this->token->id,
                 'uploadable_type' => 'App\\Models\\Invoice',
                 'uploadable_id' => 1,
                 'status' => UploadStatus::Completed,
                 'download_id' => 'DL123',
                 'standard' => 'UBL',
             ]);
+            $upload->setRelation('token', null);
 
             // Should not throw
             $this->downloadService->downloadResponse($upload);
@@ -347,13 +354,16 @@ describe('DownloadService', function () {
         });
 
         it('skips messages with missing token', function () {
+            // See the checkStatus case above: a real orphaned message cannot exist, so
+            // create a valid row and null the loaded relation to hit the token guard.
             $message = EfacturaMessage::create([
-                'efactura_token_id' => 999,
+                'efactura_token_id' => $this->token->id,
                 'message_id' => 'MSG123',
                 'type' => 'received',
                 'download_id' => 'DL123',
                 'is_downloaded' => false,
             ]);
+            $message->setRelation('token', null);
 
             // Should not throw
             $this->downloadService->downloadMessage($message);
