@@ -4,10 +4,20 @@ import { modelIntegrationContent } from "../src/content/model-integration.js";
 import { eventReferenceContent } from "../src/content/event-reference.js";
 import { jobReferenceContent } from "../src/content/job-reference.js";
 import { wrapperConfigContent } from "../src/content/wrapper-config.js";
+import { VALID_TOPICS } from "../src/registry.js";
 
-const VALID_TOPICS = [
-  "overview", "setup", "upload-pipeline", "token-management", "commands",
-];
+// Registry/content parity. This is the reason a topic can no longer ship
+// untested: this file used to re-declare VALID_TOPICS, so the `migration` topic
+// was added to the server and silently skipped here.
+//
+// Checking both directions matters:
+//   registry \ content = server advertises a topic that returns an error
+//   content \ registry = documentation written but unreachable through the tool
+describe("registry/content parity", () => {
+  it("VALID_TOPICS and wrapperDocsContent expose exactly the same keys", () => {
+    expect([...VALID_TOPICS].sort()).toEqual(Object.keys(wrapperDocsContent).sort());
+  });
+});
 
 describe("get-wrapper-docs", () => {
   it.each(VALID_TOPICS)("returns content for topic '%s'", (topic) => {

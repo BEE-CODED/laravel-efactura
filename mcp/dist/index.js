@@ -21022,7 +21022,7 @@ EFactura::client($cui); // raw SDK client with token
 
 | Model | Purpose |
 |-------|---------|
-| \`EfacturaToken\` | OAuth tokens per CUI (company), with \`is_active\` flag and \`last_used_at\` tracking. Tokens are stored **unencrypted** \u2014 see Token Model |
+| \`EfacturaToken\` | OAuth tokens per CUI (company), with \`is_active\` flag and \`last_used_at\` tracking. Credentials are **encrypted at rest** since v3.0.0 \u2014 see Token Model |
 | \`EfacturaUpload\` | Polymorphic upload record tracking status, XML path, download ID, response path, errors |
 | \`EfacturaMessage\` | Synced ANAF messages (sent/received invoices, errors, buyer messages) |
 
@@ -21032,17 +21032,25 @@ Any Eloquent model can be uploaded to e-Factura by implementing \`EFacturaUpload
 
 ### Event-Driven
 
-6 domain events are fired at key lifecycle points, enabling loose coupling between the package and your application code. Use standard Laravel event listeners or subscribers.
+7 domain events are fired at key lifecycle points, enabling loose coupling between the package and your application code. Use standard Laravel event listeners or subscribers.
 
-### 8 Queue Jobs
+Since v3.0.0 \`InvoiceFailed\` is **terminal-only**; the new \`InvoiceRateLimited\` carries transient rate-limit hits. See the Event Reference.
 
-Background processing is handled by 8 queue jobs:
-- **Batch jobs** (for scheduling): ProcessPendingUploads, CheckUploadStatuses, DownloadResponses, SyncMessages, RetryRateLimitedUploads, DownloadReceivedInvoices
+### 9 Queue Jobs
+
+Background processing is handled by 9 queue jobs:
+- **Batch jobs** (for scheduling): ProcessPendingUploads, CheckUploadStatuses, DownloadResponses, SyncMessages, RetryRateLimitedUploads, DownloadReceivedInvoices, SweepStaleUploads
 - **Single-upload jobs** (dispatched on-demand): ProcessSingleUpload, CheckSingleUploadStatus
 
-### 4 Artisan Commands
+\`SweepStaleUploads\` is new in v3.0.0 and must be scheduled \u2014 it is the only thing that rescues uploads stranded in \`uploading\` by a hard worker death.
 
-Manual operation commands: \`efactura:auth\`, \`efactura:upload\`, \`efactura:status\`, \`efactura:sync\`
+### 5 Artisan Commands
+
+Manual operation commands: \`efactura:auth\`, \`efactura:upload\`, \`efactura:status\`, \`efactura:sync\`, \`efactura:reconcile\`
+
+### Failure Classification (v3.0.0)
+
+A \`Failed\` upload carries an authoritative \`failure_reason\` (\`FailureReason\` enum) in its own indexed column. Only \`rate_limited\` and \`transient\` are ever re-submitted automatically; \`indeterminate\` means delivery to ANAF is UNKNOWN and requires \`efactura:reconcile\`. Never substring-match the \`errors\` text to classify a failure.
 
 ### Feature Flags
 
@@ -21079,7 +21087,7 @@ This publishes \`config/efactura.php\`.
 php artisan vendor:publish --tag=efactura-migrations
 \`\`\`
 
-This publishes 3 migration files for the wrapper tables.
+This publishes **6** migration files (3 create the tables; 3 more were added in v3.0.0).
 
 ## Step 4: Run Migrations
 
@@ -21088,15 +21096,26 @@ php artisan migrate
 \`\`\`
 
 Creates three tables:
-- \`efactura_tokens\` \u2014 OAuth tokens per CUI
-- \`efactura_uploads\` \u2014 Upload tracking (polymorphic)
+- \`efactura_tokens\` \u2014 OAuth tokens per CUI (credentials encrypted at rest)
+- \`efactura_uploads\` \u2014 Upload tracking (polymorphic, unique per model)
 - \`efactura_messages\` \u2014 Synced ANAF messages
+
+The v3.0.0 migrations are \`..._000004_encrypt_efactura_token_credentials\`,
+\`..._000005_add_failure_reason_to_efactura_uploads_table\` and
+\`..._000006_add_unique_uploadable_index_to_efactura_uploads_table\`. On a **fresh** install they are
+no-ops beyond schema. **Upgrading an existing v2 install? Read the \`migration\` topic first** \u2014 that
+upgrade requires a maintenance window with the queue workers stopped, \`..._000004\` must run before
+any e-Factura operation or existing companies throw \`DecryptException\` (which is why it is ordered
+first), and \`..._000006\` aborts if pre-3.0 duplicate uploads exist.
+
+> **\`APP_KEY\` is load-bearing from v3.0.0.** It encrypts the ANAF credentials. Losing or rotating
+> it without \`APP_PREVIOUS_KEYS\` forces a fresh OAuth flow for every connected company. Back it
+> up somewhere other than the database it protects.
 
 ## Step 5: Configure Environment Variables
 
 ### SDK Variables (required for API access)
 \`\`\`env
-EFACTURA_ENABLED=true
 EFACTURA_CLIENT_ID=your-anaf-client-id
 EFACTURA_CLIENT_SECRET=your-anaf-client-secret
 EFACTURA_REDIRECT_URI=https://yourapp.com/efactura/callback
@@ -21105,6 +21124,11 @@ EFACTURA_SANDBOX=true   # false for production
 
 ### Wrapper-Specific Variables
 \`\`\`env
+# Master switch \u2014 this wrapper's own flag, read from config/efactura.php.
+# Not an SDK variable: when false, this package's jobs exit immediately,
+# but the SDK client itself is unaffected.
+EFACTURA_ENABLED=true
+
 # Feature flags
 EFACTURA_UPLOAD_ENABLED=true
 EFACTURA_DOWNLOAD_RECEIVED=false
@@ -21127,7 +21151,21 @@ EFACTURA_ERROR_REDIRECT=/
 EFACTURA_RATE_LIMIT_RETRY_HOURS=24
 EFACTURA_RATE_LIMIT_RETRY_BATCH=250
 EFACTURA_RATE_LIMIT_RETRY_MAX_DAYS=7
+
+# ANAF company-lookup retry (1 req/sec endpoint)
+EFACTURA_ANAF_LOOKUP_RETRY_ATTEMPTS=5
+
+# Periodic job hardening
+EFACTURA_JOB_MAX_STALENESS=120
+EFACTURA_JOB_UNIQUE_FOR=3600
+EFACTURA_JOB_TRANSIENT_RETRY_DELAY=30
+EFACTURA_JOB_MAX_TRANSIENT_ATTEMPTS=5
+EFACTURA_JOB_STALE_UPLOADING_MINUTES=30
 \`\`\`
+
+> **A shared cache store is required** (redis, memcached, database \u2014 anything but \`array\`). The
+> OAuth state lives in the cache as of v3.0.0, so the web and console processes must see the same
+> store, and \`TokenService\` uses cache locks to serialise token refresh.
 
 ## Step 6: Schedule Background Jobs
 
@@ -21139,13 +21177,20 @@ use BeeCoded\\EFactura\\Jobs\\CheckUploadStatuses;
 use BeeCoded\\EFactura\\Jobs\\DownloadResponses;
 use BeeCoded\\EFactura\\Jobs\\SyncMessages;
 use BeeCoded\\EFactura\\Jobs\\RetryRateLimitedUploads;
+use BeeCoded\\EFactura\\Jobs\\SweepStaleUploads;
 
 Schedule::job(new ProcessPendingUploads)->everyFiveMinutes();
 Schedule::job(new CheckUploadStatuses)->everyFiveMinutes();
 Schedule::job(new DownloadResponses)->everyFiveMinutes();
 Schedule::job(new SyncMessages)->everyFifteenMinutes();
 Schedule::job(new RetryRateLimitedUploads)->everyThirtyMinutes();
+
+// New in v3.0.0 \u2014 rescues uploads stranded mid-flight by a dead worker.
+Schedule::job(new SweepStaleUploads)->everyFifteenMinutes();
 \`\`\`
+
+**A queue worker is required.** These jobs dispatch \`ProcessSingleUpload\` per row; nothing uploads
+without a worker consuming \`config('efactura.queue')\`.
 
 ## Step 7: Implement EFacturaUploadableInterface
 
@@ -21163,6 +21208,11 @@ class Invoice extends Model implements EFacturaUploadableInterface
     public function getEfacturaCui(): string { return $this->company->cui; }
 }
 \`\`\`
+
+\`toEfacturaData()\` builds the **SDK's** \`InvoiceData\`, so SDK requirements apply here. Two are
+mandatory as of SDK v3.0 \u2014 see the \`get-model-integration-guide\` tool and the \`migration\` topic:
+- \`PartyData::$isVatPayer\` is **required** (and moved to the 4th constructor position \u2014 **always use named arguments**)
+- \`InvoiceData::$taxAmountRon\` is **required** when \`currency\` is not \`RON\`, and **rejected** when it is
 
 ## Step 8: MCP Setup (for AI tools)
 
@@ -21198,6 +21248,18 @@ $upload = EFactura::queueB2CUpload($invoice);       // B2C (consumer invoices)
 
 This creates an \`EfacturaUpload\` record with status \`Pending\`.
 
+> **Idempotent since v3.0.0.** A model has **at most one** upload row \u2014
+> \`(uploadable_type, uploadable_id)\` is unique at the database, matching the 1:1 \`morphOne\` the
+> trait exposes. Calling \`queueUpload()\` twice does **not** create a second row:
+>
+> - \`Pending\` / \`Uploading\` / \`Processing\` \u2192 returns the existing row (already in the pipeline)
+> - \`Completed\` \u2192 returns the existing row (ANAF accepted it; never re-file)
+> - \`Failed\` (retryable **or** terminal) \u2192 recycles that row, resetting it to \`Pending\`
+> - \`Failed\` + \`failure_reason = indeterminate\` \u2192 **throws \`DuplicateUploadException\`**
+>
+> Before v3 it created a row unconditionally, so a double-clicked button filed the invoice at ANAF
+> twice while \`morphOne\` only ever showed one of them.
+
 ### 2. ProcessPendingUploads (scheduled)
 
 The \`ProcessPendingUploads\` batch job runs on schedule (every 5 minutes recommended). For each pending upload, it dispatches a \`ProcessSingleUpload\` job onto the configured queue.
@@ -21209,8 +21271,8 @@ This job handles the full upload for one invoice:
 1. **Atomic claim** \u2014 Updates status from \`Pending\` \u2192 \`Uploading\` using an atomic DB query to prevent double-processing
 2. **XML generation** \u2014 Calls \`UblBuilder\` to generate UBL 2.1 XML from \`InvoiceData\`
 3. **Store XML** \u2014 Saves generated XML to configured storage disk/path
-4. **Upload to ANAF** \u2014 Calls \`EFacturaClient::uploadInvoice()\` with concurrent-safe token handling via \`TokenService::executeWithClient()\`
-5. **Success** \u2014 Marks upload as \`Processing\`, stores the ANAF \`download_id\`
+4. **Upload to ANAF** \u2014 Calls \`EFacturaClient::uploadDocument()\` (or \`uploadB2CDocument()\` when the upload is B2C) with concurrent-safe token handling via \`TokenService::executeWithClient()\`
+5. **Success** \u2014 Marks upload as \`Processing\` and stores the ANAF **\`upload_index\`** (the \`indexIncarcare\` returned by the upload call). The \`download_id\` is **not** set yet \u2014 it arrives later, from \`CheckUploadStatuses\`
 6. Fires \`InvoiceUploaded\` event
 
 ### 4. CheckUploadStatuses (scheduled)
@@ -21221,41 +21283,106 @@ Runs every 5 minutes. For each upload in \`Processing\` state, calls ANAF's \`ge
 
 Runs every 5 minutes. For uploads with a \`download_id\` but no \`response_path\`, downloads the response ZIP from ANAF and stores it to disk.
 
-Fires \`InvoiceProcessed\` event for Completed uploads after download.
-Fires \`InvoiceFailed\` event for Failed uploads.
+Fires \`InvoiceProcessed\` after download, **only** when the upload's status is \`Completed\` \u2014 a Failed upload's error-report ZIP is downloaded and stored, but fires no event here.
+
+\`DownloadResponses\` never fires \`InvoiceFailed\`; that event has already been fired earlier \u2014 by \`UploadService\` at upload time, by \`CheckUploadStatuses\` (via \`DownloadService::checkStatus()\`), by \`ProcessSingleUpload::failed()\` / \`SweepStaleUploads\` for a stranded upload, or by \`ProcessSingleUpload\` when a transient failure exhausts its attempts.
 
 ## Upload Status State Machine
 
 \`\`\`
 Pending \u2192 Uploading \u2192 Processing \u2192 Completed
-                                 \u2192 Failed
+   \u2191          \u2502            \u2502
+   \u2502          \u2193            \u2193
+   \u2514\u2500\u2500\u2500\u2500\u2500\u2500  Failed  \u2190\u2500\u2500\u2500\u2500\u2500\u2500\u2518
 \`\`\`
 
 | Status | Meaning |
 |--------|---------|
 | \`Pending\` | Queued, not yet processed |
-| \`Uploading\` | Currently being uploaded by a job |
+| \`Uploading\` | Claimed by a job, about to be / being sent to ANAF |
 | \`Processing\` | Uploaded to ANAF, awaiting ANAF processing |
 | \`Completed\` | ANAF accepted and processed the invoice |
-| \`Failed\` | Upload or processing failed |
+| \`Failed\` | Upload or processing failed \u2014 read \`failure_reason\` for what happens next |
+
+\`Failed\` \u2192 \`Pending\` is the automatic retry path, taken only for a **retryable** \`failure_reason\`.
+
+> **\`Uploading\` is no longer a dead end (v3.0.0).** \`processUpload()\` claims a row into \`Uploading\`
+> immediately before the POST. If the worker dies there, \`ProcessSingleUpload::failed()\` transitions
+> it to \`Failed\` / \`indeterminate\`; a SIGKILL (which never runs \`failed()\`) is caught by the
+> \`SweepStaleUploads\` job. Before v3 such rows sat in \`Uploading\` forever, because the queue's retry
+> re-ran \`processUpload()\`, whose claim (\`WHERE status = pending\`) matched zero rows and silently
+> reported success.
+
+## Failure Classification \u2014 \`failure_reason\`
+
+Every \`Failed\` upload carries a \`FailureReason\` enum in the indexed \`failure_reason\` column. This is
+the **authoritative** classification \u2014 never substring-match \`errors\`.
+
+| Reason | Meaning | Auto-retried |
+|--------|---------|--------------|
+| \`rate_limited\` | ANAF quota exhausted (pre-flight limiter or a real HTTP 429). Rejected before filing. The row stays **\`Pending\`**, not \`Failed\` | Yes |
+| \`transient\` | Auth/token failure or pre-flight error, provably before ANAF accepted anything | Yes, up to \`jobs.max_transient_attempts\` |
+| \`abandoned\` | Gave up: a \`transient\` failure outlived \`jobs.max_transient_attempts\`, or the \`retryUntil\` window expired while the row was still unsent. Provably never filed, so **no reconciliation needed** | No |
+| \`indeterminate\` | **Delivery UNKNOWN** \u2014 worker died around the POST, or 5xx/transport loss. May already be filed | **Never** \u2014 \`efactura:reconcile\` |
+| \`validation\` | ANAF rejected the document on its merits, or it was never valid (4xx, bad XML) | No |
+| \`configuration\` | Local problem \u2014 no token, model no longer implements the contract | No |
+
+\`FailureReason::isRetryable()\` is true **only** where the document provably never entered ANAF's
+filing pipeline. Re-driving anything else risks double-filing a legal invoice.
+
+> **Why \`abandoned\` is distinct from \`transient\`.** Giving up has to *change* the reason, because
+> \`RetryRateLimitedUploads\` selects on \`rate_limited\` and \`transient\`. A given-up row that kept
+> \`transient\` was resurrected by that job within ~10 minutes \u2014 re-firing \`InvoiceFailed\`, resetting
+> the attempt counter and the retry window, and hammering ANAF for the full retry period. The cap
+> only exists because the give-up transition is non-retryable.
 
 ## Rate Limit Handling
 
-ANAF enforces daily upload quotas. The SDK's \`RateLimiter\` performs client-side pre-flight checks before each upload attempt.
+Before each upload attempt \`ProcessSingleUpload\` pre-flight-checks the SDK \`RateLimiter\`'s **\`global\`** bucket \u2014 a **per-minute** ceiling (\`global_per_minute\`, default **500/min**), not a daily quota. If the remaining quota is 0 it releases the job back to the queue with a delay matching the bucket reset, **before** the upload row is claimed, so the row is untouched and no event fires. (ANAF does also enforce per-day quotas, but they are separate buckets and are not what this pre-flight checks.)
 
-When \`RateLimitExceededException\` is caught:
-1. Upload status is reset to \`Pending\`
-2. The failure is recorded with rate-limit context
-3. \`RetryRateLimitedUploads\` job (runs every 30 min) finds these failed uploads and re-queues them
-4. \`ProcessSingleUpload\` uses \`retryUntil()\` based on \`rate_limit.retry_window_hours\` (default 24h) before failing permanently
+If the limit is instead hit **during** the API call, the ordering is:
+
+1. \`UploadService\` releases the claim: the row goes back to **\`Pending\`** with \`failure_reason = rate_limited\` and \`processed_at = null\`. It is deliberately **not** marked \`Failed\` \u2014 it never left the pipeline, and a \`Failed\` row would make \`isEfacturaProcessed()\` report \`true\` for an upload that flips back to \`Pending\` 60 seconds later
+2. **\`InvoiceRateLimited\` fires** \u2014 *not* \`InvoiceFailed\`. The upload is still in the pipeline
+3. Back in \`ProcessSingleUpload\`, the row is re-read; seeing \`Pending\` + \`rate_limited\` it \`release(60)\`s itself without a reset
+
+Two distinct exceptions land here, and v3 treats them identically:
+- \`RateLimitExceededException\` \u2014 the SDK's **client-side** pre-flight limiter refused the call
+- \`ApiException\` with \`statusCode === 429\` \u2014 a **genuine ANAF 429**. The SDK's \`isRetryable()\` excludes 429, so it surfaces as a plain \`ApiException\`. Before v3 this became a permanent \`Failed\`
+
+So \`ProcessSingleUpload\` normally recovers its **own** rate-limited upload. \`RetryRateLimitedUploads\` is only the **safety net**, for rows nothing else will re-drive: a \`Failed\` row with a retryable reason (the worker died between steps 1 and 3, or the migration backfilled it), and a live \`Pending\` / \`rate_limited\` row whose released job was lost.
+
+> **\`ProcessPendingUploads\` deliberately skips \`Pending\` / \`rate_limited\` rows.** A rate-limited row is Pending, but its own \`ProcessSingleUpload\` is already queued on a 60-second release, and \`ProcessSingleUpload\` carries no uniqueness guard \u2014 so dispatching it again would stack another job on the same row every scheduled tick. A genuinely queued row has \`failure_reason\` **NULL** (\`resetForRetry()\` clears it), which is what separates "nobody is on this" from "a job is waiting one out". Recovery for the latter is \`RetryRateLimitedUploads\`, and the atomic \`WHERE status = pending\` claim means a duplicate job can never reach ANAF twice.
+
+\`ProcessSingleUpload\` uses \`retryUntil()\` based on \`rate_limit.retry_window_hours\` (default 24h). Once that window passes the **job** stops retrying and \`failed()\` resolves the row by where it actually got to:
+
+| Row state at the deadline | Outcome |
+|---|---|
+| \`Uploading\` | \`Failed\` / \`indeterminate\` \u2014 the worker died around the POST, so delivery is unknown. Needs \`efactura:reconcile\` |
+| \`Pending\`, or \`Failed\` with a retryable reason | \`Failed\` / \`abandoned\` + \`InvoiceFailed\` \u2014 it was still queued and never reached ANAF |
+
+Both transitions are guarded conditional updates, so a row that reached a terminal state in the meantime is left alone. Before v3.0.0 the second case matched nothing: the row stayed \`Pending\`, **no event fired at all**, and the scheduled \`ProcessPendingUploads\` handed it a brand-new 24h window \u2014 so \`rate_limit.retry_window_hours\` never actually terminated anything.
+
+## Indeterminate Uploads \u2014 the human path
+
+An upload whose delivery cannot be proven is parked \`Failed\` / \`indeterminate\` and is **never
+re-submitted automatically**: re-sending might double-file a legal invoice, writing it off might
+leave a statutory filing undone. Resolve with:
+
+\`\`\`bash
+php artisan efactura:reconcile                              # list what needs checking
+php artisan efactura:reconcile --filed=12 --index=5001130255 # confirmed filed at ANAF
+php artisan efactura:reconcile --not-filed=12               # confirmed absent \u2014 re-queues it
+\`\`\`
 
 ## Events Fired
 
 | Event | When |
 |-------|------|
 | \`InvoiceUploaded\` | After successful ANAF upload (status \u2192 Processing) |
-| \`InvoiceProcessed\` | After response ZIP downloaded for Completed upload |
-| \`InvoiceFailed\` | When upload or processing fails terminally |
+| \`InvoiceProcessed\` | After response ZIP downloaded for a Completed upload |
+| \`InvoiceRateLimited\` | Transient rate-limit hit \u2014 upload stays in the pipeline and is retried |
+| \`InvoiceFailed\` | The upload failed **terminally** \u2014 safe to alert on. Since v3.0.0 it does **not** fire for rate limits, nor for a \`transient\` failure until its retries are exhausted |
 `,
   "token-management": `# Laravel e-Factura Wrapper \u2014 Token Management
 
@@ -21279,9 +21406,27 @@ $url = EFactura::getAuthorizationUrl($cui);
 // Redirect user to $url
 \`\`\`
 
+### Option C: CLI
+
+\`\`\`bash
+php artisan efactura:auth {cui}
+\`\`\`
+
+Prints the authorization URL to open in a browser. The callback then completes in the web process.
+
+> **This actually works as of v3.0.0.** The state used to be written to the console process's
+> session, which boots no \`StartSession\` middleware \u2014 so it went to an in-memory store that was
+> never persisted, and the callback always answered
+> \`Invalid or expired state parameter. Please try again.\` The CLI flow was structurally impossible
+> to complete. State now lives in the cache, which any process can verify.
+
 ### CSRF Protection
 
-State validation uses a 15-minute expiry. The state parameter contains a base64-encoded JSON object with \`cui\` and a cryptographically secure \`token\`. The token is stored in session for verification on callback. Expired or mismatched states are rejected silently.
+State validation uses a 15-minute expiry (\`OAUTH_STATE_TTL_SECONDS = 900\`). The state parameter is a base64-encoded JSON object carrying \`cui\` and a cryptographically secure \`token\` (256 bits, \`bin2hex(random_bytes(32))\`).
+
+**Changed in v3.0.0:** the token is recorded in the **cache** (\`efactura:oauth_state:{token}\`), not the session. Validation uses \`Cache::pull()\`, making the state strictly **single-use** \u2014 a replayed callback is rejected even inside the TTL. The \`cui\` in the (attacker-visible) state must also match what was recorded server-side. Expired, replayed, or mismatched states are rejected silently.
+
+> **Requires a cache store shared across web and console processes** (redis, memcached, database \u2014 anything but \`array\`). This is strictly less demanding than the session store it replaces.
 
 ## TokenService::executeWithClient() \u2014 Concurrent-Safe Pattern
 
@@ -21292,19 +21437,33 @@ The core concurrent-safe method for all API operations. It optimizes for paralle
 **Case 1: Token NOT expiring soon (> 2 min to expiry)**
 - Proceed immediately without acquiring any lock
 - This allows parallel API calls to run concurrently
-- After operation: if SDK unexpectedly refreshed, persist with lock protection
 
 **Case 2: Token IS expiring soon (< 2 min to expiry)**
-- Acquire a distributed cache lock (2-minute timeout, 30-second block wait)
-- Reload token from DB (another process may have already refreshed it)
-- Re-check expiry:
-  - If another process refreshed it: release lock, proceed as Case 1
-  - If still expiring: proceed with lock held, handle refresh after operation
+- Acquire the \`efactura:token_refresh:{cui}\` cache lock (2-minute timeout, 30-second block wait)
+- Reload the token from DB (another process may have already refreshed it)
+- Re-check expiry: if it still needs refreshing, **refresh it explicitly now**, under the lock
+- **Release the lock**, then run the operation \u2014 Case 1 from here on
+
+> **The lock is never held across the operation, and this is load-bearing (fixed in v3.0.0).**
+> The SDK's \`EFacturaClient::getValidAccessToken()\` acquires the **same** cache key
+> (\`efactura:token_refresh:{vatNumber}\`, and \`cui == vatNumber\`) whenever it decides a token needs
+> refreshing. Laravel cache locks are **not re-entrant**, so the pre-v3 code \u2014 which held the key
+> across \`$operation()\` \u2014 made the SDK block on a lock this same process already owned, until it
+> timed out and threw \`AuthenticationException('Token refresh lock timeout')\`.
+>
+> That was **deterministic, not racy**: both layers use a 120-second expiry buffer, so the wrapper
+> took the locked path in exactly the cases where the SDK was going to refresh. Token refresh could
+> not succeed. By refreshing explicitly and releasing first, the SDK sees a valid token and never
+> needs the lock.
 
 **After Operation**
-- \`handleClientTokenRefresh(client, token)\` is called automatically
-- If \`client.wasTokenRefreshed()\` is true: persist new tokens, fire \`TokenRefreshed\` event
-- Always updates \`last_used_at\`
+
+The operation always runs via \`executeWithoutLock()\`, which checks \`$client->wasTokenRefreshed()\`:
+
+- **Refreshed** (the SDK refreshed unexpectedly): \`persistTokenRefreshWithLock($token, $client)\` \u2014 acquires the lock only now, to persist it safely, fires \`TokenRefreshed\`, and updates \`last_used_at\`
+- **Not refreshed:** \`last_used_at\` is updated directly
+
+\`handleClientTokenRefresh()\` remains a **public** method for callers driving a client by hand; \`executeWithClient()\` no longer routes through it.
 
 ### Usage Pattern
 
@@ -21314,8 +21473,9 @@ $token = EFactura::tokenService()->getToken($cui);
 
 $result = EFactura::tokenService()->executeWithClient(
     $token,
-    function (EFacturaClient $client) use ($upload) {
-        return $client->uploadInvoice($xmlContent, $options);
+    function (EFacturaClient $client) use ($xmlContent, $options) {
+        // B2C invoices go through uploadB2CDocument() instead
+        return $client->uploadDocument($xmlContent, $options);
     }
 );
 \`\`\`
@@ -21324,26 +21484,61 @@ $result = EFactura::tokenService()->executeWithClient(
 
 The \`EfacturaToken\` model stores:
 - \`cui\` \u2014 Company identifier (without RO prefix)
-- \`access_token\` \u2014 Stored as-is, in a plain \`text\` column
-- \`refresh_token\` \u2014 Stored as-is, in a plain \`text\` column
+- \`access_token\` \u2014 Encrypted at rest (\`encrypted\` cast) since v3.0.0; \`text\` column
+- \`refresh_token\` \u2014 Encrypted at rest (\`encrypted\` cast) since v3.0.0; \`text\` column
 - \`expires_at\` \u2014 Token expiry timestamp
 - \`is_active\` \u2014 Boolean flag (deactivation doesn't delete)
 - \`last_used_at\` \u2014 Updated on every API call
 
-> **Tokens are NOT encrypted at rest.** Earlier revisions of this document claimed they were
-> encrypted via Laravel's \`Crypt\`; that was never true \u2014 no encryption exists anywhere in the
-> package. Both columns are plain \`text\` and \`TokenService::storeToken()\` writes the values
-> verbatim.
+> **Changed in v3.0.0.** Both credentials are now encrypted at rest via Laravel's \`encrypted\`
+> cast. Before v3 they were stored verbatim in plain \`text\` columns, so a database read, a
+> backup, or a query log yielded live ANAF credentials. (\`$hidden\` is still set on both fields,
+> but it only filters \`toArray()\` / \`toJson()\` \u2014 it never affected what was written to disk.)
 >
-> The model does set \`$hidden\` for both fields, but that only keeps them out of \`toArray()\` /
-> \`toJson()\` output \u2014 it has no effect on what is written to the database. Anyone with read
-> access to the \`efactura_tokens\` table, a database backup, or a query log holds live ANAF
-> credentials.
+> Reads and writes are transparent: \`$token->access_token\` returns the plaintext credential, and
+> \`TokenService\` needs no changes. Nothing queries these columns by value, so no lookups break.
+
+## Upgrading an existing install to v3.0 (token encryption)
+
+Migration \`2024_01_01_000004_encrypt_efactura_token_credentials\` converts pre-v3 plaintext rows.
+It is ordered **first** of the v3 migrations precisely because it is the one that restores service.
+
+**The queue workers MUST be stopped before \`php artisan migrate\`, and \`migrate\` must run
+immediately after \`composer update\`.**
+
+\`\`\`bash
+php artisan down          # then actually stop the worker processes
+composer update bee-coded/laravel-efactura
+php artisan migrate
+php artisan queue:restart # then start the workers again
+php artisan up
+\`\`\`
+
+Stopping the workers is not optional: a v2 worker alive across the migration can refresh a token and
+write **plaintext into the already-encrypted column**. The migration is by then recorded as run, so
+re-running it does nothing, and that company throws \`DecryptException\` until it re-authorises. Point
+anyone upgrading at the \`migration\` topic before they run a single command.
+
+Between \`composer update\` and \`migrate\`, e-Factura operations for existing companies fail with
+\`DecryptException: The payload is invalid.\` This is **by design** \u2014 the cast has no plaintext
+fallback, because a fallback would hide a migration that never ran while credentials stayed
+readable in the database. An unmigrated row fails loudly rather than quietly working.
+
+The migration is idempotent (values that are already ciphertext are skipped, so re-running cannot
+double-encrypt) and reversible (\`migrate:rollback\` restores plaintext for a v2 downgrade). A
+rollback attempted under the **wrong** \`APP_KEY\` aborts loudly rather than silently leaving
+ciphertext behind for a cast-less v2 model to send to ANAF as a Bearer token.
+
+> **\`APP_KEY\` now protects ANAF credentials \u2014 new in v3.** Surface this when advising on any
+> upgrade, key rotation, or database copy:
 >
-> Treat the table as secret material: restrict database access, and consider adding
-> \`'access_token' => 'encrypted'\` / \`'refresh_token' => 'encrypted'\` to the model's \`$casts\`
-> in your own application if you need encryption at rest. Note that doing so requires migrating
-> any existing rows, since previously stored values are plaintext.
+> - Losing or rotating \`APP_KEY\` without \`APP_PREVIOUS_KEYS\` makes every token undecryptable,
+>   and **each connected company must redo the OAuth flow** (\`php artisan efactura:auth {cui}\`).
+>   Rotate by setting \`APP_PREVIOUS_KEYS=base64:<previous key>\` alongside the new \`APP_KEY\`.
+> - Restoring a production database into staging or local now requires the production \`APP_KEY\`;
+>   with a different key the tokens are unreadable. This workflow silently worked before v3
+>   because the values were plaintext.
+> - \`APP_KEY\` should be backed up somewhere other than the database it protects.
 
 ## Events
 
@@ -21369,23 +21564,60 @@ Generate an OAuth authorization URL for a CUI.
 php artisan efactura:auth {cui}
 \`\`\`
 
-Displays the ANAF OAuth authorization URL that the user must visit in a browser to grant access. Useful for initial setup or re-authorization.
+Displays the ANAF OAuth authorization URL that the user must visit in a browser to grant access. Useful for initial setup or re-authorization. If a token already exists for the CUI it warns and asks for confirmation before issuing a new URL.
 
 **Arguments:**
 - \`{cui}\` \u2014 The company's CUI (VAT number, without RO prefix)
 
+> **This CLI flow works as of v3.0.0** \u2014 the OAuth state moved from the (unreachable) console
+> session to the cache. It requires a shared cache store, since the callback completes in the web
+> process. Previously it could never complete.
+
 ## efactura:upload
 
-Process all pending uploads or filter by CUI.
+Queue all pending uploads onto the rate-limit-aware pipeline, or filter by CUI.
 
 \`\`\`bash
-php artisan efactura:upload [--cui=]
+php artisan efactura:upload [--cui=] [--sync]
 \`\`\`
 
-Processes pending \`EfacturaUpload\` records by dispatching \`ProcessSingleUpload\` jobs. Respects the \`features.upload_invoices\` feature flag.
+**Changed in v3.0.0: this now QUEUES.** It calls \`UploadService::dispatchPendingUploads()\`, which dispatches one \`ProcessSingleUpload\` job per pending row. **Nothing uploads until a queue worker consumes them** \u2014 the command prints \`Queued N pending upload(s) for processing.\` and reminds you which queue to run. Respects the \`features.upload_invoices\` feature flag (exits \`FAILURE\` with \`e-Factura upload feature is disabled.\` when off).
+
+> **Why it changed.** It used to call \`processPendingUploads()\` inline, bypassing
+> \`ProcessSingleUpload\` entirely \u2014 and with it the rate-limit pre-flight and the \`release()\`-based
+> retry. Run against a backlog larger than ANAF's remaining quota, it marked every invoice past the
+> limit permanently \`Failed\` and fired an \`InvoiceFailed\` storm, for a purely transient condition.
 
 **Options:**
-- \`--cui=\` \u2014 Optional CUI filter to process only uploads for a specific company
+- \`--cui=\` \u2014 Optional CUI filter (RO prefix stripped automatically). On the **default (queueing)** path an unknown CUI exits \`FAILURE\` with \`No active token found for CUI: {cui}\`
+- \`--sync\` \u2014 Process **inline** instead of queueing, for deployments with no queue worker. Warns \`Running inline: no rate-limit retry. Uploads stop at the first rate limit.\` and prints \`Processed N upload(s).\` Unlike the pre-v3 inline path, it now **stops at the first rate limit** rather than burning down the backlog
+
+> **\`--sync\` swallows an unknown \`--cui\`.** The \`--sync\` branch returns *before* the unknown-CUI
+> check, and \`processPendingUploads()\` only writes a \`Log::warning\` and returns \`0\` for a CUI with no
+> token. So \`efactura:upload --sync --cui=99999999\` prints \`Processed 0 upload(s).\` and exits
+> **SUCCESS** \u2014 indistinguishable from "nothing was pending". The \`FAILURE\` above applies to the
+> queueing path only. Verify the CUI yourself if you script against this.
+
+## efactura:reconcile
+
+Resolve uploads whose delivery to ANAF is **unknown**. New in v3.0.0.
+
+\`\`\`bash
+php artisan efactura:reconcile [--filed= --index=] [--not-filed=]
+\`\`\`
+
+With no options, lists every upload parked \`Failed\` / \`indeterminate\` in a table (ID, CUI, Model, Model ID, Claimed at, XML) so an operator can search ANAF's SPV around the claim time. These uploads are **never re-submitted automatically**.
+
+**Options:**
+- \`--filed=<id> --index=<index_incarcare>\` \u2014 Operator confirmed the document **is** filed at ANAF. Hands the row back to the normal status-check pipeline as \`Processing\`. \`--index\` is required; without it: \`--index is required with --filed: supply the index_incarcare ANAF assigned.\`
+- \`--not-filed=<id>\` \u2014 Operator confirmed the document is **not** at ANAF. Returns the row to \`Pending\` for a normal re-upload
+
+Both refuse rows that are not awaiting reconciliation: \`Upload {id} is not awaiting reconciliation (status: {status}).\`
+
+> **Not automated on purpose.** A stranded upload never received an \`index_incarcare\` (ANAF only
+> assigns one on a successful response), and ANAF's message listing exposes no invoice number to
+> match on. Guessing would mean spending ANAF quota to answer a legal question wrongly in one of two
+> directions: double-filing, or leaving a required filing undone.
 
 ## efactura:status
 
@@ -21395,11 +21627,16 @@ Check upload statuses and download responses.
 php artisan efactura:status [--cui=] [--upload=]
 \`\`\`
 
-Checks ANAF processing status for uploads in \`Processing\` state, updates their status to \`Completed\` or \`Failed\`, and downloads response ZIPs for completed uploads.
+Checks ANAF processing status for uploads in \`Processing\` state, updates their status to \`Completed\` or \`Failed\`, and downloads response ZIPs.
+
+> **ZIPs are downloaded for \`Failed\` uploads too**, not just \`Completed\` ones \u2014 a rejected document's
+> ZIP is ANAF's error report, which is exactly what you need. The scope is
+> \`whereIn('status', [Completed, Failed])\` + has \`download_id\` + no \`response_path\` yet. Only the
+> \`InvoiceProcessed\` **event** is restricted to \`Completed\`.
 
 **Options:**
-- \`--cui=\` \u2014 Optional CUI filter
-- \`--upload=\` \u2014 Optional upload ID to check a single specific upload
+- \`--cui=\` \u2014 Optional CUI filter (RO prefix stripped). Exits \`FAILURE\` with \`No active token found for CUI: {cui}\` if unknown
+- \`--upload=\` \u2014 Optional upload ID to check a single specific upload. Exits \`FAILURE\` with \`Upload #{id} not found.\` if it does not exist
 
 ## efactura:sync
 
@@ -21409,11 +21646,656 @@ Sync messages from ANAF.
 php artisan efactura:sync [--cui=] [--download]
 \`\`\`
 
-Syncs the ANAF message list into \`EfacturaMessage\` records. With \`--download\`, also downloads the XML content for received invoices.
+Syncs the ANAF message list into \`EfacturaMessage\` records and prints \`Synced N message(s).\` With \`--download\`, also downloads received invoices \u2014 as **ZIP archives** (stored under \`{storage.path}/received/{cui}/\`), not raw XML.
+
+> **Sync failures are now reported (v3.0.0).** \`syncMessages()\` / \`syncAllMessages()\` return an
+> \`int\` count and **throw** on failure instead of swallowing errors. The command catches
+> \`MessageSyncFailedException\` (and any other \`\\Throwable\`, which it also \`report()\`s), prints the
+> message, and exits \`FAILURE\` \u2014 so a broken sync no longer looks like a clean run. Previously every
+> error was caught and logged as one line, which is exactly how a wire-contract bug survived for
+> months: every run reported success while syncing **zero** messages.
+
+> **\`--download\` is a silent no-op unless \`features.download_received\` is enabled.** The flag is
+> AND-ed with \`config('efactura.features.download_received')\`, which defaults to **false**. With the
+> default config the command syncs messages, prints \`Done.\`, exits \`SUCCESS\`, and downloads nothing \u2014
+> no warning is emitted. Set \`EFACTURA_DOWNLOAD_RECEIVED=true\` to actually download.
 
 **Options:**
 - \`--cui=\` \u2014 Optional CUI filter to sync only a specific company
-- \`--download\` \u2014 Also download received invoice ZIPs after syncing messages
+- \`--download\` \u2014 Also download received invoice ZIPs after syncing messages. Requires \`features.download_received\` (default: false)
+`,
+  migration: `# Laravel e-Factura \u2014 Upgrading v2 \u2192 v3.0
+
+Follow these steps **in order**. Each says what breaks, the symptom you will actually see, and the
+exact change. Steps 0\u20135 are ordered deliberately: getting them out of order leaves the app in a
+state where **no company can file an invoice** \u2014 and in one case (Step 1) leaves a company's
+credentials permanently orphaned, which no re-run of the migration will repair.
+
+**This upgrade requires a maintenance window with your queue workers stopped.** That is a hard
+requirement, not a recommendation. See Step 1.
+
+v3.0.0 requires **SDK ^3.0** (\`bee-coded/laravel-efactura-sdk\`). The SDK has its own breaking
+changes that land in **your** \`toEfacturaData()\` \u2014 see Step 8. Do not skip it.
+
+---
+
+## Step 0 \u2014 Prerequisites (on the OLD version, before any command)
+
+### 0a. Back up \`APP_KEY\`, somewhere other than the database
+
+From v3.0.0 \`APP_KEY\` decrypts your ANAF OAuth credentials. Lose it and **every connected company
+must redo the OAuth flow**. It was never load-bearing for e-Factura before, so it may never have
+been treated as a secret worth backing up. It is now.
+
+### 0b. Confirm your cache store is shared and persistent
+
+Not \`array\`. Redis, memcached or database. The OAuth state moved into the cache (Step 9) and token
+refresh uses cache locks.
+
+### 0c. Audit for writes that bypass the model
+
+\`Builder::update()\` and raw SQL skip casts, so any query-builder write to
+\`efactura_tokens.access_token\` / \`refresh_token\` will silently store unreadable plaintext from v3
+on. Fix these before deploying \u2014 details in Step 4.
+
+### 0d. Size the unique-index build
+
+\`\`\`sql
+SELECT COUNT(*) FROM efactura_uploads;
+\`\`\`
+
+Step 4 runs \`ALTER TABLE efactura_uploads ADD UNIQUE (uploadable_type, uploadable_id)\`. Up to
+~100k rows that is seconds. On **millions** of rows expect **minutes**, holding a brief exclusive
+metadata lock, and it can fail outright on \`innodb_lock_wait_timeout\` under concurrent writes.
+Stopping the workers (Step 1) removes most of that risk. If the table is large enough that the
+window itself is the problem, build the index out of band with \`pt-online-schema-change\` or
+\`gh-ost\` and mark the migration as run instead.
+
+### 0e. Plan the maintenance window
+
+It must cover Steps 1\u20135. Between \`composer update\` and \`php artisan migrate\`, e-Factura is down by
+design (Step 4).
+
+---
+
+## Step 1 \u2014 Stop the queue workers (MANDATORY)
+
+\`\`\`bash
+php artisan down
+\`\`\`
+
+Then **actually stop the worker processes** (\`supervisorctl stop laravel-worker:*\`, or your
+orchestrator's equivalent) and confirm nothing is in flight.
+
+\`php artisan down\` is a necessary start but **is not sufficient**:
+
+- \`queue:work\` does respect maintenance mode, but a worker already **mid-job** finishes that job \u2014
+  including a token refresh.
+- Workers started with \`queue:work --force\` ignore maintenance mode entirely.
+- Horizon needs \`php artisan horizon:pause\` (or \`horizon:terminate\`).
+
+### Why this is mandatory
+
+A v2 worker still alive while Step 4 runs will do one of two things, both bad:
+
+1. **Refresh a token and write PLAINTEXT into an already-encrypted column.** v2's
+   \`$token->update([...])\` has no cast. By then the encryption migration is already **recorded as
+   run**, so the remedy you would reach for \u2014 "re-run the migration" \u2014 **does nothing**. That
+   company throws \`DecryptException\` on every operation until it re-authorises
+   (\`php artisan efactura:auth {cui}\`). This is the only failure in this upgrade with no clean
+   recovery.
+2. **Read an already-encrypted row and send the ciphertext to ANAF as a Bearer token.** ANAF answers
+   \`401\` and that batch of invoices parks as \`Failed\`.
+
+Neither is a race you can win by being quick.
+
+---
+
+## Step 2 \u2014 Resolve duplicate uploads (inside the window, writes stopped)
+
+\`\`\`sql
+SELECT uploadable_type, uploadable_id, COUNT(*) AS copies
+FROM efactura_uploads
+GROUP BY uploadable_type, uploadable_id
+HAVING COUNT(*) > 1;
+\`\`\`
+
+If this returns rows, resolve them before Step 4. Migration \`..._000006\` adds a unique
+\`(uploadable_type, uploadable_id)\` index and **aborts** when duplicates exist:
+
+\`\`\`
+RuntimeException: Cannot add the unique (uploadable_type, uploadable_id) index: efactura_uploads
+already contains duplicate uploads for the same model.
+\`\`\`
+
+For each duplicate: check ANAF (SPV), keep the row reflecting the real filing, delete the rest. The
+abort is deliberate \u2014 a duplicate can mean an invoice was filed at ANAF twice, and a migration does
+not get to silently delete legal records.
+
+**Run it here, not the day before.** v2's \`queueUpload()\` has no duplicate guard, so a check run
+while v2 is still serving traffic is only true until the next request reintroduces a duplicate. With
+writes stopped (Step 1) the result is authoritative.
+
+**It is no longer catastrophic if you miss one.** Token encryption is ordered **first** (Step 4), so
+an abort here costs you the index and nothing else \u2014 e-Factura keeps working. This step saves you a
+failed deploy; it is no longer the difference between working and company-wide outage.
+
+---
+
+## Step 3 \u2014 composer update
+
+\`\`\`bash
+composer update bee-coded/laravel-efactura
+\`\`\`
+
+This brings wrapper v3.0.0 and SDK ^3.0.
+
+---
+
+## Step 4 \u2014 php artisan migrate (IMMEDIATELY after Step 3)
+
+\`\`\`bash
+php artisan migrate
+\`\`\`
+
+Three new migrations run, **in this order**:
+
+| Order | Migration | What it does |
+|-------|-----------|--------------|
+| 1st | \`..._000004_encrypt_efactura_token_credentials\` | Encrypts the plaintext \`access_token\` / \`refresh_token\` already in \`efactura_tokens\`. **Ordered first deliberately**: it is the migration that restores service for the v3 code you just deployed, so nothing that can abort is allowed to run ahead of it |
+| 2nd | \`..._000005_add_failure_reason_to_efactura_uploads_table\` | Adds the indexed \`failure_reason\` column; backfills \`rate_limited\` for rows whose legacy \`errors\` text carries a \`RATE_LIMIT_EXCEEDED:\` marker. Anything unrecognised stays \`NULL\` rather than being guessed. **Re-entrant** \u2014 an interrupted backfill resumes on the next \`migrate\` instead of wedging on a duplicate-column error |
+| 3rd | \`..._000006_add_unique_uploadable_index_to_efactura_uploads_table\` | Adds the unique \`(uploadable_type, uploadable_id)\` index. **Aborts on pre-3.0 duplicates** before touching this table's schema (Step 2). Ordered last because it is the only one expected to abort |
+| 4th | \`..._000007_add_response_attempt_tracking_to_efactura_uploads_table\` | Adds \`response_attempts\` and \`response_failed_at\` so a poisoned \`/descarcare\` body (2xx but not a ZIP) is retried a bounded number of times instead of on every scheduled run forever. Additive columns only; cannot abort |
+
+### What breaks
+
+**Symptom:** between Step 1 and Step 2, every e-Factura operation for an existing company throws:
+
+\`\`\`
+Illuminate\\Contracts\\Encryption\\DecryptException: The payload is invalid.
+\`\`\`
+
+**Why:** \`EfacturaToken\` now casts both credentials to \`encrypted\`. The cast only governs values
+written **through the model**, so every row written by v2 is still plaintext. There is deliberately
+**no plaintext fallback** \u2014 a fallback would let a migration that never ran pass unnoticed while your
+credentials stayed readable in the database. It fails loudly at the point of use instead.
+
+**Fix:** run the migration. It is **idempotent** (values that already decrypt are skipped, so
+re-running cannot double-encrypt \u2014 safe after a partial failure, and safe on a table mixing migrated
+and freshly-authorised rows) and **reversible** (\`migrate:rollback\` restores plaintext for a v2
+downgrade). No schema change: both columns are already \`text\`.
+
+### New \`APP_KEY\` obligations
+
+- **Rotating \`APP_KEY\`** without \`APP_PREVIOUS_KEYS\` orphans every token \u2192 each company must rerun
+  \`php artisan efactura:auth {cui}\`. Rotate like this instead:
+  \`\`\`dotenv
+  APP_KEY=base64:<new key>
+  APP_PREVIOUS_KEYS=base64:<previous key>
+  \`\`\`
+- **Restoring a production database into staging/local** now needs the production \`APP_KEY\`, or the
+  tokens are unreadable. This silently worked before v3 because the values were plaintext.
+  (Re-authorising in staging is often the better answer than copying the key.)
+
+### One new hazard: writes that bypass the model
+
+\`Builder::update()\` bypasses casts. Any query-builder or raw-SQL write to these columns now stores
+**unreadable plaintext**, with no error:
+
+\`\`\`php
+// BROKEN as of v3.0.0 \u2014 writes plaintext into an encrypted column, silently.
+DB::table('efactura_tokens')->where('cui', $cui)->update(['access_token' => $raw]);
+EfacturaToken::where('cui', $cui)->update(['access_token' => $raw]); // also bypasses casts
+
+// Correct \u2014 go through the model instance so the cast runs.
+$token = EfacturaToken::forCui($cui)->first();
+$token->update(['access_token' => $raw]);
+\`\`\`
+
+Audit your app for raw writes to \`efactura_tokens\` before deploying.
+
+### If \`migrate\` aborts: how to get out of it
+
+An abort is **not** a no-op at the database level, whatever a migration's own docblock may imply
+about leaving things "untouched". Migrations that already ran are committed and **recorded**; only
+the aborting one is not. What you are left with depends on where it stopped:
+
+| Aborted at | State | Do this |
+|------------|-------|---------|
+| \`..._000004\` (encryption) | Tokens partly or not encrypted. e-Factura is **down** | Idempotent \u2014 fix the cause and re-run \`php artisan migrate\`. It resumes safely and cannot double-encrypt |
+| \`..._000005\` (failure_reason) | Tokens **encrypted, service is up**. Column may exist with the backfill unfinished | Re-entrant \u2014 re-run \`php artisan migrate\`. It skips the DDL it already did and resumes the backfill |
+| \`..._000006\` (unique index) | Tokens **encrypted, service is up**. Only the index is missing | Resolve the duplicates (Step 2), then re-run \`php artisan migrate\`. No rush \u2014 but the pre-3.0 duplicate race stays open until you do |
+
+**Emergency lever \u2014 restore service immediately.** If you are down and need tokens working *now*,
+without first resolving duplicates or anything else, run the encryption migration on its own:
+
+\`\`\`bash
+php artisan migrate --path=database/migrations/2024_01_01_000004_encrypt_efactura_token_credentials.php
+\`\`\`
+
+Safe at any point: idempotent, touches only \`efactura_tokens\`, and has no dependency on the other
+two. (If you published the migrations into your app, point \`--path\` at your copy.) Then deal with
+the rest at your own pace.
+
+---
+
+## Step 5 \u2014 Bring it back up
+
+\`\`\`bash
+php artisan queue:restart
+php artisan up
+\`\`\`
+
+Start your worker processes again (\`supervisorctl start laravel-worker:*\`). They come back on the
+new code because they are new processes \u2014 \`queue:restart\` is the belt-and-braces for any worker
+that survived Step 1, since a stale one holds pre-v3 code in memory and will keep firing
+\`InvoiceFailed\` on rate limits and writing plaintext credentials.
+
+---
+
+## Step 6 \u2014 Wrapper API changes (code)
+
+### 6a. \`resetForRateLimit()\` \u2192 \`resetForRetry()\`
+
+**Symptom:** \`Error: Call to undefined method BeeCoded\\EFactura\\Services\\UploadService::resetForRateLimit()\`
+
+\`\`\`php
+// Before
+$uploadService->resetForRateLimit($upload);
+
+// After
+$uploadService->resetForRetry($upload);   // returns bool
+\`\`\`
+
+It now covers every retryable reason (not just rate limits) and **refuses non-retryable ones**: the
+atomic reset filters on \`whereIn('failure_reason', FailureReason::retryable())\`, so an
+\`indeterminate\` upload can never be re-driven from here. Returns \`true\` only if the reset applied.
+
+### 6b. \`markUploadAsFailed()\` gained a 4th parameter
+
+\`\`\`php
+public function markUploadAsFailed(
+    EfacturaUpload $upload,
+    array $errors,
+    ?string $downloadId = null,
+    FailureReason $reason = FailureReason::Validation,   // NEW
+): void
+\`\`\`
+
+It **defaults to \`FailureReason::Validation\`**, so existing 2- and 3-argument calls keep compiling
+and are classified as terminal/non-retryable. That is usually right \u2014 but if you were marking a
+failure you expected to be retried, pass the reason explicitly:
+
+\`\`\`php
+$uploadService->markUploadAsFailed($upload, [$e->getMessage()], reason: FailureReason::Transient);
+\`\`\`
+
+### 6c. \`processPendingUploads()\`: \`void\` \u2192 \`int\`
+
+Returns how many uploads it processed. It now **stops at the first rate limit** instead of ploughing
+through the backlog and marking every invoice past ANAF's quota permanently \`Failed\`.
+
+Prefer the new \`dispatchPendingUploads(?string $cui = null): ?int\` \u2014 it dispatches
+\`ProcessSingleUpload\` per row and so keeps the quota pre-flight and release-based retry.
+(It returns \`null\` when the CUI is unknown.)
+
+### 6d. \`syncMessages()\` / \`syncAllMessages()\`: \`void\` \u2192 \`int\`, and they THROW
+
+\`\`\`php
+public function syncMessages(EfacturaToken $token, ?MessageFilter $filter = null): int  // throws \\Throwable
+public function syncAllMessages(?MessageFilter $filter = null): int                     // throws MessageSyncFailedException
+\`\`\`
+
+Both return a synced-message count. Errors now **propagate** instead of being logged and swallowed.
+
+- \`syncMessages()\` re-throws whatever the SDK/transport raised \u2014 it does **not** wrap it.
+- \`syncAllMessages()\` keeps per-token isolation (one company's revoked token must not stop the
+  others) but no longer reports false success: once every token has had its turn, it throws
+  \`MessageSyncFailedException\` carrying a \`failures\` map of \`CUI => error\`.
+
+**Symptom if you do nothing:** \`SyncMessages\` jobs that used to "succeed" silently now fail loudly
+and land in \`failed_jobs\`. That is the point \u2014 it is surfacing breakage that was always there.
+
+\`\`\`php
+use BeeCoded\\EFactura\\Exceptions\\MessageSyncFailedException;
+
+try {
+    $count = $messageSyncService->syncAllMessages();
+} catch (MessageSyncFailedException $e) {
+    // $e->failures \u2014 ['12345678' => 'Token refresh failed', ...]
+    report($e);
+}
+\`\`\`
+
+### 6e. \`queueUpload()\` is now idempotent \u2014 and can throw
+
+**Symptom:** \`BeeCoded\\EFactura\\Exceptions\\DuplicateUploadException\`, message:
+\`Cannot re-queue upload {id}: its delivery to ANAF is indeterminate. Re-submitting could double-file this invoice. Reconcile it first with ...\`
+
+A model now has **at most one** upload row, enforced by the unique index. Re-queueing recycles that
+row instead of inserting another, and the race the index closes is handled for you: if a concurrent
+request wins the insert, \`queueUpload()\` catches the unique violation, re-reads, and returns that
+row \u2014 it does **not** surface a \`QueryException\`.
+
+Two situations throw \`DuplicateUploadException\`:
+
+| Existing row | Re-queued with\u2026 | Result |
+|---|---|---|
+| \`Failed\` / \`indeterminate\` | anything | **Throws** \u2014 delivery is unknown, re-sending could double-file |
+| \`Uploading\` / \`Processing\` / \`Completed\` | **different** options (\`b2c\`, \`standard\`, \`extern\`, \`self_billed\`) | **Throws** \u2014 the options describe what was already sent; rewriting them would make the row lie |
+| \`Uploading\` / \`Processing\` / \`Completed\` | the same options | Returns the existing row (idempotent) |
+| \`Pending\` | different options | Applies them to the row (atomic; if it loses the race to a claim, falls back to the conflict check above) |
+| \`Failed\` (any other reason) | anything | Recycles the row for a fresh attempt |
+
+That fourth row matters: before v3.0.0, \`queueB2CUpload()\` on a model that already had a \`Pending\`
+B2B row returned the **B2B row unchanged, with no signal**, and the invoice was then filed to ANAF
+in the wrong mode.
+
+\`\`\`php
+use BeeCoded\\EFactura\\Exceptions\\DuplicateUploadException;
+
+try {
+    $upload = EFactura::queueUpload($invoice);
+} catch (DuplicateUploadException $e) {
+    // $e->existingUpload \u2014 needs a human: php artisan efactura:reconcile
+    return back()->withErrors('This invoice needs manual reconciliation with ANAF.');
+}
+\`\`\`
+
+**Behaviour change to note:** if your code assumed \`queueUpload()\` always returns a *new* \`Pending\`
+row, it does not. A \`Completed\` model returns its existing \`Completed\` row \u2014 re-filing is precisely
+what must never happen.
+
+---
+
+## Step 7 \u2014 Event changes (silent \u2014 nothing will error)
+
+### 7a. \`InvoiceFailed\` no longer fires on rate limits
+
+This is the change most likely to break your app **without any error**.
+
+- \`InvoiceFailed\` is now **terminal-only** \u2014 safe to alert on. It fires for \`validation\`,
+  \`configuration\` and \`indeterminate\` failures, and for a \`transient\` failure only once its retries
+  are exhausted.
+- A transient rate-limit hit now fires the new **\`InvoiceRateLimited\`** instead.
+
+**Symptom:** a listener that reacted to rate limits (e.g. custom backoff, or counting failures)
+silently stops running. Nothing throws.
+
+\`\`\`php
+use BeeCoded\\EFactura\\Events\\InvoiceRateLimited;
+
+Event::listen(InvoiceRateLimited::class, function (InvoiceRateLimited $event) {
+    $event->upload;              // EfacturaUpload \u2014 still in the pipeline, will be retried
+    $event->errors;              // array<int, string>
+    $event->retryAfterSeconds;   // ?int \u2014 hint from the SDK/ANAF when available
+});
+\`\`\`
+
+**The upside:** if you previously skipped rate-limit noise inside an \`InvoiceFailed\` listener, delete
+that guard. \`InvoiceFailed\` no longer produces a false alarm followed by a successful upload.
+
+### 7b. The \`RATE_LIMIT_EXCEEDED:\` error-text marker is GONE
+
+Any listener that substring-matched the marker to classify a failure now matches **nothing** \u2014 and
+therefore treats every transient hit as a real failure (or vice versa). Switch to the indexed
+\`failure_reason\` column / \`FailureReason\` enum:
+
+\`\`\`php
+use BeeCoded\\EFactura\\Enums\\FailureReason;
+
+// Before \u2014 fragile, and now always false
+if (str_contains(json_encode($upload->errors), 'RATE_LIMIT_EXCEEDED:')) { /* ... */ }
+
+// After \u2014 authoritative
+if ($upload->failure_reason === FailureReason::RateLimited) { /* ... */ }
+if ($upload->failure_reason?->isRetryable()) { /* will be re-submitted automatically */ }
+if ($upload->failure_reason?->needsReconciliation()) { /* human must check ANAF */ }
+\`\`\`
+
+Text-matching was wrong in both directions anyway: it missed ANAF's Romanian 429 bodies
+(\`S-au facut deja 1000 de apeluri...\`) and would have re-submitted any unrelated failure whose text
+merely mentioned a rate limit.
+
+---
+
+## Step 8 \u2014 SDK v3 changes inside \`toEfacturaData()\`
+
+\`toEfacturaData()\` builds the **SDK's** \`InvoiceData\`, so SDK v3's breaking changes land in your
+model. This is the wrapper's primary extension point \u2014 expect to touch it.
+
+### 8a. \`PartyData::$isVatPayer\` is REQUIRED \u2014 and the parameter ORDER CHANGED
+
+\`\`\`php
+// SDK v2 signature
+__construct(string $registrationName, string $companyId, AddressData $address,
+            ?string $registrationNumber = null, bool $isVatPayer = false)
+
+// SDK v3 signature \u2014 isVatPayer is 4th and has NO default
+__construct(string $registrationName, string $companyId, AddressData $address,
+            bool $isVatPayer, ?string $registrationNumber = null)
+\`\`\`
+
+**Symptom A \u2014 omitted entirely:**
+\`\`\`
+ArgumentCountError: Too few arguments to function
+BeeCoded\\EFacturaSdk\\Data\\Invoice\\PartyData::__construct(), 3 passed and at least 4 expected
+\`\`\`
+Via \`PartyData::from()\` you get \`CannotCreateData\` instead, or a clean 422 from the \`#[Required]\`
+rule when validating.
+
+**Symptom B \u2014 THERE IS NO SYMPTOM. This is the dangerous one.**
+
+If you passed arguments **positionally**, the 4th used to be \`registrationNumber\` and is now
+\`isVatPayer\`. In a caller **without \`declare(strict_types=1)\`** \u2014 which is most Laravel app models \u2014
+PHP coerces the string in **silently**:
+
+\`\`\`php
+// v2 code, unchanged, running against SDK v3, from a file with no strict_types:
+new PartyData('ACME SRL', '12345678', $address, 'J40/1234/2020');
+// \u2192 isVatPayer         = true    (the ONRC string coerced to bool)
+// \u2192 registrationNumber = null    (silently lost)
+// \u2192 NO exception. NO warning.
+\`\`\`
+
+A non-VAT-payer previously filed with \`isVatPayer = false\` now files as \`true\`. That inverts the
+document: \`InvoiceBuilder::getTaxCategory()\` puts every line under VAT category **"O" (Not subject
+to VAT)** when the flag is false, and omits the party's VAT identifier (BT-31 seller / BT-48 buyer).
+The resulting document is internally consistent, so **ANAF accepts it** \u2014 there is no error to
+notice. (From a file *with* \`strict_types=1\` you get a \`TypeError\` instead, which is the lucky case.)
+
+**Fix \u2014 always use named arguments:**
+
+\`\`\`php
+new PartyData(
+    registrationName: $this->company->name,
+    companyId: $this->company->vat_number,
+    address: $address,
+    isVatPayer: $this->company->is_vat_payer,   // REQUIRED \u2014 a real declaration, not a preference
+    registrationNumber: $this->company->onrc,   // optional
+);
+\`\`\`
+
+Grep your codebase for \`new PartyData(\` and confirm **every** call is named.
+
+### 8b. \`InvoiceData::$taxAmountRon\` \u2014 required for non-RON, rejected for RON
+
+\`\`\`php
+public ?float $taxAmountRon = null;   // 11th constructor parameter
+\`\`\`
+
+**Symptom:** the upload is marked \`Failed\` with \`failure_reason = validation\` and \`InvoiceFailed\`
+fires, carrying the SDK's message. XML generation happens in \`UploadService\`'s preparation phase,
+which catches \`\\Throwable\` and fails the upload terminally \u2014 you will see this in the \`errors\`
+column, not as an unhandled exception:
+
+- Non-RON invoice, \`taxAmountRon\` missing \u2192 \`ValidationException\`:
+  \`A EUR invoice must declare its total VAT in RON: set taxAmountRon to the converted amount (BT-111). ANAF cannot verify the conversion, so an incorrect value would be filed as a true statement of VAT owed (BR-RO-030, BR-53).\`
+- RON invoice, \`taxAmountRon\` set \u2192 \`ValidationException\`:
+  \`taxAmountRon must not be set on a RON invoice: the VAT total is already stated in RON, and a second RON tax total is not permitted (BR-CO-15).\`
+- Sign disagrees with the invoice VAT total \u2192 \`ValidationException\`:
+  \`taxAmountRon must have the same sign as the invoice VAT total: a credited amount cannot be declared as collected VAT, or vice versa (BT-111).\`
+
+**Fix \u2014 set it only when the currency is not RON:**
+
+\`\`\`php
+public function toEfacturaData(): InvoiceData
+{
+    return new InvoiceData(
+        invoiceNumber: $this->number,
+        issueDate: $this->issued_at,
+        supplier: $supplier,
+        customer: $customer,
+        lines: $lines,
+        currency: $this->currency,
+        // Required when currency !== 'RON', and MUST be null when it is.
+        taxAmountRon: $this->currency === 'RON' ? null : $this->vat_total_ron,
+    );
+}
+\`\`\`
+
+It carries the converted **amount**, not an exchange rate: the rate is not part of the filed document
+(EN 16931 defines no business term for it, and UBL-CR-490 warns against \`cac:TaxExchangeRate\`). Pass
+the BNR-rate figure your ledger already holds \u2014 ANAF cannot verify the conversion, so a wrong value
+is **accepted and filed** as a true statement of VAT owed. For a credit note, supply it in the same
+positive sense as your line tax amounts; the builder sign-flips it alongside them.
+
+**If every invoice you file is in RON, you have nothing to do here** \u2014 leave \`taxAmountRon\` unset.
+
+---
+
+## Step 9 \u2014 Scheduler, workers, and operations
+
+### 9a. \`efactura:upload\` now QUEUES \u2014 it needs a worker
+
+**Symptom:** the command prints \`Queued N pending upload(s) for processing.\` and **nothing uploads**.
+No error. If you ran this from cron on a box with no worker, invoices silently stop being filed.
+
+\`\`\`bash
+# v3: dispatches one ProcessSingleUpload per row. Requires a queue worker.
+php artisan efactura:upload
+
+# Restores the old inline behaviour (now stops at the first rate limit instead of
+# marking the whole backlog Failed).
+php artisan efactura:upload --sync
+\`\`\`
+
+Either run a worker on \`config('efactura.queue')\`, or add \`--sync\`.
+
+### 9b. Schedule the new \`SweepStaleUploads\` job
+
+Without it, an upload stranded in \`uploading\` by a **SIGKILL'd** worker is never noticed \u2014 that
+worker never gets to run \`failed()\`.
+
+\`\`\`php
+use BeeCoded\\EFactura\\Jobs\\SweepStaleUploads;
+
+Schedule::job(new SweepStaleUploads)->everyFifteenMinutes();
+\`\`\`
+
+Takes no arguments. Parks rows older than \`jobs.stale_uploading_minutes\` (default 30) as
+\`Failed\` / \`indeterminate\`.
+
+### 9c. New operational duty \u2014 \`efactura:reconcile\`
+
+v3 introduces uploads that **no automation will ever resolve**. When delivery to ANAF cannot be
+proven (worker died around the POST; 5xx or transport loss), the row is parked
+\`Failed\` / \`indeterminate\` rather than retried or written off, because re-sending may double-file a
+legal invoice and writing it off may leave a statutory filing undone.
+
+\`\`\`bash
+php artisan efactura:reconcile                                # list what needs a human
+php artisan efactura:reconcile --filed=12 --index=5001130255  # you found it in SPV
+php artisan efactura:reconcile --not-filed=12                 # it never arrived \u2014 re-queues it
+\`\`\`
+
+**Put this in a runbook and alert on it.** Listen for \`InvoiceFailed\` with
+\`failure_reason === FailureReason::Indeterminate\`; nothing else will tell you these exist, and they
+will sit there indefinitely.
+
+Related v3 change: a real ANAF **HTTP 429** is now treated as a rate limit (retried) rather than
+becoming a permanent \`Failed\`. And only errors that **prove** the document never reached ANAF are
+retried \u2014 5xx, transport loss and unknown exceptions become \`indeterminate\` instead of being
+silently re-sent.
+
+---
+
+## Step 10 \u2014 Two things that start working (no action needed)
+
+These were broken in v2 and are fixed in v3. Expect **new** traffic and **new** rows.
+
+- **Message sync actually runs.** It read \`$response->messages\`, a property the SDK never declared,
+  and the exception was swallowed \u2014 so every run "succeeded" while syncing **zero** messages. It now
+  reads \`$response->mesaje\`. Your first sync after upgrading may create a large batch of
+  \`EfacturaMessage\` rows (60-day lookback) and fire \`InvoiceReceived\` for each downloaded invoice.
+  Make sure those listeners can cope with a burst.
+- **Token refresh actually works.** The wrapper held the same cache lock the SDK acquires internally;
+  since Laravel locks are not re-entrant, refresh deadlocked against itself and threw
+  \`AuthenticationException('Token refresh lock timeout')\` \u2014 deterministically, not racily.
+- **The CLI OAuth flow completes.** \`efactura:auth\` state moved from the console session (never
+  persisted \u2014 no \`StartSession\` middleware in a console process) to the cache: 15-minute TTL,
+  single-use via \`Cache::pull()\`.
+
+---
+
+## Rollback
+
+\`\`\`bash
+php artisan down               # stop the workers first, exactly as in Step 1
+php artisan migrate:rollback   # restores plaintext tokens, drops the unique index + failure_reason
+composer require bee-coded/laravel-efactura:^2.3
+php artisan queue:restart
+php artisan up
+\`\`\`
+
+Roll back the **migration first, while the v3 code is still deployed** \u2014 \`..._000004\`'s \`down()\` needs
+\`APP_KEY\` to decrypt, and leaving ciphertext behind would hand v2's cast-less model an unusable
+credential.
+
+**The rollback aborts if \`APP_KEY\` is not the key the tokens were encrypted with** (rotated key, or
+a production dump restored elsewhere):
+
+\`\`\`
+RuntimeException: Cannot roll back the e-Factura token encryption: a stored credential is
+encrypted, but APP_KEY cannot decrypt it.
+\`\`\`
+
+That is deliberate. A wrong-key MAC failure is indistinguishable from plaintext to a trial decrypt,
+so skipping it would report a successful rollback while leaving ciphertext in a column v2 reads
+verbatim \u2014 and v2 would send it to ANAF as a Bearer token. Restore the original key (or set
+\`APP_PREVIOUS_KEYS\` to it) and re-run. If the key is gone the tokens are unrecoverable: delete the
+affected \`efactura_tokens\` rows and have each company redo the OAuth flow.
+
+---
+
+## Checklist
+
+**Before any command**
+- [ ] \`APP_KEY\` backed up outside the database; \`APP_PREVIOUS_KEYS\` set if rotating
+- [ ] Cache store is shared and not \`array\`
+- [ ] No raw/query-builder writes to \`efactura_tokens.access_token\` / \`refresh_token\`
+- [ ] \`efactura_uploads\` row count checked; index build sized (Step 0d)
+- [ ] Maintenance window planned to cover Steps 1\u20135
+
+**In the window, in this order**
+- [ ] **Queue workers STOPPED** \u2014 \`php artisan down\` *and* the processes actually stopped (Step 1)
+- [ ] Duplicate \`efactura_uploads\` rows resolved, with writes stopped (Step 2)
+- [ ] \`composer update\` \u2192 \`php artisan migrate\` run back-to-back (Steps 3\u20134)
+- [ ] Workers restarted on the new code; \`php artisan up\` (Step 5)
+
+**Code changes**
+- [ ] \`resetForRateLimit()\` \u2192 \`resetForRetry()\`
+- [ ] \`syncMessages()\` / \`syncAllMessages()\` callers handle throws
+- [ ] \`queueUpload()\` callers handle \`DuplicateUploadException\`
+- [ ] Listeners no longer match \`RATE_LIMIT_EXCEEDED:\`; use \`failure_reason\`
+- [ ] Rate-limit logic moved from \`InvoiceFailed\` to \`InvoiceRateLimited\`
+- [ ] Every \`new PartyData(...)\` uses **named** arguments and passes \`isVatPayer\`
+- [ ] \`taxAmountRon\` set for non-RON invoices, and **not** set for RON ones
+
+**Operations**
+- [ ] \`efactura:upload\` has a queue worker, or uses \`--sync\`
+- [ ] \`SweepStaleUploads\` scheduled
+- [ ] \`efactura:reconcile\` in the runbook, with an alert on \`indeterminate\`
 `
 };
 
@@ -21478,6 +22360,27 @@ class Invoice extends Model implements EFacturaUploadableInterface
 }
 \`\`\`
 
+> **\`isVatPayer\` is REQUIRED, and its constructor position CHANGED in SDK v3.0.** It moved from 5th
+> to **4th**, swapping places with \`registrationNumber\`, and lost its \`false\` default.
+> **Always use named arguments**, as above. A v2-era *positional* call
+> \`new PartyData($name, $id, $address, 'J40/1234/2020')\` now assigns the ONRC string to
+> \`isVatPayer\` \u2014 and from a caller without \`declare(strict_types=1)\` (i.e. most app models) PHP
+> **silently coerces it to \`true\`** and drops the registration number. No exception, no warning; the
+> invoice files with an inverted VAT status that ANAF accepts. See the \`migration\` topic.
+
+> **\`taxAmountRon\` is required for non-RON invoices (SDK v3.0).** \`InvoiceData::$taxAmountRon\`
+> (BT-111, the VAT total converted to RON) **must** be set when \`currency\` is not \`'RON'\`, and must
+> **not** be set when it is. Getting it wrong throws \`ValidationException\` during XML generation,
+> which the wrapper turns into a \`Failed\` upload with \`failure_reason = validation\`:
+>
+> \`\`\`php
+> taxAmountRon: $this->currency === 'RON' ? null : $this->vat_total_ron,
+> \`\`\`
+>
+> Pass the converted **amount** from your ledger (the BNR-rate figure), not an exchange rate. ANAF
+> cannot verify the conversion, so a wrong value is **accepted and filed** as a true statement of
+> VAT owed. If you only ever file in RON, leave it unset.
+
 > **Immutable dates:** apps calling \`Date::use(CarbonImmutable::class)\` can pass their \`datetime\`
 > casts (\`$this->issue_date\`, \`$this->due_date\`) straight into \`InvoiceData\` as shown. This
 > requires **SDK v2.3.0+**, because \`CarbonImmutable\` is not a \`Carbon\` subclass. On earlier
@@ -21521,7 +22424,7 @@ This trait provides:
 - \`efacturaCompleted()\` \u2014 Status = Completed
 - \`efacturaFailed()\` \u2014 Status = Failed
 - \`efacturaProcessed()\` \u2014 Status IN (Completed, Failed)
-- \`efacturaAwaitingResponse()\` \u2014 Completed but no response_path yet
+- \`efacturaAwaitingResponse()\` \u2014 Completed, has a \`download_id\`, but no \`response_path\` yet
 
 ## Step 3: Queue Upload
 
@@ -21536,38 +22439,86 @@ $upload = EFactura::queueB2CUpload($invoice);
 
 // With options
 $upload = EFactura::queueUpload($invoice, [
-    'is_extern' => true,
-    'is_self_billed' => true,
+    'standard' => 'UBL',      // UBL, CN, CII, RASP
+    'extern' => true,         // External/non-Romanian supplier
+    'self_billed' => true,    // Self-billed/autofactura
 ]);
 \`\`\`
 
-## Credit Notes
+> **Option keys are \`extern\` / \`self_billed\`, not \`is_extern\` / \`is_self_billed\`.** \`UploadService\`
+> reads \`$options['extern']\` and \`$options['self_billed']\`; the \`is_\` prefix belongs to the
+> \`efactura_uploads\` **columns**, not the options array. Unrecognised keys are silently ignored \u2014
+> pass \`is_extern\` and the flag defaults to \`false\`, so the invoice is filed without it and
+> nothing warns you.
 
-For credit notes, set InvoiceTypeCode to '381' and provide precedingInvoiceNumber. Quantities must be negative for credit notes to satisfy ANAF validation. The taxAmount field is required (SDK v2.0+) and must be pre-computed.
+### Idempotency (v3.0.0)
+
+\`queueUpload()\` is idempotent. A model has **at most one** upload row \u2014
+\`(uploadable_type, uploadable_id)\` is unique at the database, matching the 1:1 \`morphOne\` the trait
+exposes. Calling it twice (double-clicked button, application retry) does **not** file the invoice
+twice:
+
+| Existing row | Result |
+|--------------|--------|
+| \`Pending\` / \`Uploading\` / \`Processing\` | Returns it \u2014 already in the pipeline |
+| \`Completed\` | Returns it \u2014 ANAF accepted this document; re-filing is what must never happen |
+| \`Failed\` (retryable or terminal) | Recycles the row, resetting it to \`Pending\` |
+| \`Failed\` + \`failure_reason = indeterminate\` | **Throws \`DuplicateUploadException\`** |
 
 \`\`\`php
+use BeeCoded\\EFactura\\Exceptions\\DuplicateUploadException;
+
+try {
+    $upload = EFactura::queueUpload($invoice);
+} catch (DuplicateUploadException $e) {
+    // $e->existingUpload \u2014 delivery to ANAF is UNKNOWN; re-sending could double-file it.
+    // A human must reconcile: php artisan efactura:reconcile
+    return back()->withErrors('This invoice needs manual reconciliation with ANAF.');
+}
+\`\`\`
+
+Note it does **not** necessarily return a fresh \`Pending\` row \u2014 check \`$upload->status\` if you care.
+Before v3 it inserted unconditionally, so two calls produced two \`Pending\` rows, both passed the
+per-row atomic claim, and the invoice was filed at ANAF twice while \`morphOne\` only ever showed one.
+
+## Credit Notes
+
+For credit notes, set \`invoiceTypeCode\` to the enum case \`InvoiceTypeCode::CreditNote\` and provide \`precedingInvoiceNumber\`. Pass **negative** quantities for the items being credited. The taxAmount field is required (SDK v2.0+) and must be pre-computed.
+
+> **Pass the enum, not the string.** \`InvoiceData::$invoiceTypeCode\` is typed \`?InvoiceTypeCode\`.
+> The SDK declares \`strict_types=1\`, so a string like \`'381'\` is **not** coerced \u2014 it throws a
+> \`TypeError\` at construction.
+
+> **\`taxAmount\`'s sign must follow \`quantity\`'s.** The SDK negates *both* for credit notes. Pass a
+> negative \`quantity\` with a **positive** \`taxAmount\` and you get a positive taxable base against a
+> negative tax \u2014 the XML totals will not reconcile and ANAF rejects the document. \`unitPrice\` is the
+> exception: it is never negated and must stay **positive** (a negative one is a \`ValidationException\`).
+
+\`\`\`php
+use BeeCoded\\EFacturaSdk\\Enums\\InvoiceTypeCode;
+
 public function toEfacturaData(): InvoiceData
 {
     return new InvoiceData(
         invoiceNumber: $this->number,
-        invoiceTypeCode: '381',  // credit note type code
+        invoiceTypeCode: InvoiceTypeCode::CreditNote,  // value '381'
         precedingInvoiceNumber: $this->original_invoice_number,
         // ... same structure, quantities are negative
         lines: $this->items->map(fn ($item) => new InvoiceLineData(
             name: $item->name,
-            quantity: -abs($item->quantity),  // Negative for credit notes
-            unitPrice: $item->unit_price,
+            quantity: -abs($item->quantity),     // Negative for credit notes
+            unitPrice: $item->unit_price,        // Always positive \u2014 never negated
             taxPercent: $item->vat_rate,
-            taxAmount: $item->tax_amount,
+            taxAmount: -abs($item->tax_amount),  // Sign MUST follow quantity
         ))->toArray(),
     );
 }
 \`\`\`
 
 ### Credit Note Notes
-- \`invoiceTypeCode: '381'\` identifies this as a credit note in the UBL XML
+- \`invoiceTypeCode: InvoiceTypeCode::CreditNote\` (backing value \`'381'\`) identifies this as a credit note and switches the SDK to the UBL \`<CreditNote>\` document schema
 - \`precedingInvoiceNumber\` references the original invoice being reversed
-- Quantities **must be negative** \u2014 the SDK and ANAF both require this for proper credit note processing
+- Pass **negative** quantities for items being credited \u2014 but not because ANAF wants negatives. The SDK **negates** credit note line quantities (and the matching \`taxAmount\`) before building the XML, so ANAF receives the **positive** values a \`<CreditNote>\` document expects. Pass **positive** quantities for debit-back lines (e.g. discount reversals), which the same negation flips to negative.
 - This is a standard B2B or B2C upload \u2014 use \`EFactura::queueUpload()\` as normal
 `;
 
@@ -21604,7 +22555,20 @@ public function __construct(public EfacturaToken $token)
 public function __construct(public EfacturaToken $token)
 \`\`\`
 
-**Trigger:** Fired after a token is automatically refreshed during an API call (via \`TokenService::handleClientTokenRefresh\`). This is transparent to the caller.
+**Trigger:** Fired after a token is refreshed during an API call. This is transparent to the caller.
+
+\`TokenService\` fires it from **three** places (**changed in v3.0.0**):
+- \`refreshToken()\` \u2014 the token was expiring, so \`executeWithRefreshLock()\` refreshed it **explicitly, under the lock, before running the operation**. This is the normal path
+- \`persistTokenRefreshWithLock()\` \u2014 the token looked fresh so the operation ran unlocked, but the SDK refreshed anyway; the lock is acquired after the fact to persist it
+- \`handleClientTokenRefresh()\` \u2014 a **public** helper for callers driving an \`EFacturaClient\` by hand. \`executeWithClient()\` does **not** call it
+
+> **Changed in v3.0.0.** Pre-v3, the expiring-token path held the refresh lock across the operation
+> and persisted via \`handleClientTokenRefresh()\`. That deadlocked: the SDK acquires the *same* cache
+> key internally and Laravel locks are not re-entrant, so refresh threw
+> \`AuthenticationException('Token refresh lock timeout')\` deterministically \u2014 meaning
+> \`TokenRefreshed\` effectively never fired on that path. If your listener seemed dead, this is why.
+
+Listeners must handle all firing paths \u2014 the event is identical in each case.
 
 **Use Cases:**
 - Audit logging for token lifecycle monitoring
@@ -21622,7 +22586,12 @@ public function __construct(public EfacturaToken $token)
 public function __construct(public EfacturaUpload $upload)
 \`\`\`
 
-**Trigger:** Fired after a successful upload to ANAF. At this point the upload status is \`Processing\` and the ANAF \`download_id\` is stored.
+**Trigger:** Fired after a successful upload to ANAF. At this point the upload status is \`Processing\` and the ANAF **\`upload_index\`** (\`indexIncarcare\`) is stored.
+
+> **\`download_id\` is null in this listener.** It is not part of the upload response \u2014 it is only
+> set later, by \`CheckUploadStatuses\`, once ANAF reports the document ready. A listener reading
+> \`$event->upload->download_id\` here gets \`null\`. Use \`upload_index\` to correlate with ANAF at this
+> stage, and listen for \`InvoiceProcessed\` if you need the \`download_id\` or the response ZIP.
 
 **Use Cases:**
 - Notify user that their invoice was successfully submitted
@@ -21659,13 +22628,107 @@ public function __construct(public EfacturaUpload $upload)
 public function __construct(public EfacturaUpload $upload, public array $errors = [])
 \`\`\`
 
-**Trigger:** Fired when an upload or processing fails terminally. The \`errors\` array contains error details from ANAF or the upload process.
+**Trigger:** Fired when an upload reaches a **terminal** \`Failed\` state. The \`errors\` array contains error details from ANAF or the upload process. It fires from four places:
+
+| Source | Situation | \`failure_reason\` |
+|--------|-----------|------------------|
+| \`UploadService::failTerminally()\` | ANAF rejected the document, XML/model invalid, no token, 4xx, or an ambiguous 5xx/transport loss | \`validation\`, \`configuration\`, \`indeterminate\` |
+| \`DownloadService::checkStatus()\` (i.e. \`CheckUploadStatuses\`) | ANAF processed the document and rejected it on its merits | \`validation\` |
+| \`ProcessSingleUpload::failed()\` / \`SweepStaleUploads\` (via \`parkStrandedUploadAsIndeterminate()\`) | The worker died around the POST \u2014 delivery UNKNOWN | \`indeterminate\` |
+| \`ProcessSingleUpload::failed()\` (via \`abandonUnsentUpload()\`) | The \`retryUntil\` deadline expired while the row was still waiting to be sent \u2014 it never reached ANAF | \`abandoned\` |
+| \`ProcessSingleUpload\` transient cap exhausted (via \`abandonFailure()\`) | A \`transient\` failure did not clear within \`jobs.max_transient_attempts\` | \`abandoned\` |
+
+> **This IS a terminal signal \u2014 safe to alert on.** As of v3.0.0 transient rate-limit hits fire
+> \`InvoiceRateLimited\` instead, so \`InvoiceFailed\` no longer produces a false alarm followed by a
+> successful upload. Before v3 it fired on rate-limit failures too, and listeners had to
+> substring-match a \`RATE_LIMIT_EXCEEDED:\` marker in the error text to tell the two apart. That
+> marker is gone; use \`$upload->failure_reason\` instead.
+
+### Reading the failure classification
+
+\`$event->upload->failure_reason\` is a \`FailureReason\` enum carrying the authoritative reason:
+
+| Reason | Meaning | Auto-retried |
+|--------|---------|--------------|
+| \`validation\` | ANAF rejected the document on its merits, or it was never valid | No |
+| \`configuration\` | Local problem (no token, model no longer uploadable) | No |
+| \`indeterminate\` | **Delivery to ANAF is UNKNOWN** \u2014 needs human reconciliation | No |
+| \`transient\` | Auth/pre-flight blip; only terminal once retries are exhausted | Yes, until the cap |
+| \`abandoned\` | Gave up retrying a \`transient\` or never-sent row. The document did **not** reach ANAF, so no reconciliation is needed \u2014 unlike \`indeterminate\` | No |
+| \`rate_limited\` | Quota exhausted \u2014 fires \`InvoiceRateLimited\`, not this event. The row stays \`Pending\` | Yes |
+
+> \`abandoned\` exists because the give-up transition has to leave a **non-retryable** reason. While
+> a given-up row kept \`failure_reason = transient\`, \`RetryRateLimitedUploads\` \u2014 which selects on
+> \`rate_limited\` and \`transient\` \u2014 resurrected the row it had just abandoned, re-firing
+> \`InvoiceFailed\` every ~10 minutes for an upload that was immediately retried.
+
+\`\`\`php
+use BeeCoded\\EFactura\\Enums\\FailureReason;
+
+Event::listen(InvoiceFailed::class, function (InvoiceFailed $event) {
+    if ($event->upload->failure_reason === FailureReason::Indeterminate) {
+        // We do not know whether ANAF filed this. It will NOT be re-submitted.
+        // Escalate: someone must reconcile it (php artisan efactura:reconcile).
+        return;
+    }
+
+    // genuine rejection or error \u2014 safe to alert
+});
+\`\`\`
+
+---
+
+## InvoiceRateLimited
+
+**Class:** \`BeeCoded\\EFactura\\Events\\InvoiceRateLimited\`
+
+**Constructor:**
+\`\`\`php
+public function __construct(
+    public EfacturaUpload $upload,
+    public array $errors = [],
+    public ?int $retryAfterSeconds = null,
+)
+\`\`\`
+
+**Trigger:** Fired when an upload hits ANAF's rate limit \u2014 either the SDK's client-side pre-flight
+limiter (\`RateLimitExceededException\`) or a genuine HTTP 429 (\`ApiException\` with
+\`statusCode === 429\`; the SDK's \`isRetryable()\` excludes 429, so it arrives as a plain
+\`ApiException\`). The event itself only means: the upload hit the quota and was released back to
+\`Pending\` with \`failure_reason = rate_limited\`. **What re-submits it depends on the caller:**
+
+| Path | Who re-submits it |
+|------|-------------------|
+| \`ProcessSingleUpload\` (the normal queued path) | The job itself \u2014 \`release(60)\`, then it picks the \`Pending\` row straight back up |
+| \`efactura:upload --sync\` (inline) | **Nobody, immediately.** There is no job to release, so \`processPendingUploads()\` stops the batch and the row waits at \`Pending\` / \`rate_limited\` for the scheduled \`ProcessPendingUploads\` or \`RetryRateLimitedUploads\` |
+
+**Non-terminal \u2014 do NOT treat this as a failure.** Either way the upload is still going to be
+re-submitted; it is not a verdict on the document. For a terminal signal, listen to
+\`InvoiceFailed\`, which as of v3.0.0 means exactly that.
+
+> **The persisted state agrees with that, as of v3.0.0.** A rate-limited row stays \`Pending\` with
+> \`processed_at = null\`, so \`isFailed()\`, \`status->isTerminal()\` and \`isEfacturaProcessed()\` all
+> correctly report that nothing has been decided yet. Earlier v3 pre-releases parked it as
+> \`Failed\` / \`rate_limited\`, which made \`isEfacturaProcessed()\` return \`true\` for an upload that
+> was still in the pipeline and about to flip back to \`Pending\` 60 seconds later \u2014 the event said
+> "not a failure" while the model said "failed". \`failure_reason\` is retained as the signal the
+> retry paths select on.
+
+> **Not fired by the pre-flight release path.** When \`ProcessSingleUpload\` finds the quota already
+> exhausted *before* claiming the row, it simply \`release()\`s itself back to the queue. The upload
+> row is untouched and **no event fires**. This event only fires when the limit is hit *during* the
+> API call.
+
+\`retryAfterSeconds\` is populated only on the SDK client-side-limiter path (from
+\`RateLimitExceededException::$retryAfterSeconds\`). On a genuine ANAF **HTTP 429** it is \`null\` \u2014
+ANAF's response carries no such hint. Do not assume it is set; the wrapper's own retry uses a fixed
+60-second release regardless.
 
 **Use Cases:**
-- Alert admin immediately on invoice failure
-- Implement custom retry logic beyond the built-in rate-limit retry
-- Log detailed errors for debugging
-- Notify the user their invoice was rejected with error details
+- Backpressure metrics \u2014 how often you are hitting ANAF's ceiling
+- Dashboards showing "delayed, retrying" rather than "failed"
+- Feeding \`$event->retryAfterSeconds\` into your own throughput shaping
+- **Not** for alerting: these clear themselves
 
 ---
 
@@ -21698,6 +22761,7 @@ use BeeCoded\\EFactura\\Events\\TokenRefreshed;
 use BeeCoded\\EFactura\\Events\\InvoiceUploaded;
 use BeeCoded\\EFactura\\Events\\InvoiceProcessed;
 use BeeCoded\\EFactura\\Events\\InvoiceFailed;
+use BeeCoded\\EFactura\\Events\\InvoiceRateLimited;
 use BeeCoded\\EFactura\\Events\\InvoiceReceived;
 
 protected $listen = [
@@ -21716,6 +22780,9 @@ protected $listen = [
     ],
     InvoiceFailed::class => [
         \\App\\Listeners\\AlertOnInvoiceFailure::class,
+    ],
+    InvoiceRateLimited::class => [
+        \\App\\Listeners\\RecordEfacturaBackpressure::class,
     ],
     InvoiceReceived::class => [
         \\App\\Listeners\\ProcessReceivedInvoice::class,
@@ -21744,15 +22811,35 @@ All jobs are in the \`BeeCoded\\EFactura\\Jobs\` namespace.
 
 ## Shared Behavior for Batch Jobs
 
-All batch jobs (ProcessPendingUploads, CheckUploadStatuses, DownloadResponses, DownloadReceivedInvoices, SyncMessages, RetryRateLimitedUploads) share:
-- \`tries = 3\` with backoff of [60, 180, 300] seconds
+All batch jobs (ProcessPendingUploads, CheckUploadStatuses, DownloadResponses, DownloadReceivedInvoices, SyncMessages, RetryRateLimitedUploads, SweepStaleUploads) share:
 - \`timeout = 120s\`
 - Run on the configured queue: \`config('efactura.queue')\`
 - Check \`config('efactura.enabled')\` and their feature flag before executing \u2014 if either is false, the job exits immediately
 
+All of them **except \`RetryRateLimitedUploads\`** additionally declare \`tries = 3\` with \`backoff = [60, 180, 300]\` seconds and \`maxExceptions = 3\`.
+
+> **\`RetryRateLimitedUploads\` declares no \`$tries\`.** It falls back to the worker's default
+> (\`--tries=1\` unless your worker is configured otherwise), so it gets **one attempt** and is not
+> retried. Its \`$backoff\` and \`$maxExceptions = 3\` are therefore inert \u2014 both only take effect
+> across retries that never happen. It does set \`timeout = 120\` and \`uniqueFor = 600\`. In practice
+> this is tolerable: the job is an idempotent scanner and the next scheduled run re-scans anyway \u2014
+> but do not rely on it retrying a transient failure.
+
 The three high-frequency periodic jobs \u2014 **ProcessPendingUploads**, **CheckUploadStatuses**, **DownloadResponses** \u2014 additionally guard against a backlog that piles up while the queue worker is down and then drains all at once on recovery (which would re-scan the same rows and exhaust ANAF's per-message rate limits before processing can advance):
 - They implement \`ShouldBeUniqueUntilProcessing\`, keyed per-CUI via \`uniqueId()\`, so the scheduler will not enqueue a duplicate while one is still queued unprocessed. Lock TTL: \`jobs.unique_for_seconds\` (default 3600).
-- They self-discard when stale (\`DiscardsWhenStale\` trait): a job that waited in the queue longer than \`jobs.max_staleness_seconds\` (default 120) returns immediately without running. Safe because these jobs are idempotent all-rows scanners \u2014 the next scheduled run re-scans.
+- They self-discard when stale (\`DiscardsWhenStale\` trait): a job that waited in the queue longer than \`jobs.max_staleness_seconds\` (default 120) returns immediately without running. Safe because these jobs are idempotent all-rows scanners \u2014 the next scheduled run re-scans. **Only these three use \`DiscardsWhenStale\`.**
+
+**Uniqueness at a glance** \u2014 \`ShouldBeUniqueUntilProcessing\` is implemented by **five** jobs, not just those three:
+
+| Job | \`uniqueFor\` | \`uniqueId()\` |
+|-----|-------------|---------------|
+| \`ProcessPendingUploads\` | \`jobs.unique_for_seconds\` (3600) | per-CUI (\`$cui ?? 'all'\`) |
+| \`CheckUploadStatuses\` | \`jobs.unique_for_seconds\` (3600) | per-CUI (\`$cui ?? 'all'\`) |
+| \`DownloadResponses\` | \`jobs.unique_for_seconds\` (3600) | per-CUI (\`$cui ?? 'all'\`) |
+| \`RetryRateLimitedUploads\` | **hardcoded 600** (ignores the config key) | none \u2014 keyed on the class |
+| \`SweepStaleUploads\` | \`jobs.unique_for_seconds\` (3600) | none \u2014 keyed on the class |
+
+\`DownloadReceivedInvoices\`, \`SyncMessages\`, \`ProcessSingleUpload\` and \`CheckSingleUploadStatus\` are **not** unique-constrained.
 
 ---
 
@@ -21803,6 +22890,8 @@ new DownloadResponses(?string $cui = null)
 
 Downloads response ZIPs from ANAF for uploads that have a \`download_id\` but no \`response_path\` yet (applies to both Completed and Failed uploads that ANAF provided a response for).
 
+**Poisoned responses are bounded.** ANAF can answer \`/descarcare\` with a 2xx whose body is not a ZIP (typically a JSON \`eroare\`). The SDK's \`guardDownloadBody()\` throws, so \`response_path\` stays null \u2014 and without a guard the row would be re-selected here on every run, forever. Each such failure increments \`response_attempts\` and stamps \`response_failed_at\`; once \`response_attempts\` reaches \`EfacturaUpload::MAX_RESPONSE_ATTEMPTS\` (3) the row drops out of \`needsResponseDownload()\` and is left for \`efactura:reconcile\`. The upload's own \`status\` is untouched \u2014 ANAF accepted the invoice; only the receipt is missing.
+
 **Feature flag:** \`features.upload_invoices\`
 
 **Recommended schedule:** Every 5 minutes
@@ -21846,15 +22935,53 @@ Schedule::job(new SyncMessages)->everyFifteenMinutes();
 
 ---
 
+### SweepStaleUploads
+
+\`\`\`php
+new SweepStaleUploads()
+\`\`\`
+
+Rescues uploads stranded in the \`uploading\` state. \`processUpload()\` claims a row into \`Uploading\` immediately before sending it to ANAF; if the worker then dies hard (timeout, SIGKILL, OOM, deploy), nothing transitions it out \u2014 and the queue's retry of that job re-runs \`processUpload()\`, whose claim (\`WHERE status = pending\`) matches zero rows and silently reports success. Before v3.0.0 such rows sat in \`Uploading\` forever.
+
+Rows older than \`efactura.jobs.stale_uploading_minutes\` (default 30) are parked as \`Failed\` / \`indeterminate\` \u2014 **not** returned to \`Pending\`, because the crash may have happened after the POST reached ANAF. Resolve them with \`php artisan efactura:reconcile\`.
+
+**Takes no arguments** \u2014 \`__construct()\` has no \`$cui\` parameter; it always scans every CUI.
+
+**Feature flag:** \`features.upload_invoices\`
+
+**Implements:** \`ShouldBeUniqueUntilProcessing\` with \`uniqueFor\` from \`jobs.unique_for_seconds\` (default 3600). It has **no** \`uniqueId()\`, so the lock is global to the job. It does **not** use \`DiscardsWhenStale\` \u2014 a late sweep is still a useful sweep.
+
+Set \`jobs.stale_uploading_minutes\` to \`0\` or less to make it a no-op.
+
+**Recommended schedule:** Every 15 minutes
+\`\`\`php
+Schedule::job(new SweepStaleUploads)->everyFifteenMinutes();
+\`\`\`
+
+---
+
 ### RetryRateLimitedUploads
 
 \`\`\`php
 new RetryRateLimitedUploads()
 \`\`\`
 
-Finds \`EfacturaUpload\` records that failed due to rate limiting (identified by error context), resets them to \`Pending\` status, and dispatches \`ProcessSingleUpload\` for each.
+Safety net for uploads left stranded in \`Failed\` by a safe-to-resubmit error \u2014 normally \`ProcessSingleUpload\` resets and retries its own upload, so this job only picks up rows where that did not happen (worker died mid-sequence, retry window expired). Finds \`Failed\` \`EfacturaUpload\` records whose \`failure_reason\` is retryable (\`rate_limited\` or \`transient\`), atomically resets them to \`Pending\`, and dispatches \`ProcessSingleUpload\` for each.
+
+> **Uploads marked \`indeterminate\` are deliberately never picked up here.** Their original attempt
+> may already have reached ANAF, so re-sending would double-file a legal invoice. They require human
+> reconciliation via \`php artisan efactura:reconcile\`.
+
+> **Changed in v3.0.0.** This previously selected rows with \`where('errors', 'like', '%RATE_LIMIT_EXCEEDED:%')\`.
+> \`errors\` is a \`json\` column and Postgres has no \`json ~~ text\` operator, so the job **threw on every
+> run under Postgres** and rate-limited uploads were never retried at all. Selection is now an indexed
+> \`failure_reason\` column.
+
+**Takes no arguments** \u2014 unlike the other batch jobs, \`__construct()\` has **no \`$cui\` parameter**. It always scans every CUI. PHP silently discards extra constructor args, so \`new RetryRateLimitedUploads('12345678')\` does **not** filter \u2014 it quietly retries all companies.
 
 **Implements:** \`ShouldBeUniqueUntilProcessing\` with \`uniqueFor: 600\` seconds \u2014 only one instance runs at a time.
+
+**No \`$tries\`** \u2014 see Shared Behavior above; this job is not retried on failure.
 
 **Configuration:**
 - \`rate_limit.retry_batch_size\` (env: \`EFACTURA_RATE_LIMIT_RETRY_BATCH\`, default: 250) \u2014 Max uploads to reset per run
@@ -21877,19 +23004,40 @@ new ProcessSingleUpload(EfacturaUpload $upload)
 
 Processes one upload end-to-end:
 
-1. **Atomic claim** \u2014 Updates \`Pending\` \u2192 \`Uploading\` atomically (prevents double-processing)
-2. **Pre-flight rate limit check** \u2014 Checks global ANAF quota via SDK's RateLimiter before attempting upload
+1. **Pre-flight rate limit check** \u2014 Checks the SDK \`RateLimiter\`'s \`global\` quota **before** the row is claimed. If exhausted, the job \`release()\`s and returns, leaving the row \`Pending\`
+2. **Atomic claim** \u2014 Updates \`Pending\` \u2192 \`Uploading\` atomically (prevents double-processing)
 3. **XML generation** \u2014 Generates UBL 2.1 XML from the uploadable model's \`toEfacturaData()\`
 4. **Store XML** \u2014 Persists XML to storage disk
-5. **Upload** \u2014 Calls \`EFacturaClient::uploadInvoice()\` via \`TokenService::executeWithClient()\` for concurrent-safe token handling
-6. **Success** \u2014 Marks \`Processing\`, stores \`download_id\`; fires \`InvoiceUploaded\`
+5. **Upload** \u2014 Calls \`EFacturaClient::uploadDocument()\` \u2014 or \`uploadB2CDocument()\` when \`is_b2c\` is set \u2014 via \`TokenService::executeWithClient()\` for concurrent-safe token handling
+6. **Success** \u2014 Marks \`Processing\` and stores the \`upload_index\` (ANAF's \`indexIncarcare\`); fires \`InvoiceUploaded\`. **\`download_id\` is still null here** \u2014 it is only set later, by \`CheckUploadStatuses\`, when ANAF reports the document ready
 
-**Rate limit handling:** If \`RateLimitExceededException\` is caught, upload is reset to \`Pending\` for later retry by \`RetryRateLimitedUploads\`.
+Steps 1\u20132 are in that order: the pre-flight runs in \`handle()\`, *before* \`UploadService::processUpload()\` claims the row. A quota-exhausted release therefore never touches the upload.
+
+Preparation (steps 3\u20134) is strictly **before** anything is transmitted, so a failure there proves nothing was filed \u2014 it is terminal (\`validation\` / \`configuration\`), never retried.
+
+**Rate limit handling:** two distinct mechanisms, depending on *when* the limit is hit:
+
+- **Pre-flight (step 1)** \u2014 quota already exhausted: the job \`release()\`s itself with a delay matching the bucket reset (min 10s) and returns. The upload row is untouched (stays \`Pending\`), and **no event fires**.
+- **Mid-call** \u2014 the limit is hit during the API call. \`UploadService\` marks the upload \`Failed\` with \`failure_reason = rate_limited\` and fires **\`InvoiceRateLimited\`** (*not* \`InvoiceFailed\`). \`ProcessSingleUpload\` re-reads the row, sees a retryable \`failure_reason\`, calls \`resetForRetry()\` (atomic; refuses non-retryable reasons) and \`release(60)\`s itself.
+
+> **Changed in v3.0.0.** The mid-call path used to write a \`RATE_LIMIT_EXCEEDED:\` marker into the
+> free-text \`errors\` payload and fire \`InvoiceFailed\` \u2014 a false alarm followed by a successful
+> upload. Classification now lives in the indexed \`failure_reason\` column; the marker is gone.
+> Also new: a genuine ANAF **HTTP 429** arrives as \`ApiException(429)\` (the SDK's \`isRetryable()\`
+> excludes 429) and is now treated as a rate limit. Before v3 it became a permanent \`Failed\`.
+
+So the job recovers its **own** rate-limited upload. \`RetryRateLimitedUploads\` is the **safety net** for rows stranded in \`Failed\` \u2014 e.g. the worker died between the mark and the reset, or the retry window expired.
+
+**Transient failures** (auth/token blip) are re-driven after \`jobs.transient_retry_delay_seconds\` (default 30), capped at \`jobs.max_transient_attempts\` (default 5; \`0\` disables the cap). The cap stops a durable fault \u2014 a revoked token answering 401 forever \u2014 from hammering ANAF for the whole retry window. Once exhausted, the row stays \`Failed\` and \`InvoiceFailed\` fires as a genuine terminal signal.
+
+**\`failed()\` \u2014 new in v3.0.0.** When the job dies permanently (timeout, retry window expiry, uncaught error), \`failed()\` calls \`parkStrandedUploadAsIndeterminate()\`, transitioning a row still stuck in \`Uploading\` to \`Failed\` / \`indeterminate\` and firing \`InvoiceFailed\`. It deliberately does **not** reset to \`Pending\`: the process may have died *after* the POST reached ANAF, so re-driving would double-file a legal invoice. Rows are resolved by \`php artisan efactura:reconcile\`.
+
+Before v3 \`failed()\` only wrote a log line, so such rows sat in \`Uploading\` forever. A SIGKILL never runs \`failed()\` at all \u2014 that is what \`SweepStaleUploads\` is for.
 
 **Configuration:**
 - \`timeout = 120s\`
 - \`maxExceptions = 3\`
-- \`retryUntil()\` \u2014 Based on \`rate_limit.retry_window_hours\` (default 24h); job keeps retrying within this window
+- \`retryUntil()\` \u2014 Based on \`rate_limit.retry_window_hours\` (default 24h), fixed from job **creation**, so rate-limit releases don't count toward a retry cap; job keeps retrying within this window
 
 ---
 
@@ -21917,6 +23065,7 @@ use BeeCoded\\EFactura\\Jobs\\CheckUploadStatuses;
 use BeeCoded\\EFactura\\Jobs\\DownloadResponses;
 use BeeCoded\\EFactura\\Jobs\\SyncMessages;
 use BeeCoded\\EFactura\\Jobs\\RetryRateLimitedUploads;
+use BeeCoded\\EFactura\\Jobs\\SweepStaleUploads;
 use BeeCoded\\EFactura\\Jobs\\DownloadReceivedInvoices;
 
 Schedule::job(new ProcessPendingUploads)->everyFiveMinutes();
@@ -21925,9 +23074,16 @@ Schedule::job(new DownloadResponses)->everyFiveMinutes();
 Schedule::job(new SyncMessages)->everyFifteenMinutes();
 Schedule::job(new RetryRateLimitedUploads)->everyThirtyMinutes();
 
+// New in v3.0.0 \u2014 do not omit. Nothing else rescues an upload stranded in
+// "uploading" by a SIGKILL'd worker (which never gets to run failed()).
+Schedule::job(new SweepStaleUploads)->everyFifteenMinutes();
+
 // Optional \u2014 only if features.download_received is enabled:
 Schedule::job(new DownloadReceivedInvoices)->hourly();
 \`\`\`
+
+**A queue worker is required.** Every batch job above only *dispatches* work; nothing is uploaded
+without a worker consuming \`config('efactura.queue')\`.
 `;
 
 // src/content/wrapper-config.ts
@@ -21948,13 +23104,26 @@ php artisan vendor:publish --tag=efactura-config
 
 ---
 
+## Framework settings this package now depends on (v3.0.0)
+
+Not keys in \`config/efactura.php\`, but the package will not work correctly without them.
+
+| Setting | Requirement | Why |
+|---------|-------------|-----|
+| \`APP_KEY\` | Must be stable and backed up **outside** the database | Encrypts \`efactura_tokens.access_token\` / \`refresh_token\`. Rotating without \`APP_PREVIOUS_KEYS\` orphans every token and forces a fresh OAuth flow per company. Restoring a prod DB elsewhere needs the matching key. |
+| \`APP_PREVIOUS_KEYS\` | Set when rotating \`APP_KEY\` | Lets Laravel decrypt existing tokens with the old key and re-encrypt on write. |
+| \`cache.default\` | Any shared, persistent store \u2014 **not \`array\`** | The OAuth state lives in the cache (15-min TTL, single-use), so web and console processes must see the same store. \`TokenService\` also uses cache locks (\`efactura:token_refresh:{cui}\`) to serialise token refresh. |
+| A running queue worker | Consuming \`config('efactura.queue')\` | v3's \`efactura:upload\` and every batch job only *dispatch* \`ProcessSingleUpload\`. Without a worker nothing is filed, and **nothing errors**. |
+
+---
+
 ## features
 
 Feature flags for granular control over which subsystems are active.
 
 | Config Key | Env Var | Type | Default | Description | Affects |
 |-----------|---------|------|---------|-------------|---------|
-| \`features.upload_invoices\` | \`EFACTURA_UPLOAD_ENABLED\` | bool | \`true\` | Enable the upload pipeline | ProcessPendingUploads, CheckUploadStatuses, DownloadResponses jobs |
+| \`features.upload_invoices\` | \`EFACTURA_UPLOAD_ENABLED\` | bool | \`true\` | Enable the upload pipeline | ProcessPendingUploads, ProcessSingleUpload, CheckUploadStatuses, DownloadResponses, RetryRateLimitedUploads, SweepStaleUploads jobs; \`efactura:upload\` |
 | \`features.download_received\` | \`EFACTURA_DOWNLOAD_RECEIVED\` | bool | \`false\` | Enable downloading received invoices from ANAF | DownloadReceivedInvoices job |
 | \`features.sync_messages\` | \`EFACTURA_SYNC_MESSAGES\` | bool | \`true\` | Enable syncing ANAF message list | SyncMessages job |
 
@@ -21964,19 +23133,34 @@ Feature flags for granular control over which subsystems are active.
 
 | Config Key | Env Var | Type | Default | Description |
 |-----------|---------|------|---------|-------------|
-| \`queue\` | \`EFACTURA_QUEUE\` | string|null | \`null\` | Queue name for all e-Factura jobs. \`null\` uses the application's default queue. Recommended: use a dedicated queue like \`'efactura'\` for isolation. |
+| \`queue\` | \`EFACTURA_QUEUE\` | \`string\` / \`null\` | \`null\` | Queue name for all e-Factura jobs. \`null\` uses the application's default queue. Recommended: use a dedicated queue like \`'efactura'\` for isolation. |
 
 ---
 
 ## rate_limit
 
-Configuration for handling ANAF's daily upload quotas and retry behavior.
+Configuration for handling ANAF rate limits and retry behavior.
+
+\`ProcessSingleUpload\`'s pre-flight check reads the SDK \`RateLimiter\`'s **\`global\`** bucket \u2014 a **per-minute** ceiling (SDK \`global_per_minute\`, env \`EFACTURA_RATE_LIMIT_GLOBAL\`, default **500/min**). It is not a daily quota. ANAF does enforce per-day quotas too (per-CUI upload, per-message status/download, list endpoints), but those are separate SDK buckets and are not what this pre-flight consults.
 
 | Config Key | Env Var | Type | Default | Description |
 |-----------|---------|------|---------|-------------|
-| \`rate_limit.retry_window_hours\` | \`EFACTURA_RATE_LIMIT_RETRY_HOURS\` | int | \`24\` | How long (in hours) a single \`ProcessSingleUpload\` job keeps retrying via \`retryUntil()\` before failing permanently. After this window, the upload is marked Failed. |
+| \`rate_limit.retry_window_hours\` | \`EFACTURA_RATE_LIMIT_RETRY_HOURS\` | int | \`24\` | How long (in hours) a single \`ProcessSingleUpload\` job keeps retrying via \`retryUntil()\` before the **job** stops being retried and is handed to the failed-job handler. |
 | \`rate_limit.retry_batch_size\` | \`EFACTURA_RATE_LIMIT_RETRY_BATCH\` | int | \`250\` | Maximum number of rate-limited failed uploads to reset to Pending per \`RetryRateLimitedUploads\` job run. Prevents overwhelming the queue on large backlogs. |
 | \`rate_limit.retry_max_age_days\` | \`EFACTURA_RATE_LIMIT_RETRY_MAX_DAYS\` | int | \`7\` | \`RetryRateLimitedUploads\` ignores failed uploads older than this many days. Prevents retrying very stale uploads indefinitely. |
+
+> **Expiry of \`retry_window_hours\` governs the queue job, not the database row.** When
+> \`retryUntil()\` passes, Laravel stops retrying and calls \`ProcessSingleUpload::failed()\`.
+>
+> **Changed in v3.0.0:** \`failed()\` now transitions the row. A row still stuck in \`Uploading\` is
+> parked as \`Failed\` / \`indeterminate\` (via \`parkStrandedUploadAsIndeterminate()\`) and
+> \`InvoiceFailed\` fires \u2014 it is **not** returned to \`Pending\`, because the job may have died after
+> the POST reached ANAF and re-driving would double-file a legal invoice. Resolve with
+> \`php artisan efactura:reconcile\`. A row left \`Pending\` (e.g. after a rate-limit reset) is
+> untouched and picked up again by \`ProcessPendingUploads\`.
+>
+> Previously \`failed()\` only wrote a log line and performed no status transition, so rows left in
+> \`Uploading\` **stalled indefinitely** with nothing to surface them.
 
 ---
 
@@ -21992,12 +23176,15 @@ Synchronous retry policy for the public ANAF **company-lookup** endpoint (capped
 
 ## jobs
 
-Hardening for the periodic batch jobs so a backlog that accumulates while the queue worker is down does not drain all at once on recovery and overwhelm ANAF's per-message rate limits.
+Hardening for the periodic batch jobs so a backlog that accumulates while the queue worker is down does not drain all at once on recovery and overwhelm ANAF's per-message rate limits, plus the v3.0.0 retry/stranding controls.
 
 | Config Key | Env Var | Type | Default | Description |
 |-----------|---------|------|---------|-------------|
 | \`jobs.max_staleness_seconds\` | \`EFACTURA_JOB_MAX_STALENESS\` | int | \`120\` | A periodic batch job (\`ProcessPendingUploads\`, \`CheckUploadStatuses\`, \`DownloadResponses\`) that has waited in the queue longer than this self-discards instead of running \u2014 the next scheduled run re-scans. Safe because these jobs are idempotent all-rows scanners. Set to \`0\` to disable. Default is 2x the typical 1-minute cadence. |
-| \`jobs.unique_for_seconds\` | \`EFACTURA_JOB_UNIQUE_FOR\` | int | \`3600\` | Lock TTL (seconds) for \`ShouldBeUniqueUntilProcessing\` on those three batch jobs \u2014 the ceiling after which a job stuck unprocessed in the queue stops blocking a fresh dispatch. |
+| \`jobs.unique_for_seconds\` | \`EFACTURA_JOB_UNIQUE_FOR\` | int | \`3600\` | Lock TTL (seconds) for \`ShouldBeUniqueUntilProcessing\` on those three batch jobs and on \`SweepStaleUploads\` \u2014 the ceiling after which a job stuck unprocessed in the queue stops blocking a fresh dispatch. (\`RetryRateLimitedUploads\` hardcodes its own \`uniqueFor = 600\` and ignores this key.) |
+| \`jobs.transient_retry_delay_seconds\` | \`EFACTURA_JOB_TRANSIENT_RETRY_DELAY\` | int | \`30\` | How long \`ProcessSingleUpload\` waits before re-driving an upload that failed transiently (auth / pre-flight blip). Rate-limited retries use a fixed 60s instead. **New in v3.0.0.** |
+| \`jobs.max_transient_attempts\` | \`EFACTURA_JOB_MAX_TRANSIENT_ATTEMPTS\` | int | \`5\` | How many times a single upload job may be re-driven for a \`transient\` failure before it is declared terminal and \`InvoiceFailed\` fires. Stops a durable fault (e.g. a revoked token answering 401) from hammering ANAF for the whole retry window. Set to \`0\` to disable the cap. **New in v3.0.0.** |
+| \`jobs.stale_uploading_minutes\` | \`EFACTURA_JOB_STALE_UPLOADING_MINUTES\` | int | \`30\` | An upload left in \`uploading\` longer than this had its worker die mid-flight. \`SweepStaleUploads\` parks it as \`Failed\` / \`indeterminate\` for human reconciliation \u2014 it is **never** re-submitted, because it may already be filed. \`<= 0\` makes the sweep a no-op. **New in v3.0.0.** |
 
 ---
 
@@ -22008,7 +23195,7 @@ Where generated XML files and ANAF response ZIPs are stored.
 | Config Key | Env Var | Type | Default | Description |
 |-----------|---------|------|---------|-------------|
 | \`storage.disk\` | \`EFACTURA_STORAGE_DISK\` | string | \`'local'\` | Laravel filesystem disk name. Use \`'s3'\` or any configured disk for cloud storage. |
-| \`storage.path\` | \`EFACTURA_STORAGE_PATH\` | string | \`'efactura'\` | Base directory path within the disk. Files are organized in subdirectories: \`{path}/xml/\`, \`{path}/responses/\`, etc. |
+| \`storage.path\` | \`EFACTURA_STORAGE_PATH\` | string | \`'efactura'\` | Base directory path within the disk. Files are organised **per CUI** under three subdirectories: generated XML at \`{path}/uploads/{cui}/{upload_id}_{Ymd_His}.xml\`, ANAF response ZIPs at \`{path}/responses/{cui}/{upload_id}_{Ymd_His}.zip\`, and received invoice ZIPs at \`{path}/received/{cui}/{message_id}_{Ymd_His}.zip\`. |
 
 ---
 
@@ -22020,7 +23207,7 @@ OAuth callback routes configuration.
 |-----------|---------|------|---------|-------------|
 | \`routes.enabled\` | \`EFACTURA_ROUTES_ENABLED\` | bool | \`true\` | Register the built-in OAuth routes (\`GET /{prefix}/auth/{cui}\` and \`GET /{prefix}/callback\`). Set to \`false\` if you handle OAuth manually. |
 | \`routes.prefix\` | \`EFACTURA_ROUTES_PREFIX\` | string | \`'efactura'\` | URL prefix for OAuth routes. Default routes are \`/efactura/auth/{cui}\` and \`/efactura/callback\`. |
-| \`routes.middleware\` | *(not env)* | array | \`['web']\` | Laravel middleware applied to OAuth routes. Modify in \`config/efactura.php\` directly. Requires \`'web'\` for session support. |
+| \`routes.middleware\` | *(not env)* | array | \`['web']\` | Laravel middleware applied to OAuth routes. Modify in \`config/efactura.php\` directly. \`'web'\` is the default because the callback redirects with flashed session data (\`efactura_success\`, \`efactura_cui\`, \`efactura_message\`). **As of v3.0.0 the OAuth state itself no longer needs the session** \u2014 it lives in the cache \u2014 so a session-less stack works if you also replace the redirect handling. |
 | \`routes.success_redirect\` | \`EFACTURA_SUCCESS_REDIRECT\` | string | \`'/'\` | URL to redirect to after successful OAuth authorization. |
 | \`routes.error_redirect\` | \`EFACTURA_ERROR_REDIRECT\` | string | \`'/'\` | URL to redirect to if OAuth authorization fails or state validation fails. |
 
@@ -22052,6 +23239,11 @@ EFACTURA_ANAF_LOOKUP_RETRY_ATTEMPTS=5
 EFACTURA_JOB_MAX_STALENESS=120
 EFACTURA_JOB_UNIQUE_FOR=3600
 
+# Upload retry / stranding controls (v3.0.0)
+EFACTURA_JOB_TRANSIENT_RETRY_DELAY=30
+EFACTURA_JOB_MAX_TRANSIENT_ATTEMPTS=5
+EFACTURA_JOB_STALE_UPLOADING_MINUTES=30
+
 # Storage
 EFACTURA_STORAGE_DISK=local
 EFACTURA_STORAGE_PATH=efactura
@@ -22064,21 +23256,24 @@ EFACTURA_ERROR_REDIRECT=/dashboard/error
 \`\`\`
 `;
 
-// src/index.ts
-var server = new McpServer({
-  name: "efactura",
-  version: "1.0.0"
-});
+// src/registry.ts
 var VALID_TOPICS = [
   "overview",
   "setup",
   "upload-pipeline",
   "token-management",
-  "commands"
+  "commands",
+  "migration"
 ];
+
+// src/index.ts
+var server = new McpServer({
+  name: "efactura",
+  version: "1.0.0"
+});
 server.tool(
   "get-wrapper-docs",
-  "Get documentation about the Laravel e-Factura wrapper package for a specific topic",
+  "Get documentation about the Laravel e-Factura wrapper package for a specific topic. Use 'migration' for the step-by-step v2 to v3.0 upgrade guide (breaking changes, symptoms, and exact code changes).",
   { topic: external_exports.enum(VALID_TOPICS).describe("Documentation topic") },
   async ({ topic }) => {
     const content = wrapperDocsContent[topic];

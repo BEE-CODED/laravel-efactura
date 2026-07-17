@@ -41,6 +41,27 @@ class EfacturaManager
         return $this->tokenService->getAuthorizationUrl($cui);
     }
 
+    /**
+     * A raw SDK client for this CUI — an escape hatch, not the happy path.
+     *
+     * WARNING: nothing persists a refresh that happens on this client. ANAF
+     * rotates refresh tokens, so if the SDK refreshes mid-call the new grant
+     * lives only in the returned object: the stored token is now spent, and once
+     * you discard the client the company must re-authorise from scratch. No
+     * concurrency is involved — a token within the SDK's 120s expiry buffer is
+     * enough.
+     *
+     * Prefer TokenService::executeWithClient(), which locks, refreshes and
+     * persists around your operation:
+     *
+     *     app(TokenService::class)->executeWithClient($token, fn ($client) => ...);
+     *
+     * If you must use this, persist afterwards yourself:
+     *
+     *     $client = EFactura::client($cui);
+     *     $result = $client->getMessages(...);
+     *     app(TokenService::class)->handleClientTokenRefresh($client, EFactura::getToken($cui));
+     */
     public function client(string $cui): EFacturaClient
     {
         return $this->tokenService->createClientForCui($cui);

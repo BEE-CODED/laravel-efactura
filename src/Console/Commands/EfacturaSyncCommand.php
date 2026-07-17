@@ -11,6 +11,7 @@
 
 namespace BeeCoded\EFactura\Console\Commands;
 
+use BeeCoded\EFactura\Exceptions\MessageSyncFailedException;
 use BeeCoded\EFactura\Services\DownloadService;
 use BeeCoded\EFactura\Services\MessageSyncService;
 use BeeCoded\EFactura\Services\TokenService;
@@ -43,16 +44,32 @@ class EfacturaSyncCommand extends Command
 
         $this->info('Syncing messages from ANAF...');
 
-        if ($cui) {
-            $token = $tokenService->getToken($cui);
-            if (!$token) {
-                $this->error("No active token found for CUI: {$cui}");
+        // Sync failures now propagate rather than being swallowed, so report them as
+        // a non-zero exit instead of letting the command claim success (or dump a
+        // stack trace at an operator).
+        try {
+            if ($cui) {
+                $token = $tokenService->getToken($cui);
+                if (!$token) {
+                    $this->error("No active token found for CUI: {$cui}");
 
-                return self::FAILURE;
+                    return self::FAILURE;
+                }
+                $synced = $messageSyncService->syncMessages($token);
+            } else {
+                $synced = $messageSyncService->syncAllMessages();
             }
-            $messageSyncService->syncMessages($token);
-        } else {
-            $messageSyncService->syncAllMessages();
+
+            $this->info("Synced {$synced} message(s).");
+        } catch (MessageSyncFailedException $e) {
+            $this->error($e->getMessage());
+
+            return self::FAILURE;
+        } catch (\Throwable $e) {
+            report($e);
+            $this->error('Message sync failed: '.$e->getMessage());
+
+            return self::FAILURE;
         }
 
         if ($this->option('download') && config('efactura.features.download_received')) {

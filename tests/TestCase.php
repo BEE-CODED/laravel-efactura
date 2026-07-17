@@ -21,6 +21,11 @@ abstract class TestCase extends Orchestra
     protected function getPackageProviders($app): array
     {
         return [
+            // The SDK's DTOs are spatie/laravel-data objects, and methods like
+            // toArray() read that package's config. It is auto-discovered in a real
+            // app (the SDK requires spatie/laravel-data), so registering it here
+            // mirrors production - without it the config is null and toArray() throws.
+            \Spatie\LaravelData\LaravelDataServiceProvider::class,
             // The SDK provider binds AnafDetailsClientInterface; auto-discovered in
             // a real app. Registered here so the wrapper's decorating extend() has a
             // concrete to wrap (mirrors production wiring).
@@ -38,12 +43,30 @@ abstract class TestCase extends Orchestra
 
     protected function defineEnvironment($app): void
     {
+        // Defaults to in-memory sqlite — the whole suite locally and the main CI
+        // matrix. Set DB_CONNECTION=pgsql (with the usual DB_* env) to run against
+        // Postgres, which the CI Postgres job does so the transaction poisoning
+        // only Postgres exhibits is actually exercised. sqlite :memory: cannot: it
+        // never poisons, and a second connection to it is a separate empty
+        // database, so the create/constraint race tests skip there.
+        $connection = env('DB_CONNECTION') === 'pgsql'
+            ? [
+                'driver' => 'pgsql',
+                'host' => env('DB_HOST', '127.0.0.1'),
+                'port' => env('DB_PORT', '5432'),
+                'database' => env('DB_DATABASE', 'efactura_test'),
+                'username' => env('DB_USERNAME', 'postgres'),
+                'password' => env('DB_PASSWORD', 'postgres'),
+                'prefix' => '',
+            ]
+            : [
+                'driver' => 'sqlite',
+                'database' => ':memory:',
+                'prefix' => '',
+            ];
+
         $app['config']->set('database.default', 'testing');
-        $app['config']->set('database.connections.testing', [
-            'driver' => 'sqlite',
-            'database' => ':memory:',
-            'prefix' => '',
-        ]);
+        $app['config']->set('database.connections.testing', $connection);
 
         $app['config']->set('efactura.enabled', true);
         $app['config']->set('efactura.features.upload_invoices', true);

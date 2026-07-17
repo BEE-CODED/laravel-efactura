@@ -68,6 +68,10 @@ composer install
 - **Services**: ALL business logic belongs in Service classes
 - **Models**: ONLY relationships, scopes, accessors, and simple state checks like `isValid()`, `isCompleted()`
 - ❌ NEVER put API calls, data transformations, or complex logic in Models
+- ⚠️ **Token credentials are encrypted by a cast (v3.0.0+).** `Builder::update()` delegates to
+  `toBase()->update()`, so **casts never run** — `EfacturaToken::where(...)->update(['access_token' => $x])`
+  writes **plaintext** into an encrypted column, and nothing can read it back. Load the model and
+  save it, so the cast applies. The same is true in reverse: never call `Crypt` on these attributes.
 
 #### Dependency Injection
 Services ALWAYS use constructor injection:
@@ -86,14 +90,18 @@ class UploadService
 // ✅ Correct - business logic in service
 class TokenService
 {
-    public function getTokensForCif(string $cif): ?OAuthTokensData
+    public function getTokensForCui(string $cui): ?OAuthTokensData
     {
-        $token = EfacturaToken::where('cif', $cif)->first();
+        $token = EfacturaToken::where('cui', $cui)->first();
         if (!$token) return null;
 
+        // Read the attributes plainly. Since v3.0.0 EfacturaToken casts both
+        // credentials to `encrypted`, so Eloquent has ALREADY decrypted them
+        // here. Calling Crypt::decryptString() on them throws DecryptException
+        // - it would be decrypting plaintext.
         return new OAuthTokensData(
-            accessToken: Crypt::decryptString($token->access_token),
-            refreshToken: Crypt::decryptString($token->refresh_token),
+            accessToken: $token->access_token,
+            refreshToken: $token->refresh_token,
             expiresAt: $token->expires_at,
         );
     }
@@ -112,9 +120,13 @@ class EfacturaToken extends Model
 {
     use HasFactory;
 
-    protected $fillable = ['cif', 'access_token', 'refresh_token', 'expires_at'];
+    protected $fillable = ['cui', 'access_token', 'refresh_token', 'expires_at'];
 
     protected $casts = [
+        // Since v3.0.0. Encryption/decryption happens HERE, once - never in a
+        // service, and never by calling Crypt manually on these attributes.
+        'access_token' => 'encrypted',
+        'refresh_token' => 'encrypted',
         'expires_at' => 'datetime',
     ];
 

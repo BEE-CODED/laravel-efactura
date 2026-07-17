@@ -34,6 +34,10 @@ class TestInvoice extends Model implements EFacturaUploadableInterface
                     street: 'Test Street 1',
                     city: 'Bucharest',
                     postalZone: '010101',
+                    // Required by the SDK's UBL builder for RO addresses (BR-RO-110).
+                    // Omitting it made generateInvoiceXml() throw, which no test ever
+                    // noticed because they all swapped the UblBuilder facade out.
+                    county: 'Bucuresti',
                     countryCode: 'RO',
                 ),
                 isVatPayer: true,
@@ -45,6 +49,7 @@ class TestInvoice extends Model implements EFacturaUploadableInterface
                     street: 'Customer Street 2',
                     city: 'Cluj',
                     postalZone: '400001',
+                    county: 'Cluj',
                     countryCode: 'RO',
                 ),
                 isVatPayer: true,

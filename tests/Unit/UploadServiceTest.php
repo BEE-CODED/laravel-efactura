@@ -1,5 +1,6 @@
 <?php
 
+use BeeCoded\EFactura\Enums\FailureReason;
 use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Events\InvoiceFailed;
 use BeeCoded\EFactura\Events\InvoiceUploaded;
@@ -8,6 +9,7 @@ use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFactura\Tests\Fixtures\TestInvoice;
+use BeeCoded\EFacturaSdk\Exceptions\AuthenticationException;
 use BeeCoded\EFacturaSdk\Facades\UblBuilder;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Schema;
@@ -142,11 +144,19 @@ describe('UploadService', function () {
         it('fails upload when token is missing', function () {
             Event::fake([InvoiceFailed::class]);
 
+            // Its own model: an upload row is now unique per uploadable, and the
+            // beforeEach already registered one for $this->invoice.
+            $orphanInvoice = TestInvoice::create([
+                'number' => 'INV-ORPHAN',
+                'cui' => '12345678',
+                'total' => 100,
+            ]);
+
             // Create upload without token relationship
             $orphanUpload = EfacturaUpload::create([
                 'efactura_token_id' => 999, // Non-existent token
                 'uploadable_type' => TestInvoice::class,
-                'uploadable_id' => $this->invoice->id,
+                'uploadable_id' => $orphanInvoice->id,
                 'status' => UploadStatus::Pending,
                 'standard' => 'UBL',
             ]);
@@ -233,7 +243,18 @@ describe('UploadService', function () {
             Event::assertDispatched(InvoiceFailed::class);
         });
 
-        it('handles exceptions during upload', function () {
+        /**
+         * An unrecognised throwable from the transmission phase may have been raised
+         * AFTER ANAF accepted the document — we cannot tell. It is parked as
+         * Indeterminate (never auto-resubmitted) rather than either retried blindly
+         * (double-filing risk) or written off as a validation failure.
+         *
+         * The mock must actually INVOKE the operation: "during transmission" is precisely
+         * the state of having handed the document to a live client. A mock that throws
+         * without ever calling the closure describes the opposite case (see below) and
+         * cannot tell the two apart.
+         */
+        it('parks an unrecognised exception during upload as indeterminate', function () {
             Event::fake([InvoiceFailed::class]);
             Storage::fake('local');
 
@@ -247,15 +268,96 @@ describe('UploadService', function () {
 
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andThrow(new \Exception('API Error'));
+                ->andReturnUsing(fn ($token, $operation) => $operation(new class
+                {
+                    public function uploadDocument($xml, $options)
+                    {
+                        throw new \Exception('API Error');
+                    }
+
+                    public function uploadB2CDocument($xml, $options)
+                    {
+                        throw new \Exception('API Error');
+                    }
+                }));
 
             $this->uploadService->processUpload($this->upload);
 
             $this->upload->refresh();
             expect($this->upload->status)->toBe(UploadStatus::Failed)
+                ->and($this->upload->failure_reason)->toBe(FailureReason::Indeterminate)
                 ->and($this->upload->errors)->toContain('API Error');
 
             Event::assertDispatched(InvoiceFailed::class);
+        });
+
+        /**
+         * The other side of that line. An unrecognised throwable raised BEFORE the client
+         * was ever handed the document (reading an unmigrated token throws DecryptException;
+         * TokenService throws RuntimeException for a deactivated token) proves the document
+         * never entered ANAF's pipeline. Writing those off as Indeterminate — "never
+         * auto-resubmitted, requires human reconciliation" — condemned every upload filed
+         * during a deploy window to manual reconciliation, and the migration landing
+         * afterwards did not unpark them.
+         */
+        it('classifies an unrecognised exception raised before transmission as transient', function () {
+            Event::fake([InvoiceFailed::class]);
+            Storage::fake('local');
+
+            UblBuilder::swap(new class
+            {
+                public function generateInvoiceXml($data): string
+                {
+                    return '<Invoice>test</Invoice>';
+                }
+            });
+
+            // Throws WITHOUT invoking the operation: the client never got the document.
+            $this->tokenService->shouldReceive('executeWithClient')
+                ->once()
+                ->andThrow(new \RuntimeException('Token for CUI 12345678 has been deactivated'));
+
+            $this->uploadService->processUpload($this->upload);
+
+            $this->upload->refresh();
+            expect($this->upload->status)->toBe(UploadStatus::Failed)
+                ->and($this->upload->failure_reason)->toBe(FailureReason::Transient)
+                ->and($this->upload->failure_reason->needsReconciliation())->toBeFalse();
+
+            // Not a terminal outcome: the pipeline will re-drive it.
+            Event::assertNotDispatched(InvoiceFailed::class);
+        });
+
+        /**
+         * An auth blip provably never reaches ANAF's filing pipeline, so it must stay
+         * retryable instead of permanently failing a legal filing. This is the exact
+         * shape that turned the (now-fixed) token deadlock into permanent data loss.
+         */
+        it('classifies an authentication failure as transient and retryable', function () {
+            Event::fake([InvoiceFailed::class]);
+            Storage::fake('local');
+
+            UblBuilder::swap(new class
+            {
+                public function generateInvoiceXml($data): string
+                {
+                    return '<Invoice>test</Invoice>';
+                }
+            });
+
+            $this->tokenService->shouldReceive('executeWithClient')
+                ->once()
+                ->andThrow(new AuthenticationException('Token refresh lock timeout'));
+
+            $this->uploadService->processUpload($this->upload);
+
+            $this->upload->refresh();
+            expect($this->upload->status)->toBe(UploadStatus::Failed)
+                ->and($this->upload->failure_reason)->toBe(FailureReason::Transient)
+                ->and($this->upload->failure_reason->isRetryable())->toBeTrue();
+
+            // Not a terminal outcome: the pipeline will re-drive it.
+            Event::assertNotDispatched(InvoiceFailed::class);
         });
 
         it('handles missing uploadable model', function () {
@@ -320,34 +422,63 @@ describe('UploadService', function () {
         });
     });
 
-    describe('resetForRateLimit', function () {
+    describe('resetForRetry', function () {
         beforeEach(function () {
             $this->upload = EfacturaUpload::create([
                 'efactura_token_id' => $this->token->id,
                 'uploadable_type' => TestInvoice::class,
                 'uploadable_id' => $this->invoice->id,
                 'status' => UploadStatus::Failed,
+                'failure_reason' => FailureReason::RateLimited,
                 'standard' => 'UBL',
                 'errors' => ['Rate limit exceeded'],
                 'processed_at' => now(),
             ]);
         });
 
-        it('resets a failed upload back to pending', function () {
-            $result = $this->uploadService->resetForRateLimit($this->upload);
+        it('resets a rate-limited upload back to pending', function () {
+            $result = $this->uploadService->resetForRetry($this->upload);
 
             expect($result)->toBeTrue();
 
             $upload = $this->upload->fresh();
             expect($upload->status)->toBe(UploadStatus::Pending)
+                ->and($upload->failure_reason)->toBeNull()
                 ->and($upload->errors)->toBeNull()
                 ->and($upload->processed_at)->toBeNull();
+        });
+
+        it('resets a transiently-failed upload back to pending', function () {
+            $this->upload->update(['failure_reason' => FailureReason::Transient]);
+
+            expect($this->uploadService->resetForRetry($this->upload))->toBeTrue();
+            expect($this->upload->fresh()->status)->toBe(UploadStatus::Pending);
+        });
+
+        /**
+         * The load-bearing guard: an indeterminate upload may ALREADY sit in ANAF's
+         * pipeline. Re-driving it would double-file a legal invoice.
+         */
+        it('refuses to reset an indeterminate upload', function () {
+            $this->upload->update(['failure_reason' => FailureReason::Indeterminate]);
+
+            $result = $this->uploadService->resetForRetry($this->upload);
+
+            expect($result)->toBeFalse();
+            expect($this->upload->fresh()->status)->toBe(UploadStatus::Failed);
+        });
+
+        it('refuses to reset a terminally-rejected upload', function () {
+            $this->upload->update(['failure_reason' => FailureReason::Validation]);
+
+            expect($this->uploadService->resetForRetry($this->upload))->toBeFalse();
+            expect($this->upload->fresh()->status)->toBe(UploadStatus::Failed);
         });
 
         it('returns false when upload is no longer in failed state', function () {
             $this->upload->update(['status' => UploadStatus::Processing]);
 
-            $result = $this->uploadService->resetForRateLimit($this->upload);
+            $result = $this->uploadService->resetForRetry($this->upload);
 
             expect($result)->toBeFalse();
             expect($this->upload->fresh()->status)->toBe(UploadStatus::Processing);
@@ -356,7 +487,7 @@ describe('UploadService', function () {
         it('returns false for pending uploads', function () {
             $this->upload->update(['status' => UploadStatus::Pending]);
 
-            $result = $this->uploadService->resetForRateLimit($this->upload);
+            $result = $this->uploadService->resetForRetry($this->upload);
 
             expect($result)->toBeFalse();
         });
@@ -364,7 +495,7 @@ describe('UploadService', function () {
         it('returns false for completed uploads', function () {
             $this->upload->update(['status' => UploadStatus::Completed]);
 
-            $result = $this->uploadService->resetForRateLimit($this->upload);
+            $result = $this->uploadService->resetForRetry($this->upload);
 
             expect($result)->toBeFalse();
         });

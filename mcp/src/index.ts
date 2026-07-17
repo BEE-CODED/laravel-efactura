@@ -6,6 +6,7 @@ import { modelIntegrationContent } from "./content/model-integration.js";
 import { eventReferenceContent } from "./content/event-reference.js";
 import { jobReferenceContent } from "./content/job-reference.js";
 import { wrapperConfigContent } from "./content/wrapper-config.js";
+import { VALID_TOPICS } from "./registry.js";
 
 const server = new McpServer({
   name: "efactura",
@@ -13,13 +14,9 @@ const server = new McpServer({
 });
 
 // Tool 1: get-wrapper-docs (parameterized by topic)
-const VALID_TOPICS = [
-  "overview", "setup", "upload-pipeline", "token-management", "commands",
-] as const;
-
 server.tool(
   "get-wrapper-docs",
-  "Get documentation about the Laravel e-Factura wrapper package for a specific topic",
+  "Get documentation about the Laravel e-Factura wrapper package for a specific topic. Use 'migration' for the step-by-step v2 to v3.0 upgrade guide (breaking changes, symptoms, and exact code changes).",
   { topic: z.enum(VALID_TOPICS).describe("Documentation topic") },
   async ({ topic }) => {
     const content = wrapperDocsContent[topic];

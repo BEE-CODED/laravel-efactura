@@ -98,10 +98,28 @@ return [
     |                        ceiling after which a job stuck unprocessed in the
     |                        queue stops blocking a fresh dispatch. Default 3600.
     |
+    | transient_retry_delay_seconds:
+    |                        How long ProcessSingleUpload waits before re-driving an
+    |                        upload that failed transiently (auth/pre-flight blip).
+    | max_transient_attempts:
+    |                        How many times a single upload job may be re-driven for
+    |                        a transient failure before it is declared terminal and
+    |                        InvoiceFailed fires. Stops a durable fault (e.g. a
+    |                        revoked token answering 401) from hammering ANAF for
+    |                        the whole retry window. Set to 0 to disable the cap.
+    | stale_uploading_minutes:
+    |                        An upload left in "uploading" longer than this had its
+    |                        worker die mid-flight. SweepStaleUploads parks it as
+    |                        Failed/indeterminate for human reconciliation — it is
+    |                        never re-submitted, because it may already be filed.
+    |
     */
     'jobs' => [
         'max_staleness_seconds' => env('EFACTURA_JOB_MAX_STALENESS', 120),
         'unique_for_seconds' => env('EFACTURA_JOB_UNIQUE_FOR', 3600),
+        'transient_retry_delay_seconds' => env('EFACTURA_JOB_TRANSIENT_RETRY_DELAY', 30),
+        'max_transient_attempts' => env('EFACTURA_JOB_MAX_TRANSIENT_ATTEMPTS', 5),
+        'stale_uploading_minutes' => env('EFACTURA_JOB_STALE_UPLOADING_MINUTES', 30),
     ],
 
     /*

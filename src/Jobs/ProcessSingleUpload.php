@@ -13,6 +13,8 @@ declare(strict_types=1);
 
 namespace BeeCoded\EFactura\Jobs;
 
+use BeeCoded\EFactura\Enums\FailureReason;
+use BeeCoded\EFactura\Events\InvoiceFailed;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFacturaSdk\Services\RateLimiter;
@@ -77,42 +79,161 @@ class ProcessSingleUpload implements ShouldQueue
 
         $uploadService->processUpload($this->upload);
 
-        // Post-check: race condition — rate limit hit during actual API call
-        // Uses atomic reset (WHERE status = Failed) to prevent overwriting concurrent transitions
+        // Post-check: the upload may have failed for a reason that is safe to re-drive
+        // (rate limit, or a transient auth/pre-flight error). The reset is atomic and
+        // itself refuses any non-retryable reason, so an Indeterminate upload can
+        // never be re-submitted from here.
         $this->upload->refresh();
-        if ($this->upload->isFailed() && $this->isRateLimitError()) {
-            if ($uploadService->resetForRateLimit($this->upload)) {
-                Log::info('EFactura: Rate limit hit during upload, resetting to pending', [
-                    'upload_id' => $this->upload->id,
-                ]);
 
-                $this->release(60);
-            }
+        $reason = $this->upload->failure_reason;
+
+        // A rate-limited upload never leaves Pending — it is still in the pipeline,
+        // waiting out ANAF's quota, so there is no failed state to reset. Just wait.
+        if ($this->upload->isPending() && $reason === FailureReason::RateLimited) {
+            $delay = $this->retryDelayFor($reason);
+
+            Log::info('EFactura: Upload rate-limited, releasing for a later attempt', [
+                'upload_id' => $this->upload->id,
+                'delay_seconds' => $delay,
+            ]);
+
+            $this->release($delay);
+
+            return;
+        }
+
+        if (!$this->upload->isFailed()) {
+            return;
+        }
+
+        if ($reason === null || !$reason->isRetryable()) {
+            return;
+        }
+
+        if ($this->transientAttemptsExhausted($reason)) {
+            $this->giveUpOnTransientFailure($uploadService, $reason);
+
+            return;
+        }
+
+        if ($uploadService->resetForRetry($this->upload)) {
+            $delay = $this->retryDelayFor($reason);
+
+            Log::info('EFactura: Retryable upload failure, resetting to pending', [
+                'upload_id' => $this->upload->id,
+                'failure_reason' => $reason->value,
+                'delay_seconds' => $delay,
+            ]);
+
+            $this->release($delay);
         }
     }
 
+    /**
+     * The job is over: it threw its last attempt, or it ran past retryUntil().
+     *
+     * Two very different rows can arrive here, and they must not be treated alike.
+     *
+     * UPLOADING — a crash between the atomic claim and a terminal transition. Nothing
+     * drives such a row out: the queue's own retry re-runs processUpload(), whose claim
+     * (WHERE status = pending) matches zero rows and silently reports success having done
+     * nothing. We deliberately do NOT reset it to Pending — the process may have died AFTER
+     * the POST reached ANAF, so re-driving would double-file a legal invoice. It is parked
+     * as Failed/Indeterminate for a human to reconcile against ANAF's message list.
+     *
+     * PENDING — the retry-window expiry routes. handle() calls resetForRetry() (-> Pending)
+     * and then release()s, and the rate-limit pre-check release()s a still-Pending row
+     * outright. This used to delegate to parkStranded* unconditionally, whose
+     * `WHERE status = uploading` guard matched ZERO rows here: it returned false silently,
+     * no terminal state was reached, no InvoiceFailed ever fired, and ProcessPendingUploads
+     * handed the Pending row straight back with a brand-new 24h window — so
+     * retry_window_hours was not a cap at all. Nothing was transmitted from a Pending row,
+     * so it is abandoned terminally instead.
+     */
     public function failed(Throwable $exception): void
     {
         Log::error('EFactura: Upload job failed permanently', [
             'upload_id' => $this->upload->id,
             'error' => $exception->getMessage(),
         ]);
+
+        $uploadService = app(UploadService::class);
+
+        $parked = $uploadService->parkStrandedUploadAsIndeterminate(
+            $this->upload,
+            'Upload job died mid-flight: '.$exception->getMessage(),
+        );
+
+        if ($parked) {
+            return;
+        }
+
+        $uploadService->abandonUnsentUpload(
+            $this->upload,
+            'Upload job gave up before the document was sent to ANAF: '.$exception->getMessage(),
+        );
     }
 
-    private function isRateLimitError(): bool
+    /**
+     * Transient failures get a bounded number of re-drives. Without a cap, a durable
+     * fault (a revoked token answering 401 forever) would release every few seconds
+     * for the whole retry window and hammer ANAF.
+     */
+    private function transientAttemptsExhausted(FailureReason $reason): bool
     {
-        $errors = $this->upload->errors;
-        if (!$errors) {
+        if ($reason !== FailureReason::Transient) {
             return false;
         }
 
-        $encoded = json_encode($errors, JSON_INVALID_UTF8_SUBSTITUTE);
-        if ($encoded === false) {
-            return false;
+        $max = (int) config('efactura.jobs.max_transient_attempts', 5);
+
+        return $max > 0 && $this->attempts() >= $max;
+    }
+
+    /**
+     * The upload keeps failing transiently and we are out of attempts.
+     *
+     * It is provably not filed, so nothing is at risk — but the row must be retired to a
+     * NON-RETRYABLE reason, not merely announced. Firing InvoiceFailed while leaving it
+     * Failed/transient left it matching exactly what RetryRateLimitedUploads selects
+     * (Failed + rate_limited|transient), so the scheduled job reset it to Pending with a
+     * fresh attempts counter and a fresh 24h window: this "give up" then ran again every
+     * ~10 minutes for retry_max_age_days, firing a false InvoiceFailed each time for an
+     * upload that was immediately retried — the very false-alarm-then-retry contract
+     * violation InvoiceRateLimited was introduced to eliminate.
+     *
+     * abandonFailure() both makes the transition (guarded, atomic) and fires the event.
+     */
+    private function giveUpOnTransientFailure(UploadService $uploadService, FailureReason $reason): void
+    {
+        Log::error('EFactura: Transient upload failure did not clear, giving up', [
+            'upload_id' => $this->upload->id,
+            'attempts' => $this->attempts(),
+        ]);
+
+        $uploadService->abandonFailure($this->upload, $reason, $this->recordedErrors());
+    }
+
+    /**
+     * The error messages recorded on the row, as the list of strings they actually are.
+     *
+     * The model declares `errors` as array<string, mixed> because it is a generic json
+     * cast, but everything written to it is a list of message strings. Narrow it here
+     * rather than widening abandonFailure()'s contract to match the looser declaration.
+     *
+     * @return array<int, string>
+     */
+    private function recordedErrors(): array
+    {
+        return array_values(array_filter($this->upload->errors ?? [], is_string(...)));
+    }
+
+    private function retryDelayFor(FailureReason $reason): int
+    {
+        if ($reason === FailureReason::RateLimited) {
+            return 60;
         }
 
-        // Check for controlled marker set by UploadService, plus legacy text matching for backward compatibility
-        return str_contains($encoded, 'RATE_LIMIT_EXCEEDED:')
-            || str_contains(strtolower($encoded), 'rate limit');
+        return (int) config('efactura.jobs.transient_retry_delay_seconds', 30);
     }
 }

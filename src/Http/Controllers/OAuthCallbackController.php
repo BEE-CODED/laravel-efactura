@@ -137,22 +137,14 @@ class OAuthCallbackController extends Controller
     }
 
     /**
-     * Clean up orphan OAuth session state.
+     * Clean up an orphan pending OAuth state.
+     *
+     * The state lives in the cache rather than the session (the session was never
+     * reachable from the console-initiated flow), so cleanup delegates to the service
+     * that owns it.
      */
     protected function cleanupOAuthSession(?string $state): void
     {
-        if (!$state) {
-            return;
-        }
-
-        try {
-            $decoded = json_decode(base64_decode($state), true);
-
-            if (is_array($decoded) && isset($decoded['token'])) {
-                session()->forget("efactura_oauth_state_{$decoded['token']}");
-            }
-        } catch (\Exception) {
-            // Invalid state format, nothing to clean up
-        }
+        $this->tokenService->forgetOAuthState($state);
     }
 }

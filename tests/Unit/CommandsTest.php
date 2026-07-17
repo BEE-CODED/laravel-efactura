@@ -35,29 +35,52 @@ describe('EfacturaUploadCommand', function () {
             ->assertExitCode(1);
     });
 
-    it('processes all uploads when no CUI specified', function () {
+    /**
+     * The command now QUEUES uploads instead of uploading them inline: the inline path
+     * has no rate-limit pre-flight and no release/retry, so a backlog past ANAF's
+     * quota used to be marked permanently Failed en masse.
+     */
+    it('queues all uploads when no CUI specified', function () {
         config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true]);
 
         $uploadService = Mockery::mock(UploadService::class);
-        $uploadService->shouldReceive('processPendingUploads')
+        $uploadService->shouldReceive('dispatchPendingUploads')
             ->once()
-            ->with(null);
+            ->with(null)
+            ->andReturn(2);
 
         $this->app->instance(UploadService::class, $uploadService);
 
         $this->artisan('efactura:upload')
-            ->expectsOutput('Processing pending uploads...')
-            ->expectsOutput('Done.')
+            ->expectsOutputToContain('Queued 2 pending upload(s)')
             ->assertExitCode(0);
     });
 
-    it('processes uploads for specific CUI', function () {
+    it('still supports inline processing behind --sync', function () {
         config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true]);
 
         $uploadService = Mockery::mock(UploadService::class);
         $uploadService->shouldReceive('processPendingUploads')
             ->once()
-            ->with('12345678');
+            ->with(null)
+            ->andReturn(3);
+        $uploadService->shouldNotReceive('dispatchPendingUploads');
+
+        $this->app->instance(UploadService::class, $uploadService);
+
+        $this->artisan('efactura:upload', ['--sync' => true])
+            ->expectsOutputToContain('Processed 3 upload(s).')
+            ->assertExitCode(0);
+    });
+
+    it('queues uploads for specific CUI', function () {
+        config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true]);
+
+        $uploadService = Mockery::mock(UploadService::class);
+        $uploadService->shouldReceive('dispatchPendingUploads')
+            ->once()
+            ->with('12345678')
+            ->andReturn(1);
 
         $this->app->instance(UploadService::class, $uploadService);
 
@@ -69,9 +92,10 @@ describe('EfacturaUploadCommand', function () {
         config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true]);
 
         $uploadService = Mockery::mock(UploadService::class);
-        $uploadService->shouldReceive('processPendingUploads')
+        $uploadService->shouldReceive('dispatchPendingUploads')
             ->once()
-            ->with('12345678');
+            ->with('12345678')
+            ->andReturn(0);
 
         $this->app->instance(UploadService::class, $uploadService);
 

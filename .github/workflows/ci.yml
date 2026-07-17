@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    # composer.json allows Laravel 11 and 12 but only one is ever installed locally,
+    # so the matrix is the only thing that actually checks the range we advertise.
+    name: PHP ${{ matrix.php }} / Laravel ${{ matrix.laravel }} / ${{ matrix.dependency-version }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.4']
+        laravel: ['11.*', '12.*']
+        dependency-version: [prefer-lowest, prefer-stable]
+        include:
+          - laravel: '11.*'
+            testbench: '9.*'
+          - laravel: '12.*'
+            testbench: '10.*'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: dom, curl, libxml, mbstring, zip, sqlite3, pdo_sqlite
+          coverage: none
+
+      - name: Install dependencies
+        run: |
+          composer require "illuminate/support:${{ matrix.laravel }}" "orchestra/testbench:${{ matrix.testbench }}" --no-interaction --no-update
+          composer update --${{ matrix.dependency-version }} --prefer-dist --no-interaction
+
+      # The suite runs against sqlite :memory:, hardcoded in tests/TestCase.php and
+      # mirrored in phpunit.xml.dist. No external service required.
+      - name: Tests
+        run: vendor/bin/pest
+
+  postgres:
+    # The suite runs on sqlite :memory:, which never poisons a transaction on a
+    # failed statement and gives each connection its own database. The
+    # create/constraint race tests need the opposite on both counts, so they skip
+    # on sqlite and run here against a real Postgres — this is the only job that
+    # actually exercises queueFor()'s savepoint recovery inside a caller's
+    # transaction. Without it that fix would be shipped unverified.
+    name: Postgres (transaction poisoning)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: efactura_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DB_CONNECTION: pgsql
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_DATABASE: efactura_test
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: dom, curl, libxml, mbstring, zip, pdo_pgsql, pgsql
+          coverage: none
+      - run: composer update --prefer-dist --no-interaction
+      # Fail loudly if the race tests are skipped here — this job exists solely to
+      # run them, so a skip means Postgres is not actually wired up.
+      - name: Race tests must run (not skip) on Postgres
+        run: |
+          vendor/bin/pest --filter="create/constraint race" --log-junit junit.xml
+          if grep -q '<skipped' junit.xml; then
+            echo "::error::The create/constraint race tests skipped on the Postgres job — the DB is not wired up."
+            exit 1
+          fi
+      - name: Full suite on Postgres
+        run: vendor/bin/pest
+
+  static-analysis:
+    name: PHPStan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: dom, curl, libxml, mbstring, zip, sqlite3, pdo_sqlite
+          coverage: none
+      - run: composer update --prefer-dist --no-interaction
+      # Keep this honest: an ignoreErrors entry is exactly how the message-sync
+      # bug (reading a property the SDK never declared) stayed hidden.
+      - run: vendor/bin/phpstan analyse --no-progress
+
+  code-style:
+    name: Pint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          coverage: none
+      - run: composer update --prefer-dist --no-interaction
+      - run: vendor/bin/pint --test
+
+  mcp:
+    name: MCP server (docs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: mcp/package-lock.json
+      - run: npm ci
+        working-directory: mcp
+      - run: npx vitest run
+        working-directory: mcp
+      # dist/index.js is committed and shipped to consumers. If it drifts from
+      # src/, users get documentation that does not match this release.
+      - name: Verify committed bundle matches src
+        working-directory: mcp
+        run: |
+          npm run build
+          if ! git diff --quiet -- dist/; then
+            echo "::error::mcp/dist is stale — run 'npm run build' in mcp/ and commit the result."
+            git diff --stat -- dist/
+            exit 1
+          fi

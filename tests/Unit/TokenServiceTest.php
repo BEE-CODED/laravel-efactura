@@ -3,11 +3,13 @@
 use BeeCoded\EFactura\Events\TokenRefreshed;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Services\TokenService;
+use BeeCoded\EFacturaSdk\Contracts\AnafAuthenticatorInterface;
 use BeeCoded\EFacturaSdk\Data\Auth\OAuthTokensData;
 use BeeCoded\EFacturaSdk\Services\ApiClients\EFacturaClient;
 use Carbon\Carbon as BaseCarbon;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\DateFactory;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\Event;
 
@@ -22,6 +24,24 @@ beforeEach(function () {
         'is_active' => true,
     ]);
 });
+
+/**
+ * Bind a stand-in for the OAuth authenticator that the refresh path resolves.
+ */
+function fakeAuthenticator(): void
+{
+    $authenticator = Mockery::mock(AnafAuthenticatorInterface::class);
+    $authenticator->shouldReceive('refreshAccessToken')
+        ->once()
+        ->with('test_refresh')
+        ->andReturn(new OAuthTokensData(
+            accessToken: 'explicitly_refreshed_access',
+            refreshToken: 'explicitly_refreshed_refresh',
+            expiresAt: now()->addHour(),
+        ));
+
+    app()->instance(AnafAuthenticatorInterface::class, $authenticator);
+}
 
 describe('TokenService', function () {
     describe('getToken', function () {
@@ -101,26 +121,45 @@ describe('TokenService', function () {
         });
     });
 
+    /**
+     * The OAuth state lives in the CACHE, not the session.
+     *
+     * These tests previously asserted the session behaviour — which is exactly what
+     * made the broken CLI flow look correct. In a test process the console command
+     * and the HTTP callback share one in-memory session, so session-stored state
+     * appeared to survive a hop it can never survive in production: artisan boots no
+     * StartSession middleware, and the callback arrives on the browser's own session.
+     * See tests/Feature/OAuthStateTest.php for the end-to-end proof.
+     */
     describe('getAuthorizationUrl', function () {
-        it('stores state token in session before calling SDK', function () {
-            // We can verify session state was created even if SDK call fails
-            try {
-                $this->tokenService->getAuthorizationUrl('12345678');
-            } catch (\Throwable) {
-                // SDK might not be configured, but session should be set
-            }
+        beforeEach(function () {
+            config([
+                'efactura-sdk.oauth.client_id' => 'test-client-id',
+                'efactura-sdk.oauth.client_secret' => 'test-client-secret',
+                'efactura-sdk.oauth.redirect_uri' => 'https://app.test/efactura/callback',
+            ]);
+        });
 
-            // Find the state key in session
-            $sessionKeys = array_keys(session()->all());
-            $stateKey = collect($sessionKeys)->first(fn ($key) => str_starts_with($key, 'efactura_oauth_state_'));
+        it('stores the state token in the cache, reachable from any process', function () {
+            $url = $this->tokenService->getAuthorizationUrl('12345678');
 
-            // Verify state was stored (regardless of SDK availability)
-            expect($stateKey)->not->toBeNull();
+            parse_str((string) parse_url($url, PHP_URL_QUERY), $query);
+            $decoded = json_decode(base64_decode($query['state']), true);
 
-            $storedState = session()->get($stateKey);
-            expect($storedState)->toHaveKey('cui')
+            $storedState = Cache::get('efactura:oauth_state:'.$decoded['token']);
+
+            expect($storedState)->not->toBeNull()
                 ->and($storedState['cui'])->toBe('12345678')
                 ->and($storedState)->toHaveKey('created_at');
+        });
+
+        it('does not depend on a session being available', function () {
+            $this->tokenService->getAuthorizationUrl('12345678');
+
+            $stateKey = collect(array_keys(session()->all()))
+                ->first(fn ($key) => str_starts_with($key, 'efactura_oauth_state_'));
+
+            expect($stateKey)->toBeNull();
         });
     });
 
@@ -143,7 +182,7 @@ describe('TokenService', function () {
             expect($result)->toBeNull();
         });
 
-        it('returns null when state token not in session', function () {
+        it('returns null when the state token was never issued', function () {
             $state = base64_encode(json_encode([
                 'cui' => '12345678',
                 'token' => 'unknown_token',
@@ -156,10 +195,10 @@ describe('TokenService', function () {
 
         it('returns null for expired state', function () {
             $stateToken = 'test_state_token';
-            session()->put("efactura_oauth_state_{$stateToken}", [
+            Cache::put("efactura:oauth_state:{$stateToken}", [
                 'cui' => '12345678',
                 'created_at' => now()->subMinutes(20)->timestamp, // Expired (> 15 min)
-            ]);
+            ], 900);
 
             $state = base64_encode(json_encode([
                 'cui' => '12345678',
@@ -173,10 +212,10 @@ describe('TokenService', function () {
 
         it('returns null for CUI mismatch', function () {
             $stateToken = 'test_state_token';
-            session()->put("efactura_oauth_state_{$stateToken}", [
+            Cache::put("efactura:oauth_state:{$stateToken}", [
                 'cui' => '12345678',
                 'created_at' => now()->timestamp,
-            ]);
+            ], 900);
 
             $state = base64_encode(json_encode([
                 'cui' => '99999999', // Different CUI
@@ -188,12 +227,12 @@ describe('TokenService', function () {
             expect($result)->toBeNull();
         });
 
-        it('returns CUI for valid state and removes from session', function () {
+        it('returns CUI for valid state and consumes it', function () {
             $stateToken = 'valid_state_token';
-            session()->put("efactura_oauth_state_{$stateToken}", [
+            Cache::put("efactura:oauth_state:{$stateToken}", [
                 'cui' => '12345678',
                 'created_at' => now()->timestamp,
-            ]);
+            ], 900);
 
             $state = base64_encode(json_encode([
                 'cui' => '12345678',
@@ -203,7 +242,27 @@ describe('TokenService', function () {
             $result = $this->tokenService->validateOAuthState($state);
 
             expect($result)->toBe('12345678');
-            expect(session()->has("efactura_oauth_state_{$stateToken}"))->toBeFalse();
+            expect(Cache::has("efactura:oauth_state:{$stateToken}"))->toBeFalse();
+        });
+    });
+
+    describe('forgetOAuthState', function () {
+        it('discards a pending state', function () {
+            Cache::put('efactura:oauth_state:abc', ['cui' => '12345678', 'created_at' => now()->timestamp], 900);
+
+            $this->tokenService->forgetOAuthState(base64_encode(json_encode([
+                'cui' => '12345678',
+                'token' => 'abc',
+            ])));
+
+            expect(Cache::has('efactura:oauth_state:abc'))->toBeFalse();
+        });
+
+        it('tolerates null and malformed state', function () {
+            $this->tokenService->forgetOAuthState(null);
+            $this->tokenService->forgetOAuthState('not-base64!!!');
+
+            expect(true)->toBeTrue();
         });
     });
 
@@ -426,9 +485,13 @@ describe('TokenService', function () {
                 ->toThrow(\RuntimeException::class, 'Token for CUI 12345678 has been deactivated');
         });
 
-        it('acquires lock and executes when token is expiring', function () {
-            // Set token to expire soon to trigger lock path
+        it('refreshes an expiring token before executing, and does not hold the lock across the operation', function () {
+            Event::fake([TokenRefreshed::class]);
+
+            // Set token to expire soon to trigger the refresh path
             $this->token->update(['expires_at' => now()->addSeconds(60)]);
+
+            fakeAuthenticator();
 
             $mockClient = Mockery::mock(EFacturaClient::class);
             $mockClient->shouldReceive('wasTokenRefreshed')->once()->andReturn(false);
@@ -438,35 +501,55 @@ describe('TokenService', function () {
                 ->once()
                 ->andReturn($mockClient);
 
-            $result = $partialService->executeWithClient($this->token, fn ($client) => 'locked_result');
+            $lockDuringOperation = null;
 
-            expect($result)->toBe('locked_result');
-        });
+            $result = $partialService->executeWithClient($this->token, function ($client) use (&$lockDuringOperation) {
+                // The SDK acquires this very key internally. It MUST be free by now,
+                // otherwise the SDK blocks on a lock this same process holds.
+                $probe = Cache::lock('efactura:token_refresh:12345678', 5);
+                $lockDuringOperation = $probe->get();
+                if ($lockDuringOperation) {
+                    $probe->release();
+                }
 
-        it('releases lock early if another process refreshed token', function () {
-            // Set token to expire soon to trigger lock path
-            $this->token->update(['expires_at' => now()->addSeconds(60)]);
-
-            $mockClient = Mockery::mock(EFacturaClient::class);
-            $mockClient->shouldReceive('wasTokenRefreshed')->andReturn(false);
-
-            $partialService = Mockery::mock(TokenService::class)->makePartial();
-            $partialService->shouldReceive('createClient')
-                ->andReturn($mockClient);
-
-            // First call acquires lock
-            $result1 = $partialService->executeWithClient($this->token, function ($client) {
-                // Simulate another process refreshing the token
-                $this->token->update(['expires_at' => now()->addHours(2)]);
-
-                return 'first_result';
+                return 'locked_result';
             });
 
-            // Token now fresh - second call should work without waiting for lock
-            $result2 = $partialService->executeWithClient($this->token, fn ($client) => 'second_result');
+            expect($result)->toBe('locked_result');
+            expect($lockDuringOperation)->toBeTrue();
 
-            expect($result1)->toBe('first_result');
-            expect($result2)->toBe('second_result');
+            // The token must have been refreshed explicitly, under the lock, beforehand.
+            $this->token->refresh();
+            expect($this->token->access_token)->toBe('explicitly_refreshed_access');
+            expect($this->token->refresh_token)->toBe('explicitly_refreshed_refresh');
+            Event::assertDispatched(TokenRefreshed::class);
+        });
+
+        it('does not refresh again if another process already refreshed the token', function () {
+            Event::fake([TokenRefreshed::class]);
+
+            // Looks expiring to us...
+            $this->token->update(['expires_at' => now()->addSeconds(60)]);
+
+            // ...but another process refreshed it before we took the lock.
+            EfacturaToken::where('id', $this->token->id)->update(['expires_at' => now()->addHours(2)]);
+
+            // Any refresh attempt would explode here: ANAF rotates refresh tokens, so a
+            // second refresh would invalidate the good one.
+            app()->bind(AnafAuthenticatorInterface::class, function () {
+                throw new \LogicException('must not refresh an already-refreshed token');
+            });
+
+            $mockClient = Mockery::mock(EFacturaClient::class);
+            $mockClient->shouldReceive('wasTokenRefreshed')->once()->andReturn(false);
+
+            $partialService = Mockery::mock(TokenService::class)->makePartial();
+            $partialService->shouldReceive('createClient')->once()->andReturn($mockClient);
+
+            $result = $partialService->executeWithClient($this->token, fn ($client) => 'second_result');
+
+            expect($result)->toBe('second_result');
+            Event::assertNotDispatched(TokenRefreshed::class);
         });
     });
 });

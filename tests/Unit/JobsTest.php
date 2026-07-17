@@ -1,6 +1,8 @@
 <?php
 
+use BeeCoded\EFactura\Enums\FailureReason;
 use BeeCoded\EFactura\Enums\UploadStatus;
+use BeeCoded\EFactura\Events\InvoiceFailed;
 use BeeCoded\EFactura\Jobs\CheckSingleUploadStatus;
 use BeeCoded\EFactura\Jobs\CheckUploadStatuses;
 use BeeCoded\EFactura\Jobs\DownloadReceivedInvoices;
@@ -678,10 +680,11 @@ describe('ProcessSingleUpload Rate Limiting', function () {
                 // Simulate the upload failing with a rate limit error
                 $upload->update([
                     'status' => UploadStatus::Failed,
+                    'failure_reason' => FailureReason::RateLimited,
                     'errors' => ['Rate limit exceeded'],
                 ]);
             });
-        $uploadService->shouldReceive('resetForRateLimit')
+        $uploadService->shouldReceive('resetForRetry')
             ->with(Mockery::on(fn ($arg) => $arg->id === $upload->id))
             ->once()
             ->andReturn(true);
@@ -715,10 +718,11 @@ describe('ProcessSingleUpload Rate Limiting', function () {
             ->andReturnUsing(function () use ($upload) {
                 $upload->update([
                     'status' => UploadStatus::Failed,
+                    'failure_reason' => FailureReason::RateLimited,
                     'errors' => ['Rate limit exceeded'],
                 ]);
             });
-        $uploadService->shouldReceive('resetForRateLimit')
+        $uploadService->shouldReceive('resetForRetry')
             ->once()
             ->andReturn(false); // Another process already transitioned
 
@@ -752,7 +756,7 @@ describe('ProcessSingleUpload Rate Limiting', function () {
                 // Simulate successful processing
                 $upload->update(['status' => UploadStatus::Processing]);
             });
-        $uploadService->shouldNotReceive('resetForRateLimit');
+        $uploadService->shouldNotReceive('resetForRetry');
 
         $rateLimiter = Mockery::mock(RateLimiter::class);
         $rateLimiter->shouldReceive('isEnabled')->andReturn(false);
@@ -778,15 +782,177 @@ describe('ProcessSingleUpload Rate Limiting', function () {
             ->andReturnUsing(function () use ($upload) {
                 $upload->update([
                     'status' => UploadStatus::Failed,
+                    'failure_reason' => FailureReason::Validation,
                     'errors' => ['XML validation error'],
                 ]);
             });
-        $uploadService->shouldNotReceive('resetForRateLimit');
+        $uploadService->shouldNotReceive('resetForRetry');
 
         $rateLimiter = Mockery::mock(RateLimiter::class);
         $rateLimiter->shouldReceive('isEnabled')->andReturn(false);
 
         $job = new ProcessSingleUpload($upload);
+        $job->handle($uploadService, $rateLimiter);
+    });
+});
+
+describe('ProcessSingleUpload transient retry', function () {
+    /**
+     * A transient failure (auth blip) provably never reached ANAF's pipeline, so the
+     * job must re-drive it rather than let a legal filing die permanently. This is the
+     * shape that turned the token deadlock into permanent data loss.
+     */
+    it('resets and releases a transiently-failed upload', function () {
+        config([
+            'efactura.enabled' => true,
+            'efactura.features.upload_invoices' => true,
+            'efactura.jobs.transient_retry_delay_seconds' => 30,
+        ]);
+
+        $upload = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => 'pending',
+            'standard' => 'UBL',
+        ]);
+
+        $uploadService = Mockery::mock(UploadService::class);
+        $uploadService->shouldReceive('processUpload')
+            ->once()
+            ->andReturnUsing(function () use ($upload) {
+                $upload->update([
+                    'status' => UploadStatus::Failed,
+                    'failure_reason' => FailureReason::Transient,
+                    'errors' => ['Token refresh lock timeout'],
+                ]);
+            });
+        $uploadService->shouldReceive('resetForRetry')->once()->andReturn(true);
+
+        $rateLimiter = Mockery::mock(RateLimiter::class);
+        $rateLimiter->shouldReceive('isEnabled')->andReturn(false);
+
+        $fakeQueueJob = Mockery::mock(Job::class);
+        $fakeQueueJob->shouldReceive('attempts')->andReturn(1);
+        $fakeQueueJob->shouldReceive('release')->with(30)->once();
+
+        $job = new ProcessSingleUpload($upload);
+        $job->setJob($fakeQueueJob);
+        $job->handle($uploadService, $rateLimiter);
+    });
+
+    /**
+     * A durable fault (revoked token answering 401 forever) must not release every few
+     * seconds for the whole 24h retry window. Once the cap is hit the failure is genuinely
+     * terminal, so InvoiceFailed fires exactly then.
+     *
+     * The cap is only real if the row it leaves behind is NON-RETRYABLE.
+     *
+     * giveUpOnTransientFailure() fired InvoiceFailed and returned without touching
+     * failure_reason, so the row stayed Failed/transient — exactly what
+     * RetryRateLimitedUploads::retryableQuery() selects (Failed + rate_limited|transient).
+     * The scheduled job then reset it to Pending with a fresh attempts counter and a fresh
+     * 24h window, so the job "gave up" every ~10 minutes for retry_max_age_days and fired
+     * a false InvoiceFailed each time — the exact contract violation InvoiceRateLimited
+     * was created to fix, reintroduced through a different door.
+     */
+    it('gives up, announces a terminal failure, and leaves the row non-retryable', function () {
+        config([
+            'efactura.enabled' => true,
+            'efactura.features.upload_invoices' => true,
+            'efactura.jobs.max_transient_attempts' => 5,
+        ]);
+
+        Event::fake([InvoiceFailed::class]);
+        Queue::fake();
+
+        $upload = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => 'pending',
+            'standard' => 'UBL',
+        ]);
+
+        // A REAL UploadService: the give-up transition itself is what is under test,
+        // so mocking it away would prove nothing.
+        $uploadService = Mockery::mock(
+            UploadService::class.'[processUpload]',
+            [app(TokenService::class)]
+        );
+        $uploadService->shouldReceive('processUpload')
+            ->once()
+            ->andReturnUsing(function () use ($upload) {
+                $upload->update([
+                    'status' => UploadStatus::Failed,
+                    'failure_reason' => FailureReason::Transient,
+                    'errors' => ['Token refresh lock timeout'],
+                ]);
+            });
+
+        $rateLimiter = Mockery::mock(RateLimiter::class);
+        $rateLimiter->shouldReceive('isEnabled')->andReturn(false);
+
+        $fakeQueueJob = Mockery::mock(Job::class);
+        $fakeQueueJob->shouldReceive('attempts')->andReturn(5);
+        $fakeQueueJob->shouldNotReceive('release');
+
+        $job = new ProcessSingleUpload($upload);
+        $job->setJob($fakeQueueJob);
+        $job->handle($uploadService, $rateLimiter);
+
+        $upload->refresh();
+
+        expect($upload->status)->toBe(UploadStatus::Failed)
+            ->and($upload->failure_reason->isRetryable())->toBeFalse()
+            // Nothing was transmitted, so it must not demand human reconciliation.
+            ->and($upload->failure_reason->needsReconciliation())->toBeFalse();
+
+        // The pipeline really has given up, so this is a genuine terminal failure.
+        Event::assertDispatched(InvoiceFailed::class);
+
+        // The gating layer: the scheduled batch job that actually did the resurrecting.
+        (new RetryRateLimitedUploads)->handle();
+
+        expect($upload->fresh()->status)->toBe(UploadStatus::Failed);
+        Queue::assertNothingPushed();
+    });
+
+    /**
+     * The double-filing guard at the job layer: an indeterminate upload must never be
+     * re-driven, no matter how the job got here.
+     */
+    it('never re-drives an indeterminate upload', function () {
+        config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true]);
+
+        $upload = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => 'pending',
+            'standard' => 'UBL',
+        ]);
+
+        $uploadService = Mockery::mock(UploadService::class);
+        $uploadService->shouldReceive('processUpload')
+            ->once()
+            ->andReturnUsing(function () use ($upload) {
+                $upload->update([
+                    'status' => UploadStatus::Failed,
+                    'failure_reason' => FailureReason::Indeterminate,
+                    'errors' => ['Connection lost mid-POST'],
+                ]);
+            });
+        $uploadService->shouldNotReceive('resetForRetry');
+
+        $rateLimiter = Mockery::mock(RateLimiter::class);
+        $rateLimiter->shouldReceive('isEnabled')->andReturn(false);
+
+        $fakeQueueJob = Mockery::mock(Job::class);
+        $fakeQueueJob->shouldNotReceive('release');
+
+        $job = new ProcessSingleUpload($upload);
+        $job->setJob($fakeQueueJob);
         $job->handle($uploadService, $rateLimiter);
     });
 });
@@ -807,6 +973,10 @@ describe('ProcessSingleUpload Failed Handler', function () {
             ->once()
             ->with('EFactura: Upload job failed permanently', Mockery::on(fn ($ctx) => $ctx['upload_id'] === $upload->id
                 && $ctx['error'] === 'Something went wrong'));
+
+        // The row is Pending, so failed() also abandons it (see the retry-deadline tests
+        // in StrandedUploadTest) — which logs a warning of its own.
+        Log::shouldReceive('warning')->zeroOrMoreTimes();
 
         $job->failed(new RuntimeException('Something went wrong'));
     });
@@ -871,6 +1041,7 @@ describe('RetryRateLimitedUploads Job', function () {
             'uploadable_type' => 'App\\Models\\Invoice',
             'uploadable_id' => 1,
             'status' => UploadStatus::Failed,
+            'failure_reason' => FailureReason::RateLimited,
             'standard' => 'UBL',
             'errors' => ['Rate limit exceeded'],
         ]);
@@ -894,6 +1065,7 @@ describe('RetryRateLimitedUploads Job', function () {
             'uploadable_type' => 'App\\Models\\Invoice',
             'uploadable_id' => 1,
             'status' => UploadStatus::Failed,
+            'failure_reason' => FailureReason::Validation,
             'standard' => 'UBL',
             'errors' => ['XML validation error'],
         ]);
@@ -919,6 +1091,7 @@ describe('RetryRateLimitedUploads Job', function () {
             'uploadable_type' => 'App\\Models\\Invoice',
             'uploadable_id' => 1,
             'status' => UploadStatus::Failed,
+            'failure_reason' => FailureReason::RateLimited,
             'standard' => 'UBL',
             'errors' => ['Rate limit exceeded'],
         ]);
@@ -949,6 +1122,7 @@ describe('RetryRateLimitedUploads Job', function () {
                 'uploadable_type' => 'App\\Models\\Invoice',
                 'uploadable_id' => $i,
                 'status' => UploadStatus::Failed,
+                'failure_reason' => FailureReason::RateLimited,
                 'standard' => 'UBL',
                 'errors' => ['Rate limit exceeded'],
             ]);

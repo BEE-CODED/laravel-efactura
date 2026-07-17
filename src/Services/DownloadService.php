@@ -11,12 +11,16 @@
 
 namespace BeeCoded\EFactura\Services;
 
+use BeeCoded\EFactura\Enums\FailureReason;
 use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Events\InvoiceFailed;
 use BeeCoded\EFactura\Events\InvoiceProcessed;
 use BeeCoded\EFactura\Events\InvoiceReceived;
 use BeeCoded\EFactura\Models\EfacturaMessage;
 use BeeCoded\EFactura\Models\EfacturaUpload;
+use BeeCoded\EFacturaSdk\Data\Response\StatusResponseData;
+use BeeCoded\EFacturaSdk\Exceptions\ApiException;
+use BeeCoded\EFacturaSdk\Exceptions\RateLimitExceededException;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 
@@ -29,6 +33,10 @@ class DownloadService
 
     /**
      * Check status of an upload and update accordingly.
+     *
+     * @throws ApiException|RateLimitExceededException When ANAF's quota is exhausted,
+     *                                                 so the caller stops the batch
+     *                                                 instead of walking the backlog.
      */
     public function checkStatus(EfacturaUpload $upload): void
     {
@@ -52,14 +60,52 @@ class DownloadService
 
             if ($response->isReady()) {
                 $this->uploadService->markUploadAsCompleted($upload, $response->idDescarcare);
-            } elseif ($response->isFailed()) {
-                $errors = $response->errors ?? [__('efactura::messages.processing_failed_at_anaf')];
-                $this->uploadService->markUploadAsFailed($upload, $errors, $response->idDescarcare);
-                event(new InvoiceFailed($upload, $response->errors ?? []));
-            }
-            // If still in progress, do nothing
 
+                return;
+            }
+
+            if ($response->isFailed()) {
+                $errors = $response->errors ?? [__('efactura::messages.processing_failed_at_anaf')];
+                // ANAF processed the document and rejected it on its merits: terminal.
+                $this->uploadService->markUploadAsFailed(
+                    $upload,
+                    $errors,
+                    $response->idDescarcare,
+                    FailureReason::Validation,
+                );
+                event(new InvoiceFailed($upload, $response->errors ?? []));
+
+                return;
+            }
+
+            if ($response->isInProgress()) {
+                // The ONLY legitimate no-op: ANAF said, in so many words, "not yet".
+                return;
+            }
+
+            $this->parkUnrecognisableStatus($upload, $response);
+        } catch (RateLimitExceededException $e) {
+            // The SDK's client-side pre-flight limiter refused to make the call, so
+            // nothing was sent — and nothing will be for the rest of this batch either.
+            $this->stopBatchForRateLimit($upload, $e);
+        } catch (ApiException $e) {
+            // A genuine ANAF 429 arrives HERE, not as RateLimitExceededException: the
+            // SDK's isRetryable() deliberately excludes 429, so it throws a plain
+            // ApiException(429). Swallowing it made a rate-limited run walk the ENTIRE
+            // backlog, throwing and swallowing once per upload, burning nothing but
+            // time and confirming the limit over and over.
+            if ($e->statusCode === 429) {
+                $this->stopBatchForRateLimit($upload, $e);
+            }
+
+            Log::error('EFactura status check failed', [
+                'upload_id' => $upload->id,
+                'status_code' => $e->statusCode,
+                'error' => $e->getMessage(),
+            ]);
         } catch (\Throwable $e) {
+            // Anything else stays isolated to this row: one broken upload must not stop
+            // the others, and the next scheduled run retries it.
             Log::error('EFactura status check failed', [
                 'upload_id' => $upload->id,
                 'error' => $e->getMessage(),
@@ -68,7 +114,66 @@ class DownloadService
     }
 
     /**
+     * Abandon the current batch because ANAF's quota is exhausted.
+     *
+     * Continuing is pointless — every remaining upload would hit the same wall — and
+     * the next scheduled run picks the backlog up anyway.
+     *
+     * @throws ApiException|RateLimitExceededException Always.
+     */
+    protected function stopBatchForRateLimit(EfacturaUpload $upload, \Throwable $e): never
+    {
+        Log::warning('EFactura: rate limited by ANAF, stopping this batch', [
+            'upload_id' => $upload->id,
+            'error' => $e->getMessage(),
+        ]);
+
+        throw $e;
+    }
+
+    /**
+     * Park an upload whose ANAF status we cannot read.
+     *
+     * ANAF answers an unknown index_incarcare with HTTP 200 + {"eroare": ...}, which
+     * parses into a StatusResponseData with `stare = null`. isReady() and isFailed()
+     * are then BOTH false, so the old code fell through to "still in progress, do
+     * nothing" and polled this upload every 10 minutes FOREVER — logging nothing,
+     * because nothing ever threw. SweepStaleUploads does not rescue it either: that
+     * sweeps Uploading, and this row is Processing.
+     *
+     * Indeterminate is the honest verdict, not a guess: ANAF issued the index at
+     * upload time, so the document DID reach ANAF, but ANAF now tells us nothing
+     * recognisable about it. Whether it was filed is genuinely unknown — which is why
+     * this reason is never auto-resubmitted (that could double-file a legal invoice)
+     * and instead routes to `efactura:reconcile` for a human.
+     */
+    protected function parkUnrecognisableStatus(EfacturaUpload $upload, StatusResponseData $response): void
+    {
+        $error = sprintf(
+            'ANAF returned no recognisable status (stare) for upload index %s; the upload state cannot be determined.',
+            $upload->upload_index,
+        );
+
+        Log::error('EFactura: unrecognisable ANAF status, parking upload for reconciliation', [
+            'upload_id' => $upload->id,
+            'upload_index' => $upload->upload_index,
+            'anaf_errors' => $response->errors,
+        ]);
+
+        $this->uploadService->markUploadAsFailed(
+            $upload,
+            [$error],
+            $response->idDescarcare,
+            FailureReason::Indeterminate,
+        );
+
+        event(new InvoiceFailed($upload, [$error]));
+    }
+
+    /**
      * Download response for a completed upload.
+     *
+     * @throws ApiException|RateLimitExceededException When ANAF's quota is exhausted.
      */
     public function downloadResponse(EfacturaUpload $upload): void
     {
@@ -100,12 +205,80 @@ class DownloadService
                 event(new InvoiceProcessed($upload));
             }
 
+        } catch (RateLimitExceededException $e) {
+            $this->stopBatchForRateLimit($upload, $e);
+        } catch (ApiException $e) {
+            if ($e->statusCode === 429) {
+                $this->stopBatchForRateLimit($upload, $e);
+            }
+
+            if ($this->isPoisonedBody($e)) {
+                $this->recordPoisonedResponse($upload, $e);
+
+                return;
+            }
+
+            Log::error('EFactura response download failed', [
+                'upload_id' => $upload->id,
+                'status_code' => $e->statusCode,
+                'error' => $e->getMessage(),
+            ]);
         } catch (\Throwable $e) {
             Log::error('EFactura response download failed', [
                 'upload_id' => $upload->id,
                 'error' => $e->getMessage(),
             ]);
         }
+    }
+
+    /**
+     * Whether an ApiException came from the SDK's 2xx download-body guard.
+     *
+     * guardDownloadBody() rejects a "successful" /descarcare body that is not a ZIP —
+     * a JSON {"eroare": ...} or an HTML maintenance page — and rethrows carrying the
+     * response's own status. A 2xx on an ApiException is therefore the SDK saying
+     * "ANAF answered OK and handed us something that is not a document", which is a
+     * different animal from a transport or auth failure: it is usually PERMANENT for
+     * this download id, and no amount of retrying will turn it into a ZIP.
+     */
+    protected function isPoisonedBody(ApiException $e): bool
+    {
+        return $e->statusCode >= 200 && $e->statusCode < 300;
+    }
+
+    /**
+     * Record a response ANAF will never hand over.
+     *
+     * Left unrecorded, this row is re-selected by needsResponseDownload() (status
+     * Completed/Failed + download_id + no response_path) on EVERY scheduled
+     * DownloadResponses run, re-downloading the same poison forever — and, before
+     * this, saying nothing about it at all.
+     *
+     * The upload itself stays Completed on purpose: ANAF accepted the INVOICE, and
+     * only the response artefact is unavailable. Demoting a filed invoice to Failed
+     * because its receipt is missing would be a far worse lie than the missing receipt.
+     */
+    protected function recordPoisonedResponse(EfacturaUpload $upload, ApiException $e): void
+    {
+        Log::error('EFactura: ANAF returned a non-ZIP body for a response download', [
+            'upload_id' => $upload->id,
+            'download_id' => $upload->download_id,
+            'status_code' => $e->statusCode,
+            'error' => $e->getMessage(),
+            'body_sample' => $e->details,
+        ]);
+
+        $upload->update([
+            'errors' => array_values(array_unique(array_merge(
+                $upload->errors ?? [],
+                [$e->getMessage()],
+            ))),
+            // Count this attempt so needsResponseDownload() eventually stops
+            // selecting the row instead of re-hitting ANAF forever. `now()`
+            // records the most recent failure for the reconcile view.
+            'response_attempts' => $upload->response_attempts + 1,
+            'response_failed_at' => now(),
+        ]);
     }
 
     /**
@@ -136,6 +309,30 @@ class DownloadService
 
             event(new InvoiceReceived($message));
 
+        } catch (RateLimitExceededException $e) {
+            // Same reasoning as checkStatus(): once ANAF has said "no more", walking the
+            // rest of the backlog only re-confirms it.
+            Log::warning('EFactura: rate limited by ANAF, stopping this batch', [
+                'message_id' => $message->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            throw $e;
+        } catch (ApiException $e) {
+            if ($e->statusCode === 429) {
+                Log::warning('EFactura: rate limited by ANAF, stopping this batch', [
+                    'message_id' => $message->id,
+                    'error' => $e->getMessage(),
+                ]);
+
+                throw $e;
+            }
+
+            Log::error('EFactura message download failed', [
+                'message_id' => $message->id,
+                'status_code' => $e->statusCode,
+                'error' => $e->getMessage(),
+            ]);
         } catch (\Throwable $e) {
             Log::error('EFactura message download failed', [
                 'message_id' => $message->id,

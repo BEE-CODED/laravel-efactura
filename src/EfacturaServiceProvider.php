@@ -74,6 +74,7 @@ class EfacturaServiceProvider extends ServiceProvider
                 Console\Commands\EfacturaStatusCommand::class,
                 Console\Commands\EfacturaSyncCommand::class,
                 Console\Commands\EfacturaAuthCommand::class,
+                Console\Commands\EfacturaReconcileCommand::class,
             ]);
         }
 

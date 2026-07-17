@@ -1,5 +1,6 @@
 <?php
 
+use BeeCoded\EFactura\Enums\FailureReason;
 use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Events\InvoiceFailed;
 use BeeCoded\EFactura\Events\InvoiceProcessed;
@@ -10,6 +11,8 @@ use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\DownloadService;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
+use BeeCoded\EFacturaSdk\Data\Response\DownloadResponseData;
+use BeeCoded\EFacturaSdk\Data\Response\StatusResponseData;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Storage;
 
@@ -87,24 +90,12 @@ describe('DownloadService', function () {
                 'standard' => 'UBL',
             ]);
 
-            $mockResponse = new class
-            {
-                public function isReady(): bool
-                {
-                    return true;
-                }
-
-                public function isFailed(): bool
-                {
-                    return false;
-                }
-
-                public string $idDescarcare = 'DOWNLOAD456';
-            };
-
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andReturn($mockResponse);
+                ->andReturn(StatusResponseData::fromAnafResponse([
+                    'stare' => 'ok',
+                    'id_descarcare' => 'DOWNLOAD456',
+                ]));
 
             $this->uploadService->shouldReceive('markUploadAsCompleted')
                 ->once()
@@ -125,36 +116,35 @@ describe('DownloadService', function () {
                 'standard' => 'UBL',
             ]);
 
-            $mockResponse = new class
-            {
-                public function isReady(): bool
-                {
-                    return false;
-                }
-
-                public function isFailed(): bool
-                {
-                    return true;
-                }
-
-                public array $errors = ['Processing error'];
-
-                public ?string $idDescarcare = 'ERROR_DL_123';
-            };
-
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andReturn($mockResponse);
+                ->andReturn(StatusResponseData::fromAnafResponse([
+                    'stare' => 'nok',
+                    'id_descarcare' => 'ERROR_DL_123',
+                    'Errors' => ['Processing error'],
+                ]));
 
+            // ANAF processed the document and rejected it: a terminal validation
+            // verdict, which must be recorded as such so the retry job never
+            // re-submits it.
             $this->uploadService->shouldReceive('markUploadAsFailed')
                 ->once()
-                ->with($upload, ['Processing error'], 'ERROR_DL_123');
+                ->with($upload, ['Processing error'], 'ERROR_DL_123', FailureReason::Validation);
 
             $this->downloadService->checkStatus($upload);
 
             Event::assertDispatched(InvoiceFailed::class);
         });
 
+        /**
+         * Uses the REAL StatusResponseData. The hand-rolled anonymous fake this
+         * replaces declared only isReady()/isFailed() — no isInProgress(), which the
+         * SDK's DTO has always had. Once checkStatus() started asking isInProgress(),
+         * the fake raised an undefined-method Error that the service's catch swallowed,
+         * leaving the row Processing and passing this test for entirely the wrong
+         * reason: it would have gone on "proving" the in-progress no-op long after the
+         * in-progress branch stopped being reached at all.
+         */
         it('does nothing when still in progress', function () {
             $upload = EfacturaUpload::create([
                 'efactura_token_id' => $this->token->id,
@@ -165,27 +155,44 @@ describe('DownloadService', function () {
                 'standard' => 'UBL',
             ]);
 
-            $mockResponse = new class
-            {
-                public function isReady(): bool
-                {
-                    return false;
-                }
-
-                public function isFailed(): bool
-                {
-                    return false;
-                }
-            };
-
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andReturn($mockResponse);
+                ->andReturn(StatusResponseData::fromAnafResponse(['stare' => 'in prelucrare']));
 
             // Should not mark anything
             $this->downloadService->checkStatus($upload);
 
             expect($upload->fresh()->status)->toBe(UploadStatus::Processing);
+            expect($upload->fresh()->failure_reason)->toBeNull();
+        });
+
+        /**
+         * ANAF answers an unknown index_incarcare with 200 + {"eroare"}, which parses
+         * to stare = null: isReady(), isFailed() and isInProgress() are all false.
+         */
+        it('parks an upload whose status ANAF does not recognise', function () {
+            Event::fake([InvoiceFailed::class]);
+
+            $upload = EfacturaUpload::create([
+                'efactura_token_id' => $this->token->id,
+                'uploadable_type' => 'App\\Models\\Invoice',
+                'uploadable_id' => 1,
+                'status' => UploadStatus::Processing,
+                'upload_index' => 'INDEX123',
+                'standard' => 'UBL',
+            ]);
+
+            $this->tokenService->shouldReceive('executeWithClient')
+                ->once()
+                ->andReturn(StatusResponseData::fromAnafResponse(['eroare' => 'Nu exista niciun upload']));
+
+            $this->uploadService->shouldReceive('markUploadAsFailed')
+                ->once()
+                ->withArgs(fn ($u, $errors, $downloadId, $reason) => $u->is($upload) && $reason === FailureReason::Indeterminate);
+
+            $this->downloadService->checkStatus($upload);
+
+            Event::assertDispatched(InvoiceFailed::class);
         });
 
         it('handles exceptions gracefully', function () {
@@ -273,14 +280,9 @@ describe('DownloadService', function () {
                 'standard' => 'UBL',
             ]);
 
-            $mockResponse = new class
-            {
-                public string $content = 'ZIP CONTENT';
-            };
-
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andReturn($mockResponse);
+                ->andReturn(new DownloadResponseData(content: 'ZIP CONTENT', contentType: 'application/zip'));
 
             $this->downloadService->downloadResponse($upload);
 
@@ -371,14 +373,9 @@ describe('DownloadService', function () {
                 'is_downloaded' => false,
             ]);
 
-            $mockResponse = new class
-            {
-                public string $content = 'MESSAGE CONTENT';
-            };
-
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andReturn($mockResponse);
+                ->andReturn(new DownloadResponseData(content: 'MESSAGE CONTENT', contentType: 'application/zip'));
 
             $this->downloadService->downloadMessage($message);
 
@@ -454,22 +451,9 @@ describe('DownloadService', function () {
                 'standard' => 'UBL',
             ]);
 
-            $mockResponse = new class
-            {
-                public function isReady(): bool
-                {
-                    return false;
-                }
-
-                public function isFailed(): bool
-                {
-                    return false;
-                }
-            };
-
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andReturn($mockResponse);
+                ->andReturn(StatusResponseData::fromAnafResponse(['stare' => 'in prelucrare']));
 
             $this->downloadService->checkAllStatuses();
 
@@ -514,14 +498,9 @@ describe('DownloadService', function () {
                 'standard' => 'UBL',
             ]);
 
-            $mockResponse = new class
-            {
-                public string $content = 'ZIP';
-            };
-
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andReturn($mockResponse);
+                ->andReturn(new DownloadResponseData(content: 'ZIP', contentType: 'application/zip'));
 
             $this->downloadService->downloadAllResponses();
 
@@ -553,14 +532,9 @@ describe('DownloadService', function () {
                 'is_downloaded' => false,
             ]);
 
-            $mockResponse = new class
-            {
-                public string $content = 'CONTENT';
-            };
-
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andReturn($mockResponse);
+                ->andReturn(new DownloadResponseData(content: 'CONTENT', contentType: 'application/zip'));
 
             $this->downloadService->downloadAllReceivedInvoices();
 

@@ -11,6 +11,7 @@
 
 namespace BeeCoded\EFactura\Models;
 
+use BeeCoded\EFactura\Enums\FailureReason;
 use BeeCoded\EFactura\Enums\UploadStatus;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
@@ -24,6 +25,7 @@ use Illuminate\Support\Carbon;
  * @property string $uploadable_type
  * @property int $uploadable_id
  * @property UploadStatus $status
+ * @property FailureReason|null $failure_reason
  * @property string|null $upload_index
  * @property string|null $download_id
  * @property string|null $xml_path
@@ -35,6 +37,8 @@ use Illuminate\Support\Carbon;
  * @property bool $is_b2c
  * @property Carbon|null $uploaded_at
  * @property Carbon|null $processed_at
+ * @property int $response_attempts
+ * @property Carbon|null $response_failed_at
  * @property Carbon $created_at
  * @property Carbon $updated_at
  * @property-read EfacturaToken|null $token
@@ -59,6 +63,7 @@ class EfacturaUpload extends Model
         'uploadable_type',
         'uploadable_id',
         'status',
+        'failure_reason',
         'upload_index',
         'download_id',
         'xml_path',
@@ -70,16 +75,21 @@ class EfacturaUpload extends Model
         'is_b2c',
         'uploaded_at',
         'processed_at',
+        'response_attempts',
+        'response_failed_at',
     ];
 
     protected $casts = [
         'status' => UploadStatus::class,
+        'failure_reason' => FailureReason::class,
         'errors' => 'array',
         'is_extern' => 'boolean',
         'is_self_billed' => 'boolean',
         'is_b2c' => 'boolean',
         'uploaded_at' => 'datetime',
         'processed_at' => 'datetime',
+        'response_attempts' => 'integer',
+        'response_failed_at' => 'datetime',
     ];
 
     public function token(): BelongsTo
@@ -133,11 +143,21 @@ class EfacturaUpload extends Model
             ->whereNotNull('upload_index');
     }
 
+    /**
+     * Attempts to fetch a response from ANAF before a poisoned row is set aside.
+     *
+     * A 2xx-but-not-a-ZIP body may be a transient ANAF glitch, so the download is
+     * retried a few times; past this it is left for `efactura:reconcile` rather
+     * than re-hit on every scheduled run.
+     */
+    public const MAX_RESPONSE_ATTEMPTS = 3;
+
     public function scopeNeedsResponseDownload(Builder $query): Builder
     {
         return $query->whereIn('status', [UploadStatus::Completed, UploadStatus::Failed])
             ->whereNotNull('download_id')
-            ->whereNull('response_path');
+            ->whereNull('response_path')
+            ->where('response_attempts', '<', self::MAX_RESPONSE_ATTEMPTS);
     }
 
     public function scopeForToken(Builder $query, EfacturaToken $token): Builder

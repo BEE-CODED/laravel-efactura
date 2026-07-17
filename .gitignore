@@ -4,6 +4,9 @@
 /.vscode/
 .DS_Store
 .phpunit.result.cache
+# phpunit.xml is a LOCAL override only; phpunit.xml.dist is tracked so a fresh
+# clone (and CI) can actually run the suite. PHPUnit prefers phpunit.xml when
+# present and falls back to the .dist.
 phpunit.xml
 composer.lock
 .phpunit.cache/
@@ -11,7 +14,9 @@ coverage/
 
 # MCP server
 mcp/node_modules/
-mcp/package-lock.json
+# mcp/package-lock.json is deliberately NOT ignored: the MCP server is a bundled
+# tool whose dist/index.js is committed and shipped to consumers, so its build
+# must be reproducible (and CI runs `npm ci`, which requires the lockfile).
 
 # Superpowers specs
 docs/superpowers/

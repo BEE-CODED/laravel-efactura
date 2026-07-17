@@ -59,6 +59,8 @@ describe('OAuthCallbackController', function () {
         it('handles OAuth error response', function () {
             config(['efactura.routes.error_redirect' => '/error']);
 
+            $this->tokenService->shouldReceive('forgetOAuthState')->once();
+
             $request = Request::create('/callback', 'GET', [
                 'error' => 'access_denied',
                 'error_description' => 'User cancelled',
@@ -73,6 +75,8 @@ describe('OAuthCallbackController', function () {
 
         it('handles missing authorization code', function () {
             config(['efactura.routes.error_redirect' => '/error']);
+
+            $this->tokenService->shouldReceive('forgetOAuthState')->once();
 
             $request = Request::create('/callback', 'GET', []);
 
@@ -197,51 +201,38 @@ describe('OAuthCallbackController', function () {
         });
     });
 
-    describe('cleanupOAuthSession', function () {
-        it('handles null state gracefully', function () {
-            $reflection = new ReflectionMethod($this->controller, 'cleanupOAuthSession');
-            $reflection->setAccessible(true);
+    /**
+     * Orphan-state cleanup now targets the CACHE, because that is where the OAuth
+     * state lives (the session was never reachable from the console-initiated flow).
+     * The controller delegates to TokenService, which owns the key; these tests
+     * assert that delegation, and TokenServiceTest covers the removal itself.
+     */
+    describe('orphan state cleanup', function () {
+        it('discards the pending state when ANAF reports an error', function () {
+            config(['efactura.routes.error_redirect' => '/error']);
 
-            // Should not throw - verify by calling without exception
-            $reflection->invoke($this->controller, null);
+            $state = base64_encode(json_encode(['token' => 'abc', 'cui' => '12345678']));
 
-            // Add an assertion to avoid risky test
-            expect(true)->toBeTrue();
+            $this->tokenService->shouldReceive('forgetOAuthState')
+                ->with($state)
+                ->once();
+
+            $this->controller->callback(Request::create('/callback', 'GET', [
+                'error' => 'access_denied',
+                'state' => $state,
+            ]));
         });
 
-        it('cleans up valid session state', function () {
-            $stateToken = 'test_token';
-            session()->put("efactura_oauth_state_{$stateToken}", ['cui' => '12345678']);
+        it('discards the pending state when the code is missing', function () {
+            config(['efactura.routes.error_redirect' => '/error']);
 
-            $state = base64_encode(json_encode(['token' => $stateToken, 'cui' => '12345678']));
+            $state = base64_encode(json_encode(['token' => 'abc', 'cui' => '12345678']));
 
-            $reflection = new ReflectionMethod($this->controller, 'cleanupOAuthSession');
-            $reflection->setAccessible(true);
-            $reflection->invoke($this->controller, $state);
+            $this->tokenService->shouldReceive('forgetOAuthState')
+                ->with($state)
+                ->once();
 
-            expect(session()->has("efactura_oauth_state_{$stateToken}"))->toBeFalse();
-        });
-
-        it('handles invalid base64 gracefully', function () {
-            $reflection = new ReflectionMethod($this->controller, 'cleanupOAuthSession');
-            $reflection->setAccessible(true);
-
-            // Should not throw - verify by calling without exception
-            $reflection->invoke($this->controller, 'not-valid-base64!!!');
-
-            // Add an assertion to avoid risky test
-            expect(true)->toBeTrue();
-        });
-
-        it('handles invalid JSON gracefully', function () {
-            $reflection = new ReflectionMethod($this->controller, 'cleanupOAuthSession');
-            $reflection->setAccessible(true);
-
-            // Should not throw - verify by calling without exception
-            $reflection->invoke($this->controller, base64_encode('not json'));
-
-            // Add an assertion to avoid risky test
-            expect(true)->toBeTrue();
+            $this->controller->callback(Request::create('/callback', 'GET', ['state' => $state]));
         });
     });
 });
