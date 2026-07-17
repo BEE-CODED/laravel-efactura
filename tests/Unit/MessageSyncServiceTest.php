@@ -6,6 +6,7 @@ use BeeCoded\EFactura\Services\MessageSyncService;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFacturaSdk\Data\Response\ListMessagesResponseData;
 use BeeCoded\EFacturaSdk\Enums\MessageFilter;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -258,10 +259,10 @@ describe('MessageSyncService', function () {
         it('propagates an unexpected error instead of silently syncing nothing', function () {
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andThrow(new \Exception('API Error'));
+                ->andThrow(new Exception('API Error'));
 
             expect(fn () => $this->messageSyncService->syncMessages($this->token))
-                ->toThrow(\Exception::class, 'API Error');
+                ->toThrow(Exception::class, 'API Error');
 
             expect(EfacturaMessage::count())->toBe(0);
         });
@@ -306,7 +307,7 @@ describe('MessageSyncService', function () {
 
             $this->tokenService->shouldReceive('getActiveTokens')
                 ->once()
-                ->andReturn(new \Illuminate\Database\Eloquent\Collection([$this->token, $token2]));
+                ->andReturn(new Collection([$this->token, $token2]));
 
             $this->tokenService->shouldReceive('executeWithClient')
                 ->twice()
@@ -325,7 +326,7 @@ describe('MessageSyncService', function () {
         it('passes filter to syncMessages', function () {
             $this->tokenService->shouldReceive('getActiveTokens')
                 ->once()
-                ->andReturn(new \Illuminate\Database\Eloquent\Collection([$this->token]));
+                ->andReturn(new Collection([$this->token]));
 
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()

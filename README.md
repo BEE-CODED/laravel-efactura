@@ -253,7 +253,7 @@ Your `APP_KEY` was never load-bearing for e-Factura before. It is now.
 ## Requirements
 
 - PHP 8.4+
-- Laravel 11.x or 12.x
+- Laravel 11.x, 12.x, or 13.x
 - `bee-coded/laravel-efactura-sdk` ^3.0 (installed automatically)
 - ANAF SPV OAuth credentials
 - A stable, backed-up `APP_KEY` — it encrypts the stored ANAF credentials

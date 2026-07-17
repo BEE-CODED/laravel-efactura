@@ -269,7 +269,7 @@ describe('TokenService', function () {
     describe('createClientForCui', function () {
         it('throws exception when no token found', function () {
             expect(fn () => $this->tokenService->createClientForCui('99999999'))
-                ->toThrow(\RuntimeException::class, 'No active token found for CUI: 99999999');
+                ->toThrow(RuntimeException::class, 'No active token found for CUI: 99999999');
         });
 
         it('calls createClient when token exists', function () {
@@ -279,10 +279,10 @@ describe('TokenService', function () {
                 $this->tokenService->createClientForCui('12345678');
                 // If we get here, SDK was configured and worked
                 expect(true)->toBeTrue();
-            } catch (\RuntimeException $e) {
+            } catch (RuntimeException $e) {
                 // If this is "No active token", the test failed
                 expect($e->getMessage())->not->toContain('No active token found');
-            } catch (\Exception $e) {
+            } catch (Exception $e) {
                 // SDK not configured - but we verified token was found
                 // (otherwise RuntimeException would have been thrown)
                 expect(true)->toBeTrue();
@@ -482,7 +482,7 @@ describe('TokenService', function () {
             $this->token->update(['is_active' => false]);
 
             expect(fn () => $this->tokenService->executeWithClient($this->token, fn () => 'test'))
-                ->toThrow(\RuntimeException::class, 'Token for CUI 12345678 has been deactivated');
+                ->toThrow(RuntimeException::class, 'Token for CUI 12345678 has been deactivated');
         });
 
         it('refreshes an expiring token before executing, and does not hold the lock across the operation', function () {
@@ -537,7 +537,7 @@ describe('TokenService', function () {
             // Any refresh attempt would explode here: ANAF rotates refresh tokens, so a
             // second refresh would invalidate the good one.
             app()->bind(AnafAuthenticatorInterface::class, function () {
-                throw new \LogicException('must not refresh an already-refreshed token');
+                throw new LogicException('must not refresh an already-refreshed token');
             });
 
             $mockClient = Mockery::mock(EFacturaClient::class);

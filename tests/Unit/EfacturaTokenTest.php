@@ -4,6 +4,7 @@ use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFacturaSdk\Data\Auth\OAuthTokensData;
 use Carbon\Carbon as BaseCarbon;
 use Carbon\CarbonImmutable;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\DateFactory;
 use Illuminate\Support\Facades\Date;
@@ -163,12 +164,12 @@ describe('EfacturaToken Model', function () {
     describe('relationships', function () {
         it('has uploads relationship', function () {
             expect($this->token->uploads())
-                ->toBeInstanceOf(\Illuminate\Database\Eloquent\Relations\HasMany::class);
+                ->toBeInstanceOf(HasMany::class);
         });
 
         it('has messages relationship', function () {
             expect($this->token->messages())
-                ->toBeInstanceOf(\Illuminate\Database\Eloquent\Relations\HasMany::class);
+                ->toBeInstanceOf(HasMany::class);
         });
     });
 });

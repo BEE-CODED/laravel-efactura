@@ -3,6 +3,7 @@
 use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
+use Illuminate\Database\Eloquent\Relations\MorphTo;
 use Illuminate\Support\Carbon;
 
 beforeEach(function () {
@@ -177,7 +178,7 @@ describe('EfacturaUpload Model', function () {
             $freshUpload = new EfacturaUpload;
             $relation = $freshUpload->uploadable();
 
-            expect($relation)->toBeInstanceOf(\Illuminate\Database\Eloquent\Relations\MorphTo::class);
+            expect($relation)->toBeInstanceOf(MorphTo::class);
             expect($relation->getMorphType())->toBe('uploadable_type');
             expect($relation->getForeignKeyName())->toBe('uploadable_id');
         });

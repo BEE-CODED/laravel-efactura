@@ -29,6 +29,7 @@ use BeeCoded\EFacturaSdk\Exceptions\ValidationException;
 use BeeCoded\EFacturaSdk\Exceptions\XmlParsingException;
 use BeeCoded\EFacturaSdk\Facades\UblBuilder;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
@@ -829,9 +830,9 @@ class UploadService
     /**
      * Every upload parked awaiting human reconciliation against ANAF.
      *
-     * @return \Illuminate\Database\Eloquent\Collection<int, EfacturaUpload>
+     * @return Collection<int, EfacturaUpload>
      */
-    public function awaitingReconciliation(): \Illuminate\Database\Eloquent\Collection
+    public function awaitingReconciliation(): Collection
     {
         return EfacturaUpload::where('status', UploadStatus::Failed)
             ->where('failure_reason', FailureReason::Indeterminate)
@@ -903,7 +904,7 @@ class UploadService
      * as indeterminate, so a concurrent sweep or a stale operator decision cannot
      * overwrite a real outcome.
      */
-    private function indeterminateQuery(EfacturaUpload $upload): \Illuminate\Database\Eloquent\Builder
+    private function indeterminateQuery(EfacturaUpload $upload): Builder
     {
         return EfacturaUpload::where('id', $upload->id)
             ->where('status', UploadStatus::Failed)

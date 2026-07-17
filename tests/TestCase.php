@@ -6,6 +6,7 @@ use BeeCoded\EFactura\EfacturaServiceProvider;
 use BeeCoded\EFactura\Facades\EFactura;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Orchestra\Testbench\TestCase as Orchestra;
+use Spatie\LaravelData\LaravelDataServiceProvider;
 
 abstract class TestCase extends Orchestra
 {
@@ -25,7 +26,7 @@ abstract class TestCase extends Orchestra
             // toArray() read that package's config. It is auto-discovered in a real
             // app (the SDK requires spatie/laravel-data), so registering it here
             // mirrors production - without it the config is null and toArray() throws.
-            \Spatie\LaravelData\LaravelDataServiceProvider::class,
+            LaravelDataServiceProvider::class,
             // The SDK provider binds AnafDetailsClientInterface; auto-discovered in
             // a real app. Registered here so the wrapper's decorating extend() has a
             // concrete to wrap (mirrors production wiring).

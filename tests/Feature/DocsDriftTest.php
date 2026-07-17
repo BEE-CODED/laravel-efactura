@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use BeeCoded\EFactura\Tests\Support\DocumentedSymbols;
+use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Support\Arr;
 
 /**
@@ -155,7 +156,7 @@ it('keeps symbols the migration guide says were removed actually removed', funct
 );
 
 it('shows only artisan commands and options that exist', function () {
-    $commands = app(Illuminate\Contracts\Console\Kernel::class)->all();
+    $commands = app(Kernel::class)->all();
     $problems = [];
 
     foreach (DocumentedSymbols::artisanInvocations() as $label => $calls) {

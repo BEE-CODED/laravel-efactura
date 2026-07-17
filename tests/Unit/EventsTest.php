@@ -10,6 +10,8 @@ use BeeCoded\EFactura\Events\TokenStored;
 use BeeCoded\EFactura\Models\EfacturaMessage;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
+use Illuminate\Foundation\Events\Dispatchable;
+use Illuminate\Queue\SerializesModels;
 
 beforeEach(function () {
     $this->token = EfacturaToken::create([
@@ -44,12 +46,12 @@ describe('TokenStored Event', function () {
 
     it('uses Dispatchable trait', function () {
         expect(class_uses(TokenStored::class))
-            ->toContain(\Illuminate\Foundation\Events\Dispatchable::class);
+            ->toContain(Dispatchable::class);
     });
 
     it('uses SerializesModels trait', function () {
         expect(class_uses(TokenStored::class))
-            ->toContain(\Illuminate\Queue\SerializesModels::class);
+            ->toContain(SerializesModels::class);
     });
 });
 
@@ -62,7 +64,7 @@ describe('TokenRefreshed Event', function () {
 
     it('uses Dispatchable trait', function () {
         expect(class_uses(TokenRefreshed::class))
-            ->toContain(\Illuminate\Foundation\Events\Dispatchable::class);
+            ->toContain(Dispatchable::class);
     });
 });
 
@@ -75,7 +77,7 @@ describe('InvoiceUploaded Event', function () {
 
     it('uses Dispatchable trait', function () {
         expect(class_uses(InvoiceUploaded::class))
-            ->toContain(\Illuminate\Foundation\Events\Dispatchable::class);
+            ->toContain(Dispatchable::class);
     });
 });
 
@@ -88,7 +90,7 @@ describe('InvoiceProcessed Event', function () {
 
     it('uses Dispatchable trait', function () {
         expect(class_uses(InvoiceProcessed::class))
-            ->toContain(\Illuminate\Foundation\Events\Dispatchable::class);
+            ->toContain(Dispatchable::class);
     });
 });
 
@@ -110,7 +112,7 @@ describe('InvoiceFailed Event', function () {
 
     it('uses Dispatchable trait', function () {
         expect(class_uses(InvoiceFailed::class))
-            ->toContain(\Illuminate\Foundation\Events\Dispatchable::class);
+            ->toContain(Dispatchable::class);
     });
 });
 
@@ -123,6 +125,6 @@ describe('InvoiceReceived Event', function () {
 
     it('uses Dispatchable trait', function () {
         expect(class_uses(InvoiceReceived::class))
-            ->toContain(\Illuminate\Foundation\Events\Dispatchable::class);
+            ->toContain(Dispatchable::class);
     });
 });

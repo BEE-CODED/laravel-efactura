@@ -207,7 +207,7 @@ describe('DownloadService', function () {
 
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andThrow(new \Exception('API Error'));
+                ->andThrow(new Exception('API Error'));
 
             // Should not throw
             $this->downloadService->checkStatus($upload);
@@ -305,7 +305,7 @@ describe('DownloadService', function () {
 
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andThrow(new \Exception('Download failed'));
+                ->andThrow(new Exception('Download failed'));
 
             // Should not throw
             $this->downloadService->downloadResponse($upload);
@@ -397,7 +397,7 @@ describe('DownloadService', function () {
 
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andThrow(new \Exception('Download failed'));
+                ->andThrow(new Exception('Download failed'));
 
             // Should not throw
             $this->downloadService->downloadMessage($message);

@@ -4,6 +4,7 @@ use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Tests\Fixtures\TestInvoice;
+use Illuminate\Database\Eloquent\Relations\MorphOne;
 use Illuminate\Support\Facades\Schema;
 
 beforeEach(function () {
@@ -36,7 +37,7 @@ describe('HasEfacturaUpload Trait', function () {
     describe('efacturaUpload relationship', function () {
         it('returns a MorphOne relationship', function () {
             expect($this->invoice->efacturaUpload())
-                ->toBeInstanceOf(\Illuminate\Database\Eloquent\Relations\MorphOne::class);
+                ->toBeInstanceOf(MorphOne::class);
         });
 
         it('returns the associated upload', function () {

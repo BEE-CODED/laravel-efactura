@@ -4,6 +4,10 @@ declare(strict_types=1);
 
 namespace BeeCoded\EFactura\Tests\Support;
 
+use BeeCoded\EFacturaSdk\EFacturaServiceProvider;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\Facade;
 use RecursiveDirectoryIterator;
 use RecursiveIteratorIterator;
 use ReflectionClass;
@@ -174,7 +178,7 @@ final class DocumentedSymbols
      */
     public static function sdkSourceDir(): string
     {
-        $provider = new ReflectionClass(\BeeCoded\EFacturaSdk\EFacturaServiceProvider::class);
+        $provider = new ReflectionClass(EFacturaServiceProvider::class);
 
         return dirname((string) $provider->getFileName());
     }
@@ -427,11 +431,11 @@ final class DocumentedSymbols
      */
     private static function forwardsToQueryBuilder(string $fqcn, string $method): bool
     {
-        if (!is_subclass_of($fqcn, \Illuminate\Database\Eloquent\Model::class)) {
+        if (!is_subclass_of($fqcn, Model::class)) {
             return false;
         }
 
-        return method_exists(\Illuminate\Database\Eloquent\Builder::class, $method)
+        return method_exists(Builder::class, $method)
             || method_exists(\Illuminate\Database\Query\Builder::class, $method);
     }
 
@@ -440,7 +444,7 @@ final class DocumentedSymbols
      */
     public static function facadeTarget(string $fqcn): ?string
     {
-        if (!is_subclass_of($fqcn, \Illuminate\Support\Facades\Facade::class)) {
+        if (!is_subclass_of($fqcn, Facade::class)) {
             return null;
         }
 

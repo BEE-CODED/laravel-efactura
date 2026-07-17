@@ -26,7 +26,7 @@ use Illuminate\Support\Facades\Facade;
  * @method static \BeeCoded\EFactura\Services\DownloadService downloadService()
  * @method static \BeeCoded\EFactura\Services\MessageSyncService messageSyncService()
  *
- * @see \BeeCoded\EFactura\EfacturaManager
+ * @see EfacturaManager
  */
 class EFactura extends Facade
 {

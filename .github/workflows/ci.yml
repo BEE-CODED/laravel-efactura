@@ -15,8 +15,8 @@ concurrency:
 
 jobs:
   tests:
-    # composer.json allows Laravel 11 and 12 but only one is ever installed locally,
-    # so the matrix is the only thing that actually checks the range we advertise.
+    # composer.json allows Laravel 11, 12 and 13 but only one is ever installed
+    # locally, so the matrix is the only thing that checks the range we advertise.
     name: PHP ${{ matrix.php }} / Laravel ${{ matrix.laravel }} / ${{ matrix.dependency-version }}
     runs-on: ubuntu-latest
 
@@ -24,13 +24,20 @@ jobs:
       fail-fast: false
       matrix:
         php: ['8.4']
-        laravel: ['11.*', '12.*']
+        laravel: ['11.*', '12.*', '13.*']
         dependency-version: [prefer-lowest, prefer-stable]
         include:
           - laravel: '11.*'
             testbench: '9.*'
           - laravel: '12.*'
             testbench: '10.*'
+          - laravel: '13.*'
+            testbench: '11.*'
+        exclude:
+          # Laravel 13 is tested prefer-stable only: prefer-lowest would pull test
+          # deps (pest 3.0 / phpunit 11) that predate Laravel 13 and cannot resolve.
+          - laravel: '13.*'
+            dependency-version: prefer-lowest
 
     steps:
       - uses: actions/checkout@v4
@@ -44,6 +51,10 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # Composer 2.8+ refuses to install security-advisory-flagged releases, and
+          # every laravel/framework 11.x that testbench 9.x needs currently carries one.
+          # We still support Laravel 11, so unblock it for CI only (never shipped).
+          composer config --global policy.advisories.block false
           composer require "illuminate/support:${{ matrix.laravel }}" "orchestra/testbench:${{ matrix.testbench }}" --no-interaction --no-update
           composer update --${{ matrix.dependency-version }} --prefer-dist --no-interaction
 

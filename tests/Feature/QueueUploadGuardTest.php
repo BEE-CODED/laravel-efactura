@@ -16,6 +16,7 @@ use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFactura\Tests\Fixtures\TestInvoice;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
@@ -80,8 +81,23 @@ function raceWinnerTest(object $test, Closure $assertions): void
     config(['database.connections.efactura_race_winner' => config("database.connections.{$default}")]);
     $winnerConnection = DB::connection('efactura_race_winner');
 
+    // The token from beforeEach lives in RefreshDatabase's uncommitted transaction on
+    // the DEFAULT connection, so this second connection cannot see it — and the winning
+    // row's efactura_token_id FK would fail against it. Commit a token on the winner
+    // connection itself and point the winning row at that. (uploadable is polymorphic,
+    // so uploadable_id carries no FK and needs no such treatment.)
+    $winnerTokenId = $winnerConnection->table('efactura_tokens')->insertGetId([
+        'cui' => '99999999',
+        'access_token' => 'winner',
+        'refresh_token' => 'winner',
+        'expires_at' => now()->addHour(),
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
     $raced = false;
-    EfacturaUpload::creating(function () use (&$raced, $test, $winnerConnection) {
+    EfacturaUpload::creating(function () use (&$raced, $test, $winnerConnection, $winnerTokenId) {
         if ($raced) {
             return;
         }
@@ -90,7 +106,7 @@ function raceWinnerTest(object $test, Closure $assertions): void
         // Commits immediately on the second connection: durable, outside our
         // savepoint — exactly a concurrent request that beat us to the insert.
         $winnerConnection->table('efactura_uploads')->insert([
-            'efactura_token_id' => $test->token->id,
+            'efactura_token_id' => $winnerTokenId,
             'uploadable_type' => TestInvoice::class,
             'uploadable_id' => $test->invoice->id,
             'status' => UploadStatus::Pending->value,
@@ -107,12 +123,13 @@ function raceWinnerTest(object $test, Closure $assertions): void
         $assertions();
     } finally {
         EfacturaUpload::flushEventListeners();
-        // The winner was committed on its own connection, so RefreshDatabase's
-        // rollback does not reach it. Remove it so tests stay isolated.
+        // Both rows were committed on the winner connection, so RefreshDatabase's
+        // rollback does not reach them. Remove them so tests stay isolated.
         $winnerConnection->table('efactura_uploads')
             ->where('uploadable_type', TestInvoice::class)
             ->where('uploadable_id', $test->invoice->id)
             ->delete();
+        $winnerConnection->table('efactura_tokens')->where('id', $winnerTokenId)->delete();
     }
 }
 
@@ -199,7 +216,7 @@ describe('the create/constraint race', function () {
             'uploadable_id' => $this->invoice->id,
             'status' => UploadStatus::Pending,
             'standard' => 'UBL',
-        ]))->toThrow(Illuminate\Database\QueryException::class);
+        ]))->toThrow(QueryException::class);
 
         expect(EfacturaUpload::count())->toBe(1);
     });

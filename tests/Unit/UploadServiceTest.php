@@ -91,7 +91,7 @@ describe('UploadService', function () {
                 ->andReturn(null);
 
             expect(fn () => $this->uploadService->queueUpload($this->invoice))
-                ->toThrow(\RuntimeException::class, 'No active token found for CUI: 12345678');
+                ->toThrow(RuntimeException::class, 'No active token found for CUI: 12345678');
         });
     });
 
@@ -116,7 +116,7 @@ describe('UploadService', function () {
                 ->andReturn(null);
 
             expect(fn () => $this->uploadService->queueB2CUpload($this->invoice))
-                ->toThrow(\RuntimeException::class, 'No active token found for CUI: 12345678');
+                ->toThrow(RuntimeException::class, 'No active token found for CUI: 12345678');
         });
     });
 
@@ -272,12 +272,12 @@ describe('UploadService', function () {
                 {
                     public function uploadDocument($xml, $options)
                     {
-                        throw new \Exception('API Error');
+                        throw new Exception('API Error');
                     }
 
                     public function uploadB2CDocument($xml, $options)
                     {
-                        throw new \Exception('API Error');
+                        throw new Exception('API Error');
                     }
                 }));
 
@@ -315,7 +315,7 @@ describe('UploadService', function () {
             // Throws WITHOUT invoking the operation: the client never got the document.
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andThrow(new \RuntimeException('Token for CUI 12345678 has been deactivated'));
+                ->andThrow(new RuntimeException('Token for CUI 12345678 has been deactivated'));
 
             $this->uploadService->processUpload($this->upload);
 

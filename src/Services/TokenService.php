@@ -14,10 +14,13 @@ namespace BeeCoded\EFactura\Services;
 use BeeCoded\EFactura\Events\TokenRefreshed;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFacturaSdk\Contracts\AnafAuthenticatorInterface;
+use BeeCoded\EFacturaSdk\Data\Auth\AuthUrlSettingsData;
 use BeeCoded\EFacturaSdk\Data\Auth\OAuthTokensData;
 use BeeCoded\EFacturaSdk\Facades\EFacturaSdkAuth;
 use BeeCoded\EFacturaSdk\Services\ApiClients\EFacturaClient;
 use BeeCoded\EFacturaSdk\Support\Validators\VatNumberValidator;
+use Illuminate\Contracts\Cache\LockTimeoutException;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Facades\Cache;
 
 class TokenService
@@ -103,7 +106,7 @@ class TokenService
         );
 
         return EFacturaSdkAuth::getAuthorizationUrl(
-            new \BeeCoded\EFacturaSdk\Data\Auth\AuthUrlSettingsData(
+            new AuthUrlSettingsData(
                 state: [
                     'cui' => $cui,
                     'token' => $stateToken,
@@ -282,7 +285,7 @@ class TokenService
      * @param  callable(EFacturaClient): T  $operation  The API operation to execute
      * @return T The result of the operation
      *
-     * @throws \Illuminate\Contracts\Cache\LockTimeoutException If the lock cannot be acquired within 30 seconds
+     * @throws LockTimeoutException If the lock cannot be acquired within 30 seconds
      * @throws \RuntimeException If the token has been deactivated
      */
     public function executeWithClient(EfacturaToken $token, callable $operation): mixed
@@ -476,9 +479,9 @@ class TokenService
     /**
      * Get all active tokens.
      *
-     * @return \Illuminate\Database\Eloquent\Collection<int, EfacturaToken>
+     * @return Collection<int, EfacturaToken>
      */
-    public function getActiveTokens(): \Illuminate\Database\Eloquent\Collection
+    public function getActiveTokens(): Collection
     {
         return EfacturaToken::active()->get();
     }

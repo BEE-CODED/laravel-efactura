@@ -2,6 +2,7 @@
 
 use BeeCoded\EFactura\Http\Controllers\OAuthCallbackController;
 use BeeCoded\EFactura\Services\TokenService;
+use Illuminate\Contracts\Container\BindingResolutionException;
 use Illuminate\Http\Request;
 
 beforeEach(function () {
@@ -123,7 +124,7 @@ describe('OAuthCallbackController', function () {
             // but we verify the flow reaches the exchange step
             try {
                 $this->controller->callback($request);
-            } catch (\Illuminate\Contracts\Container\BindingResolutionException) {
+            } catch (BindingResolutionException) {
                 // Expected - SDK not configured
             }
 

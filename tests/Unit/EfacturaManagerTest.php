@@ -9,6 +9,7 @@ use BeeCoded\EFactura\Services\MessageSyncService;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFactura\Tests\Fixtures\TestInvoice;
+use BeeCoded\EFacturaSdk\Services\ApiClients\EFacturaClient;
 use Illuminate\Support\Facades\Schema;
 
 beforeEach(function () {
@@ -68,7 +69,7 @@ describe('EfacturaManager', function () {
         });
 
         it('delegates client creation to TokenService', function () {
-            $mockClient = Mockery::mock(\BeeCoded\EFacturaSdk\Services\ApiClients\EFacturaClient::class);
+            $mockClient = Mockery::mock(EFacturaClient::class);
 
             $this->tokenService->shouldReceive('createClientForCui')
                 ->with('12345678')
