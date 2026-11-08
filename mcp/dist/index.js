@@ -22099,8 +22099,10 @@ new PartyData('ACME SRL', '12345678', $address, 'J40/1234/2020');
 \`\`\`
 
 A non-VAT-payer previously filed with \`isVatPayer = false\` now files as \`true\`. That inverts the
-document: \`InvoiceBuilder::getTaxCategory()\` puts every line under VAT category **"O" (Not subject
-to VAT)** when the flag is false, and omits the party's VAT identifier (BT-31 seller / BT-48 buyer).
+document: when the supplier is not a VAT payer, the SDK resolves every line to VAT category **"O" (Not
+subject to VAT)** and rejects an explicit line category incompatible with that (reverse-charge "AE"
+included). A party flagged as a non-payer also has its VAT identifier omitted (BT-31 seller / BT-48
+buyer).
 The resulting document is internally consistent, so **ANAF accepts it** \u2014 there is no error to
 notice. (From a file *with* \`strict_types=1\` you get a \`TypeError\` instead, which is the lucky case.)
 
@@ -22133,7 +22135,8 @@ column, not as an unhandled exception:
   \`A EUR invoice must declare its total VAT in RON: set taxAmountRon to the converted amount (BT-111). ANAF cannot verify the conversion, so an incorrect value would be filed as a true statement of VAT owed (BR-RO-030, BR-53).\`
 - RON invoice, \`taxAmountRon\` set \u2192 \`ValidationException\`:
   \`taxAmountRon must not be set on a RON invoice: the VAT total is already stated in RON, and a second RON tax total is not permitted (BR-CO-15).\`
-- Sign disagrees with the invoice VAT total \u2192 \`ValidationException\`:
+- \`taxAmountRon\` and the invoice VAT total have opposite nonzero signs \u2192 \`ValidationException\`
+  (either amount may round to zero; SDK 3.0/3.1 also rejected a zero against a nonzero total):
   \`taxAmountRon must have the same sign as the invoice VAT total: a credited amount cannot be declared as collected VAT, or vice versa (BT-111).\`
 
 **Fix \u2014 set it only when the currency is not RON:**
@@ -22628,12 +22631,13 @@ public function __construct(public EfacturaUpload $upload)
 public function __construct(public EfacturaUpload $upload, public array $errors = [])
 \`\`\`
 
-**Trigger:** Fired when an upload reaches a **terminal** \`Failed\` state. The \`errors\` array contains error details from ANAF or the upload process. It fires from four places:
+**Trigger:** Fired when an upload reaches a **terminal** \`Failed\` state. The \`errors\` array contains error details from ANAF or the upload process. It fires from these places:
 
 | Source | Situation | \`failure_reason\` |
 |--------|-----------|------------------|
 | \`UploadService::failTerminally()\` | ANAF rejected the document, XML/model invalid, no token, 4xx, or an ambiguous 5xx/transport loss | \`validation\`, \`configuration\`, \`indeterminate\` |
-| \`DownloadService::checkStatus()\` (i.e. \`CheckUploadStatuses\`) | ANAF processed the document and rejected it on its merits | \`validation\` |
+| \`DownloadService::checkStatus()\` (i.e. \`CheckUploadStatuses\`) | ANAF processed the document and rejected it on its merits; or (SDK 3.2+) ANAF gave a final rejection without a response archive ("XML cu erori nepreluat de sistem") \u2014 no download, never resubmitted automatically | \`validation\` |
+| \`DownloadService::checkStatus()\` (via \`parkUnrecognisableStatus()\`) | ANAF returned no recognisable status for the upload index (an unknown index, or on SDK 3.0/3.1 the "XML cu erori nepreluat de sistem" status, which those versions cannot read) \u2014 delivery UNKNOWN | \`indeterminate\` |
 | \`ProcessSingleUpload::failed()\` / \`SweepStaleUploads\` (via \`parkStrandedUploadAsIndeterminate()\`) | The worker died around the POST \u2014 delivery UNKNOWN | \`indeterminate\` |
 | \`ProcessSingleUpload::failed()\` (via \`abandonUnsentUpload()\`) | The \`retryUntil\` deadline expired while the row was still waiting to be sent \u2014 it never reached ANAF | \`abandoned\` |
 | \`ProcessSingleUpload\` transient cap exhausted (via \`abandonFailure()\`) | A \`transient\` failure did not clear within \`jobs.max_transient_attempts\` | \`abandoned\` |

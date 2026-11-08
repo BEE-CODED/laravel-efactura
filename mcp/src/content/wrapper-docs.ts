@@ -1116,8 +1116,10 @@ new PartyData('ACME SRL', '12345678', $address, 'J40/1234/2020');
 \`\`\`
 
 A non-VAT-payer previously filed with \`isVatPayer = false\` now files as \`true\`. That inverts the
-document: \`InvoiceBuilder::getTaxCategory()\` puts every line under VAT category **"O" (Not subject
-to VAT)** when the flag is false, and omits the party's VAT identifier (BT-31 seller / BT-48 buyer).
+document: when the supplier is not a VAT payer, the SDK resolves every line to VAT category **"O" (Not
+subject to VAT)** and rejects an explicit line category incompatible with that (reverse-charge "AE"
+included). A party flagged as a non-payer also has its VAT identifier omitted (BT-31 seller / BT-48
+buyer).
 The resulting document is internally consistent, so **ANAF accepts it** — there is no error to
 notice. (From a file *with* \`strict_types=1\` you get a \`TypeError\` instead, which is the lucky case.)
 
@@ -1150,7 +1152,8 @@ column, not as an unhandled exception:
   \`A EUR invoice must declare its total VAT in RON: set taxAmountRon to the converted amount (BT-111). ANAF cannot verify the conversion, so an incorrect value would be filed as a true statement of VAT owed (BR-RO-030, BR-53).\`
 - RON invoice, \`taxAmountRon\` set → \`ValidationException\`:
   \`taxAmountRon must not be set on a RON invoice: the VAT total is already stated in RON, and a second RON tax total is not permitted (BR-CO-15).\`
-- Sign disagrees with the invoice VAT total → \`ValidationException\`:
+- \`taxAmountRon\` and the invoice VAT total have opposite nonzero signs → \`ValidationException\`
+  (either amount may round to zero; SDK 3.0/3.1 also rejected a zero against a nonzero total):
   \`taxAmountRon must have the same sign as the invoice VAT total: a credited amount cannot be declared as collected VAT, or vice versa (BT-111).\`
 
 **Fix — set it only when the currency is not RON:**

@@ -11,5 +11,12 @@ parameters:
             identifier: trait.unused
         # Interface method from Model
         - '#Call to an undefined method BeeCoded\\EFactura\\Contracts\\EFacturaUploadableInterface::getKey#'
+        # Version-tolerant NotProcessed check in checkStatus(): always false against SDK 3.0/3.1
+        # (no such enum case), live on SDK >=3.2 — so it must not be reported as unmatched there.
+        -
+            identifier: identical.alwaysFalse
+            path: src/Services/DownloadService.php
+            message: "#XML cu erori#"
+            reportUnmatched: false
     excludePaths:
         - vendor

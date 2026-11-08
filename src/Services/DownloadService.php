@@ -78,6 +78,18 @@ class DownloadService
                 return;
             }
 
+            // SDK >=3.2 NotProcessed: ANAF did not take the file in — final, no download id.
+            // On SDK 3.0/3.1 the SDK drops the raw value (stare = null), so the row keeps
+            // the indeterminate park below.
+            if ($response->stare?->value === 'XML cu erori nepreluat de sistem') {
+                $errors = $response->errors ?: [__('efactura::messages.not_processed_at_anaf')];
+                // Validation is not retryable: the document is never re-submitted automatically.
+                $this->uploadService->markUploadAsFailed($upload, $errors, null, FailureReason::Validation);
+                event(new InvoiceFailed($upload, $errors));
+
+                return;
+            }
+
             if ($response->isInProgress()) {
                 // The ONLY legitimate no-op: ANAF said, in so many words, "not yet".
                 return;

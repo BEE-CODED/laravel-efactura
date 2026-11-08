@@ -103,12 +103,13 @@ public function __construct(public EfacturaUpload $upload)
 public function __construct(public EfacturaUpload $upload, public array $errors = [])
 \`\`\`
 
-**Trigger:** Fired when an upload reaches a **terminal** \`Failed\` state. The \`errors\` array contains error details from ANAF or the upload process. It fires from four places:
+**Trigger:** Fired when an upload reaches a **terminal** \`Failed\` state. The \`errors\` array contains error details from ANAF or the upload process. It fires from these places:
 
 | Source | Situation | \`failure_reason\` |
 |--------|-----------|------------------|
 | \`UploadService::failTerminally()\` | ANAF rejected the document, XML/model invalid, no token, 4xx, or an ambiguous 5xx/transport loss | \`validation\`, \`configuration\`, \`indeterminate\` |
-| \`DownloadService::checkStatus()\` (i.e. \`CheckUploadStatuses\`) | ANAF processed the document and rejected it on its merits | \`validation\` |
+| \`DownloadService::checkStatus()\` (i.e. \`CheckUploadStatuses\`) | ANAF processed the document and rejected it on its merits; or (SDK 3.2+) ANAF gave a final rejection without a response archive ("XML cu erori nepreluat de sistem") — no download, never resubmitted automatically | \`validation\` |
+| \`DownloadService::checkStatus()\` (via \`parkUnrecognisableStatus()\`) | ANAF returned no recognisable status for the upload index (an unknown index, or on SDK 3.0/3.1 the "XML cu erori nepreluat de sistem" status, which those versions cannot read) — delivery UNKNOWN | \`indeterminate\` |
 | \`ProcessSingleUpload::failed()\` / \`SweepStaleUploads\` (via \`parkStrandedUploadAsIndeterminate()\`) | The worker died around the POST — delivery UNKNOWN | \`indeterminate\` |
 | \`ProcessSingleUpload::failed()\` (via \`abandonUnsentUpload()\`) | The \`retryUntil\` deadline expired while the row was still waiting to be sent — it never reached ANAF | \`abandoned\` |
 | \`ProcessSingleUpload\` transient cap exhausted (via \`abandonFailure()\`) | A \`transient\` failure did not clear within \`jobs.max_transient_attempts\` | \`abandoned\` |
