@@ -36,6 +36,11 @@ use Illuminate\Support\Facades\Storage;
 
 class UploadService
 {
+    /**
+     * An ANAF upload index: digits only, as ANAF assigns them and the SDK polls them.
+     */
+    private const UPLOAD_INDEX_PATTERN = '/^[0-9]{1,64}$/D';
+
     public function __construct(
         protected TokenService $tokenService,
     ) {}
@@ -406,7 +411,7 @@ class UploadService
             ]) > 0;
 
         if ($failed) {
-            event(new InvoiceFailed($upload->refresh(), $errors));
+            rescue(fn () => event(new InvoiceFailed($upload->refresh(), $errors)));
         }
     }
 
@@ -423,6 +428,8 @@ class UploadService
         // building the client — provably precedes the HTTP request, so its failures CANNOT
         // be indeterminate. See the catch(\Throwable) below.
         $transmissionStarted = false;
+        // Set before the try so the catch-all can log an index ANAF had already assigned.
+        $index = null;
 
         try {
             $response = $this->tokenService->executeWithClient(
@@ -443,9 +450,9 @@ class UploadService
             // ANAF assigns an upload index only to a document it took in, so a usable index
             // means it is in the pipeline whatever ExecutionStatus says. Polling is read-only
             // and decides the outcome (including a rejection).
-            if ($index !== null && preg_match('/^[0-9]{1,64}$/D', $index) === 1) {
+            if ($index !== null && preg_match(self::UPLOAD_INDEX_PATTERN, $index) === 1) {
                 $this->markUploadAsProcessing($upload, $index);
-                event(new InvoiceUploaded($upload));
+                rescue(fn () => event(new InvoiceUploaded($upload)));
 
                 return;
             }
@@ -528,6 +535,7 @@ class UploadService
             // written off.
             Log::error('EFactura: Upload failed with an indeterminate error', [
                 'upload_id' => $upload->id,
+                'upload_index' => $index,
                 'exception' => $e::class,
                 'error' => $e->getMessage(),
             ]);
@@ -624,7 +632,7 @@ class UploadService
                 'processed_at' => null,
             ]);
 
-        event(new InvoiceRateLimited($upload->refresh(), [$message], $retryAfterSeconds));
+        rescue(fn () => event(new InvoiceRateLimited($upload->refresh(), [$message], $retryAfterSeconds)));
     }
 
     /**
@@ -639,7 +647,7 @@ class UploadService
     {
         $this->markUploadAsFailed($upload, $errors, reason: $reason);
 
-        event(new InvoiceFailed($upload, $errors));
+        rescue(fn () => event(new InvoiceFailed($upload, $errors)));
     }
 
     /**
@@ -661,18 +669,24 @@ class UploadService
             'status' => UploadStatus::Processing,
             'upload_index' => $uploadIndex,
             'uploaded_at' => now(),
+            'status_failures' => 0,
         ]);
     }
 
     /**
      * Mark upload as completed.
+     *
+     * ANAF can answer `ok` without a download id. The invoice is still filed, so it is
+     * completed (demoting it would be the worse lie), with a note that no response can
+     * be downloaded.
      */
-    public function markUploadAsCompleted(EfacturaUpload $upload, string $downloadId): void
+    public function markUploadAsCompleted(EfacturaUpload $upload, ?string $downloadId): void
     {
         $upload->update([
             'status' => UploadStatus::Completed,
             'download_id' => $downloadId,
             'processed_at' => now(),
+            ...($downloadId === null ? ['errors' => [__('efactura::messages.completed_without_download_id')]] : []),
         ]);
     }
 
@@ -757,7 +771,7 @@ class UploadService
             return false;
         }
 
-        event(new InvoiceFailed($upload->refresh(), $errors));
+        rescue(fn () => event(new InvoiceFailed($upload->refresh(), $errors)));
 
         return true;
     }
@@ -807,7 +821,7 @@ class UploadService
             'reason' => $reason,
         ]);
 
-        event(new InvoiceFailed($upload->refresh(), [$reason]));
+        rescue(fn () => event(new InvoiceFailed($upload->refresh(), [$reason])));
 
         return true;
     }
@@ -854,7 +868,7 @@ class UploadService
             'reason' => $reason,
         ]);
 
-        event(new InvoiceFailed($upload->refresh(), [$reason]));
+        rescue(fn () => event(new InvoiceFailed($upload->refresh(), [$reason])));
 
         return true;
     }
@@ -882,9 +896,17 @@ class UploadService
      * never be inferred automatically.
      *
      * @return bool Whether the upload was actually awaiting reconciliation.
+     *
+     * @throws \InvalidArgumentException When the index is not an ANAF upload index (digits only).
      */
     public function resolveIndeterminateAsFiled(EfacturaUpload $upload, string $uploadIndex): bool
     {
+        $uploadIndex = trim($uploadIndex);
+
+        if (preg_match(self::UPLOAD_INDEX_PATTERN, $uploadIndex) !== 1) {
+            throw new \InvalidArgumentException('The ANAF upload index must be 1 to 64 digits.');
+        }
+
         $resolved = $this->indeterminateQuery($upload)->update([
             'status' => UploadStatus::Processing,
             'failure_reason' => null,
@@ -892,6 +914,7 @@ class UploadService
             'upload_index' => $uploadIndex,
             'uploaded_at' => now(),
             'processed_at' => null,
+            'status_failures' => 0,
         ]) > 0;
 
         if ($resolved) {
@@ -911,10 +934,24 @@ class UploadService
      * because a human verified the absence — which is exactly why nothing automatic
      * is allowed to make this call.
      *
+     * Refused for an upload that has an upload index: ANAF issues one only for a
+     * document it took in, so re-sending it would double-file the invoice.
+     *
      * @return bool Whether the upload was actually awaiting reconciliation.
+     *
+     * @throws \InvalidArgumentException When the parked upload has an ANAF upload index.
      */
     public function resolveIndeterminateAsNotFiled(EfacturaUpload $upload): bool
     {
+        $indexed = $this->indeterminateQuery($upload)->whereNotNull('upload_index')->value('upload_index');
+
+        if ($indexed !== null) {
+            throw new \InvalidArgumentException(
+                "Upload {$upload->id} has ANAF upload index {$indexed}: ANAF issues an index only for a document "
+                    .'it took in, so it cannot be resolved as not filed.'
+            );
+        }
+
         $resolved = $this->indeterminateQuery($upload)->update([
             'status' => UploadStatus::Pending,
             'failure_reason' => null,

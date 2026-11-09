@@ -33,7 +33,7 @@ use Illuminate\Support\Arr;
 it('still extracts symbols from every documentation source', function () {
     $sources = DocumentedSymbols::sources();
 
-    expect($sources)->toHaveCount(6);
+    expect($sources)->toHaveCount(7);
 
     foreach ($sources as $label => $text) {
         expect(strlen($text))->toBeGreaterThan(500, "{$label} is empty or unreadable");
@@ -47,7 +47,9 @@ it('still extracts symbols from every documentation source', function () {
         ->and($total(DocumentedSymbols::configPaths()))->toBeGreaterThan(15)
         ->and($total(DocumentedSymbols::envVarReferences()))->toBeGreaterThan(15)
         ->and($total(DocumentedSymbols::staticMethodReferences()))->toBeGreaterThan(5)
-        ->and($total(DocumentedSymbols::artisanInvocations()))->toBeGreaterThan(10);
+        ->and($total(DocumentedSymbols::artisanInvocations()))->toBeGreaterThan(10)
+        ->and($total(DocumentedSymbols::documentedCadences()))->toBeGreaterThan(20)
+        ->and($total(DocumentedSymbols::classConstantReferences()))->toBeGreaterThan(3);
 });
 
 it('names only classes, interfaces, traits and enums that exist', function () {
@@ -143,6 +145,51 @@ it('names only Class::$property references that resolve', function () {
 
     expect($missing)->toBe([], 'Documentation references properties that do not exist: '.implode(', ', $missing));
 });
+
+it('names only Class::CONSTANT references that resolve', function () {
+    $missing = [];
+
+    foreach (DocumentedSymbols::classConstantReferences() as $label => $refs) {
+        foreach ($refs as $ref) {
+            if (!(new ReflectionClass($ref['class']))->hasConstant($ref['constant'])) {
+                $missing[] = "{$label}: {$ref['ref']}";
+            }
+        }
+    }
+
+    expect($missing)->toBe([], 'Documentation references constants that do not exist: '.implode(', ', $missing));
+});
+
+/**
+ * The package schedules nothing, so the recommended cadences exist only in the docs,
+ * and they used to disagree (CheckUploadStatuses every 5 minutes in one place, 10 in
+ * another). One table is the truth; every schedule call and cadence cell must match it.
+ */
+it('states one recommended cadence per scheduled job, the same everywhere', function () {
+    $wrong = [];
+
+    foreach (DocumentedSymbols::documentedCadences() as $label => $refs) {
+        foreach ($refs as $ref) {
+            if ($ref['cadence'] !== DocumentedSymbols::RECOMMENDED_CADENCES[$ref['job']]) {
+                $wrong[] = "{$label}: {$ref['ref']}";
+            }
+        }
+    }
+
+    expect($wrong)->toBe([], 'Documented cadences disagree with the recommended schedule: '.implode(', ', $wrong));
+});
+
+it('keeps a complete cadence table in the README and the MCP job reference', function (string $label) {
+    $tabled = collect(DocumentedSymbols::documentedCadences()[$label])
+        ->filter(fn (array $ref): bool => str_starts_with($ref['ref'], '|'))
+        ->pluck('job')
+        ->unique()
+        ->sort()
+        ->values()
+        ->all();
+
+    expect($tabled)->toBe(collect(DocumentedSymbols::RECOMMENDED_CADENCES)->keys()->sort()->values()->all());
+})->with(['README.md', 'mcp/src/content/job-reference.ts']);
 
 it('keeps symbols the migration guide says were removed actually removed', function () {
     foreach (DocumentedSymbols::documentedAsRemoved() as $removed) {

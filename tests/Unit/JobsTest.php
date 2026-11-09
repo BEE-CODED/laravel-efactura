@@ -1,6 +1,7 @@
 <?php
 
 use BeeCoded\EFactura\Enums\FailureReason;
+use BeeCoded\EFactura\Enums\StatusCheckOutcome;
 use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Events\InvoiceFailed;
 use BeeCoded\EFactura\Jobs\CheckSingleUploadStatus;
@@ -530,7 +531,8 @@ describe('CheckSingleUploadStatus Job', function () {
         $downloadService = Mockery::mock(DownloadService::class);
         $downloadService->shouldReceive('checkStatus')
             ->once()
-            ->with(Mockery::on(fn ($arg) => $arg->id === $upload->id));
+            ->with(Mockery::on(fn ($arg) => $arg->id === $upload->id))
+            ->andReturn(StatusCheckOutcome::Checked);
 
         $job = new CheckSingleUploadStatus($upload);
         $job->handle($downloadService);

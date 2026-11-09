@@ -18,6 +18,7 @@ use BeeCoded\EFacturaSdk\Exceptions\ApiException;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 
 /**
  * syncMessages() caught \Throwable, logged one line, and carried on. That is WHY the
@@ -91,6 +92,39 @@ describe('syncMessages', function () {
 
         expect($synced)->toBe(1);
         expect(EfacturaMessage::count())->toBe(1);
+    });
+
+    it('skips listed messages without a usable id instead of merging them into one row', function () {
+        // The SDK reads a missing, empty or non-scalar id as null. Upserting on it would
+        // key every such message on the same (null) message_id.
+        $message = fn (array $id) => [
+            'data_creare' => '202407171230',
+            'cif' => '12345678',
+            'id_solicitare' => '5001130255',
+            'detalii' => 'Factura cu id_incarcare=5001130255 emisa de cif_emitent=12345678 pentru cif_beneficiar=87654321',
+            'tip' => 'FACTURA PRIMITA',
+            ...$id,
+        ];
+
+        Http::fake([
+            MESSAGES_URL => Http::response(anafMessagesBody('12345678', [
+                $message([]),
+                $message(['id' => '  ']),
+                $message(['id' => ['3001130059']]),
+                $message(['id' => '3001130060']),
+            ])),
+        ]);
+
+        Log::spy();
+        Log::shouldReceive('channel')->andReturnSelf(); // the SDK client logs through a channel
+
+        $synced = $this->messageSyncService->syncMessages(makeSyncToken('12345678'));
+
+        expect($synced)->toBe(1);
+        expect(EfacturaMessage::pluck('message_id')->all())->toBe(['3001130060']);
+        Log::shouldHaveReceived('warning')
+            ->with('EFactura: ANAF listed a message without a usable id, skipping it', Mockery::type('array'))
+            ->times(3);
     });
 });
 

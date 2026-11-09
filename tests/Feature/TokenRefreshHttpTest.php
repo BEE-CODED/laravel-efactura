@@ -14,8 +14,13 @@ use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFacturaSdk\Data\Invoice\ListMessagesParamsData;
 use BeeCoded\EFacturaSdk\Data\Response\ListMessagesResponseData;
+use BeeCoded\EFacturaSdk\Exceptions\ApiException;
+use Illuminate\Log\Events\MessageLogged;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 
 /**
  * End-to-end token-refresh tests that exercise the REAL SDK client over a faked
@@ -334,7 +339,7 @@ describe('persisting a refresh that raced another worker', function () {
 
         // 121s of life: OUTSIDE the wrapper's 120s buffer, so executeWithClient
         // takes its lock-free path and leaves the refresh to the SDK. This is the
-        // only way to reach persistTokenRefreshWithLock — the locked path refreshes
+        // only way to reach the post-call save — the locked path refreshes
         // BEFORE the operation, so the SDK never has to.
         $token = EfacturaToken::create([
             'cui' => '12345678',
@@ -415,5 +420,202 @@ describe('token freshness at second precision', function () {
 
         $token->refresh();
         expect($token->refresh_token)->toBe('THEIRS_REFRESH');
+    });
+});
+
+/**
+ * Topic L2/L6: token bookkeeping never replaces an ANAF call's result, and a grant ANAF
+ * rotated is saved without a lock that could time out.
+ *
+ * Save failures are forced at the database layer (a beforeExecuting hook on the
+ * conditional UPDATE), because the save is a query-builder write that fires no model
+ * events.
+ */
+function failTokenSaves(): void
+{
+    DB::connection()->beforeExecuting(function (string $query) {
+        // Only the conditional save: the teardown rollback also updates the credentials.
+        if (str_starts_with(strtolower($query), 'update') && str_contains($query, 'refresh_token') && str_contains($query, 'is_active')) {
+            throw new RuntimeException('token save failed');
+        }
+    });
+}
+
+/**
+ * Every log record written from here on, as [level, message, context].
+ */
+function captureLogs(): ArrayObject
+{
+    $logs = new ArrayObject;
+    Log::listen(fn (MessageLogged $log) => $logs->append([$log->level, $log->message, $log->context]));
+
+    return $logs;
+}
+
+/**
+ * A token just outside the wrapper's 120s buffer: the operation runs unlocked, and the
+ * test crosses into the SDK's buffer mid-call so the SDK refreshes in memory.
+ */
+function makeTokenTheSdkWillRefresh(): EfacturaToken
+{
+    return EfacturaToken::create([
+        'cui' => '12345678',
+        'access_token' => 'OLD_ACCESS',
+        'refresh_token' => 'OLD_REFRESH',
+        'expires_at' => now()->addSeconds(121),
+        'is_active' => true,
+    ]);
+}
+
+describe('token bookkeeping after an ANAF call', function () {
+    beforeEach(function () {
+        config([
+            'efactura-sdk.http.retry_times' => 1,
+            'efactura-sdk.http.retry_delay' => 0,
+        ]);
+    });
+
+    it('returns the result and logs critical when a grant the SDK refreshed cannot be saved', function () {
+        $logs = captureLogs();
+        Http::fake([
+            OAUTH_TOKEN_URL => Http::response(['access_token' => 'NEW_ACCESS', 'refresh_token' => 'NEW_REFRESH', 'expires_in' => 3600]),
+            LIST_MESSAGES_URL => Http::response($this->listMessagesBody),
+        ]);
+        failTokenSaves();
+
+        $token = makeTokenTheSdkWillRefresh();
+
+        $result = $this->tokenService->executeWithClient($token, function ($client) {
+            $this->travel(2)->seconds();
+
+            return $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60));
+        });
+
+        expect($result)->toBeInstanceOf(ListMessagesResponseData::class)
+            ->and($token->fresh()->refresh_token)->toBe('OLD_REFRESH');
+        expect($logs->getArrayCopy())->toContain(['critical', 'EFactura: refreshed token could not be saved; re-authorisation may be needed', ['cui' => '12345678', 'exception' => RuntimeException::class]]);
+    });
+
+    it('saves a grant the SDK refreshed during a call that then threw, and rethrows the original', function () {
+        Http::fake([
+            OAUTH_TOKEN_URL => Http::response(['access_token' => 'NEW_ACCESS', 'refresh_token' => 'NEW_REFRESH', 'expires_in' => 3600]),
+            LIST_MESSAGES_URL => Http::response(['eroare' => 'Bad request'], 400),
+        ]);
+
+        $token = makeTokenTheSdkWillRefresh();
+
+        expect(fn () => $this->tokenService->executeWithClient($token, function ($client) {
+            $this->travel(2)->seconds();
+
+            return $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60));
+        }))->toThrow(ApiException::class);
+
+        $token->refresh();
+        expect($token->refresh_token)->toBe('NEW_REFRESH')
+            ->and($token->access_token)->toBe('NEW_ACCESS');
+    });
+
+    it('saves a grant the SDK refreshed even while another worker holds the refresh lock', function () {
+        Http::fake([
+            OAUTH_TOKEN_URL => Http::response(['access_token' => 'NEW_ACCESS', 'refresh_token' => 'NEW_REFRESH', 'expires_in' => 3600]),
+            LIST_MESSAGES_URL => Http::response($this->listMessagesBody),
+        ]);
+
+        $token = makeTokenTheSdkWillRefresh();
+        $siblingLock = Cache::lock('efactura:token_refresh:12345678', 120);
+
+        $this->tokenService->executeWithClient($token, function ($client) use ($siblingLock) {
+            $this->travel(2)->seconds();
+            $result = $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60));
+
+            // A sibling starts its own refresh after ours: a persist that waited on this
+            // lock timed out and lost the grant ANAF had already rotated.
+            expect($siblingLock->get())->toBeTrue();
+
+            return $result;
+        });
+
+        $siblingLock->release();
+        expect($token->fresh()->refresh_token)->toBe('NEW_REFRESH');
+    });
+
+    it('keeps the result when recording last_used_at fails', function () {
+        $logs = captureLogs();
+        Http::fake([LIST_MESSAGES_URL => Http::response($this->listMessagesBody)]);
+        EfacturaToken::updating(function (EfacturaToken $token) {
+            if ($token->isDirty('last_used_at')) {
+                throw new RuntimeException('last_used_at save failed');
+            }
+        });
+
+        $result = $this->tokenService->executeWithClient(
+            makeFreshToken(),
+            fn ($client) => $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60))
+        );
+
+        expect($result)->toBeInstanceOf(ListMessagesResponseData::class);
+        expect($logs->getArrayCopy())->toContain(['warning', 'EFactura: token bookkeeping after an ANAF call failed', ['cui' => '12345678', 'exception' => RuntimeException::class]])
+            ->and(array_column($logs->getArrayCopy(), 0))->not->toContain('critical');
+    });
+
+    it('logs critical and rethrows, sending nothing, when an explicit refresh cannot be saved', function () {
+        $logs = captureLogs();
+        Http::fake([
+            OAUTH_TOKEN_URL => Http::response(['access_token' => 'NEW_ACCESS', 'refresh_token' => 'NEW_REFRESH', 'expires_in' => 3600]),
+            LIST_MESSAGES_URL => Http::response($this->listMessagesBody),
+        ]);
+        failTokenSaves();
+
+        $ran = false;
+
+        expect(fn () => $this->tokenService->executeWithClient(makeExpiringToken(), function () use (&$ran) {
+            $ran = true;
+        }))->toThrow(RuntimeException::class, 'token save failed');
+
+        expect($ran)->toBeFalse();
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), 'listaMesajeFactura'));
+        expect($logs->getArrayCopy())->toContain(['critical', 'EFactura: refreshed token could not be saved; re-authorisation may be needed', ['cui' => '12345678', 'exception' => RuntimeException::class]]);
+    });
+});
+
+/**
+ * Topic L3: a TokenRefreshed listener that throws never replaces the result, and the
+ * grant is already saved.
+ */
+describe('a throwing TokenRefreshed listener', function () {
+    beforeEach(function () {
+        Event::listen(TokenRefreshed::class, function () {
+            throw new RuntimeException('listener failed');
+        });
+
+        Http::fake([
+            OAUTH_TOKEN_URL => Http::response(['access_token' => 'NEW_ACCESS', 'refresh_token' => 'NEW_REFRESH', 'expires_in' => 3600]),
+            LIST_MESSAGES_URL => Http::response($this->listMessagesBody),
+        ]);
+    });
+
+    it('keeps the result of a call during which the SDK refreshed', function () {
+        $token = makeTokenTheSdkWillRefresh();
+
+        $result = $this->tokenService->executeWithClient($token, function ($client) {
+            $this->travel(2)->seconds();
+
+            return $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60));
+        });
+
+        expect($result)->toBeInstanceOf(ListMessagesResponseData::class)
+            ->and($token->fresh()->refresh_token)->toBe('NEW_REFRESH');
+    });
+
+    it('still runs the operation after an explicit refresh', function () {
+        $token = makeExpiringToken();
+
+        $result = $this->tokenService->executeWithClient(
+            $token,
+            fn ($client) => $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60))
+        );
+
+        expect($result)->toBeInstanceOf(ListMessagesResponseData::class)
+            ->and($token->fresh()->refresh_token)->toBe('NEW_REFRESH');
     });
 });

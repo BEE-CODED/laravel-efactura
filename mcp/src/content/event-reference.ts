@@ -2,6 +2,12 @@ export const eventReferenceContent = `# Laravel e-Factura Wrapper — Event Refe
 
 All events are in the \`BeeCoded\\EFactura\\Events\` namespace.
 
+## Listener exceptions (v4.0)
+
+Every event is fired **after** the state it announces has been written, through Laravel's \`rescue()\`. An exception thrown by a synchronous listener is reported (\`report()\`, so your exception handler sees it), **never propagated**, and **never changes the recorded state**: the upload, message or token keeps the state it was given, and a batch carries on with the next row. (A queued listener runs later on a worker, where its failure is the queue's business.)
+
+\`TokenStored\` included: the token is stored first, and a throwing listener is reported while the OAuth callback still redirects to the success URL, without the exception's message. (Before v4.0 it sent the callback to the error URL with that message.)
+
 ## TokenStored
 
 **Class:** \`BeeCoded\\EFactura\\Events\\TokenStored\`
@@ -32,10 +38,12 @@ public function __construct(public EfacturaToken $token)
 
 **Trigger:** Fired after a token is refreshed during an API call. This is transparent to the caller.
 
-\`TokenService\` fires it from **three** places (**changed in v3.0.0**):
+\`TokenService\` fires it from **three** places (**changed in v4.0**):
 - \`refreshToken()\` — the token was expiring, so \`executeWithRefreshLock()\` refreshed it **explicitly, under the lock, before running the operation**. This is the normal path
-- \`persistTokenRefreshWithLock()\` — the token looked fresh so the operation ran unlocked, but the SDK refreshed anyway; the lock is acquired after the fact to persist it
+- after the operation (\`executeWithoutLock()\`) — the token looked fresh so the operation ran unlocked, but the SDK refreshed anyway (also when the operation then threw). The grant is saved by a conditional write, without a lock
 - \`handleClientTokenRefresh()\` — a **public** helper for callers driving an \`EFacturaClient\` by hand. \`executeWithClient()\` does **not** call it
+
+On the first two paths it fires only when the conditional write actually stored the grant: a grant older than (or as old as) the stored one, or one for a deactivated token, is not stored and fires nothing. \`persistTokenRefreshWithLock()\` no longer exists.
 
 > **Changed in v3.0.0.** Pre-v3, the expiring-token path held the refresh lock across the operation
 > and persisted via \`handleClientTokenRefresh()\`. That deadlocked: the SDK acquires the *same* cache
@@ -107,9 +115,10 @@ public function __construct(public EfacturaUpload $upload, public array $errors 
 
 | Source | Situation | \`failure_reason\` |
 |--------|-----------|------------------|
-| \`UploadService::failTerminally()\` | ANAF rejected the document (4xx, or \`ExecutionStatus=1\` without an upload index), XML/model invalid, no token; or delivery UNKNOWN: an ambiguous 5xx/transport loss, an unreadable 2xx upload answer, or an answer without a usable index and status (a non-numeric index, success without an index, no recognised status) | \`validation\`, \`configuration\`, \`indeterminate\` |
-| \`DownloadService::checkStatus()\` (i.e. \`CheckUploadStatuses\`) | ANAF processed the document and rejected it on its merits; or ANAF gave a final rejection without a response archive ("XML cu erori nepreluat de sistem") — no download, never resubmitted automatically | \`validation\` |
-| \`DownloadService::checkStatus()\` (via \`parkUnrecognisableStatus()\`) | ANAF returned no recognisable status for the upload index (e.g. an unknown index) — delivery UNKNOWN | \`indeterminate\` |
+| \`UploadService::failBeforeTransmission()\` | Before anything was sent: XML/model invalid, no token, model no longer uploadable | \`validation\`, \`configuration\` |
+| \`UploadService::failTerminally()\` | ANAF rejected the document (4xx, or \`ExecutionStatus=1\` without an upload index), or the SDK refused it (\`ValidationException\` / \`XmlParsingException\`); or delivery UNKNOWN: an ambiguous 5xx/transport loss, an unreadable 2xx upload answer, or an answer without a usable index and status (a non-numeric index, success without an index, no recognised status), or any other error after the request was handed to the SDK | \`validation\`, \`indeterminate\` |
+| \`DownloadService::checkStatus()\` (i.e. \`CheckUploadStatuses\`) | ANAF answered \`nok\` with a download id: it processed the document and rejected it on its merits; or ANAF gave a final rejection without a response archive ("XML cu erori nepreluat de sistem") — no download, never resubmitted automatically | \`validation\` |
+| \`DownloadService::checkStatus()\` (via \`parkAsIndeterminate()\`) | No verdict on the document, delivery UNKNOWN: \`nok\` without a download id (an unknown index, "Nu aveti dreptul"; the upload index is kept), no recognisable status (\`parkUnrecognisableStatus()\`), or \`polling.max_status_failures\` permanent status-check failures | \`indeterminate\` |
 | \`ProcessSingleUpload::failed()\` / \`SweepStaleUploads\` (via \`parkStrandedUploadAsIndeterminate()\`) | The worker died around the POST — delivery UNKNOWN | \`indeterminate\` |
 | \`ProcessSingleUpload::failed()\` (via \`abandonUnsentUpload()\`) | The \`retryUntil\` deadline expired while the row was still waiting to be sent — it never reached ANAF | \`abandoned\` |
 | \`ProcessSingleUpload\` transient cap exhausted (via \`abandonFailure()\`) | A \`transient\` failure did not clear within \`jobs.max_transient_attempts\` | \`abandoned\` |
@@ -136,7 +145,7 @@ public function __construct(public EfacturaUpload $upload, public array $errors 
 > \`abandoned\` exists because the give-up transition has to leave a **non-retryable** reason. While
 > a given-up row kept \`failure_reason = transient\`, \`RetryRateLimitedUploads\` — which selects on
 > \`rate_limited\` and \`transient\` — resurrected the row it had just abandoned, re-firing
-> \`InvoiceFailed\` every ~10 minutes for an upload that was immediately retried.
+> \`InvoiceFailed\` on every run for an upload that was immediately retried.
 
 \`\`\`php
 use BeeCoded\\EFactura\\Enums\\FailureReason;

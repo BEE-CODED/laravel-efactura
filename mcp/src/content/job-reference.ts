@@ -51,10 +51,7 @@ Finds all \`EfacturaUpload\` records with status \`Pending\` and dispatches a \`
 **Arguments:**
 - \`$cui\` — Optional CUI filter to process only a specific company's uploads
 
-**Recommended schedule:** Every 5 minutes
-\`\`\`php
-Schedule::job(new ProcessPendingUploads)->everyFiveMinutes();
-\`\`\`
+**Recommended schedule:** see [Recommended Scheduling](#recommended-scheduling).
 
 ---
 
@@ -64,14 +61,15 @@ Schedule::job(new ProcessPendingUploads)->everyFiveMinutes();
 new CheckUploadStatuses(?string $cui = null)
 \`\`\`
 
-Checks ANAF processing status for all uploads currently in \`Processing\` state. For each, calls \`EFacturaClient::getStatusMessage()\` and transitions to \`Completed\` or \`Failed\` accordingly.
+Checks ANAF processing status for all uploads currently in \`Processing\` state. For each, calls \`EFacturaClient::getStatusMessage()\` and transitions to \`Completed\` or \`Failed\` accordingly; the full outcome table is in the \`upload-pipeline\` topic.
+
+- \`ok\` without a download id is \`Completed\` (no response to download); \`nok\` without a download id is \`Failed\` / \`indeterminate\`, keeping the index
+- Permanent failures (4xx, unreadable 2xx, an index the SDK refuses) are counted in \`status_failures\` and park the upload \`indeterminate\` at \`polling.max_status_failures\` (default 5); transient ones (5xx, network, token) are retried uncounted
+- An upload at its per-message status limit (\`RateLimitScope::Status\`) is skipped and the batch carries on; a global limit or ANAF's 429 stops the batch
 
 **Feature flag:** \`features.upload_invoices\`
 
-**Recommended schedule:** Every 5 minutes
-\`\`\`php
-Schedule::job(new CheckUploadStatuses)->everyFiveMinutes();
-\`\`\`
+**Recommended schedule:** see [Recommended Scheduling](#recommended-scheduling).
 
 ---
 
@@ -83,14 +81,13 @@ new DownloadResponses(?string $cui = null)
 
 Downloads response ZIPs from ANAF for uploads that have a \`download_id\` but no \`response_path\` yet (applies to both Completed and Failed uploads that ANAF provided a response for).
 
-**Poisoned responses are bounded.** ANAF can answer \`/descarcare\` with a 2xx whose body is not a ZIP (typically a JSON \`eroare\`). The SDK's \`guardDownloadBody()\` throws, so \`response_path\` stays null — and without a guard the row would be re-selected here on every run, forever. Each such failure increments \`response_attempts\` and stamps \`response_failed_at\`; once \`response_attempts\` reaches \`EfacturaUpload::MAX_RESPONSE_ATTEMPTS\` (3) the row drops out of \`needsResponseDownload()\` and is left for \`efactura:reconcile\`. The upload's own \`status\` is untouched — ANAF accepted the invoice; only the receipt is missing.
+**Permanent failures are bounded.** ANAF can answer \`/descarcare\` with a 2xx whose body is not a ZIP (typically a JSON \`eroare\`). The SDK's \`guardDownloadBody()\` throws, so \`response_path\` stays null — and without a guard the row would be re-selected here on every run, forever. Each permanent failure (that, a 4xx, an id the SDK refuses, any other non-transient error) increments \`response_attempts\` and stamps \`response_failed_at\`; a transient one (5xx, network, token) is not counted; once \`response_attempts\` reaches \`EfacturaUpload::MAX_RESPONSE_ATTEMPTS\` (3) the row drops out of \`needsResponseDownload()\` and is left for \`efactura:reconcile\`. The upload's own \`status\` is untouched — ANAF accepted the invoice; only the receipt is missing.
+
+A download at its per-message download limit (\`RateLimitScope::Download\`) is skipped and the batch carries on; any other rate limit stops the batch.
 
 **Feature flag:** \`features.upload_invoices\`
 
-**Recommended schedule:** Every 5 minutes
-\`\`\`php
-Schedule::job(new DownloadResponses)->everyFiveMinutes();
-\`\`\`
+**Recommended schedule:** see [Recommended Scheduling](#recommended-scheduling).
 
 ---
 
@@ -102,12 +99,11 @@ new DownloadReceivedInvoices(?string $cui = null)
 
 Downloads received invoice ZIPs for \`EfacturaMessage\` records of type "received" that have not yet been downloaded. Fires \`InvoiceReceived\` event for each download.
 
+A permanent download failure increments \`download_attempts\`; at \`EfacturaMessage::MAX_DOWNLOAD_ATTEMPTS\` (3) the message is no longer selected. Transient failures are not counted, a per-message download limit skips the message, and any other rate limit stops the batch.
+
 **Feature flag:** \`features.download_received\` (default: **false** — must be explicitly enabled)
 
-**Recommended schedule:** Hourly
-\`\`\`php
-Schedule::job(new DownloadReceivedInvoices)->hourly();
-\`\`\`
+**Recommended schedule:** see [Recommended Scheduling](#recommended-scheduling).
 
 ---
 
@@ -117,14 +113,11 @@ Schedule::job(new DownloadReceivedInvoices)->hourly();
 new SyncMessages(?string $cui = null)
 \`\`\`
 
-Syncs the ANAF message list for all active tokens (or filtered by CUI). Creates or updates \`EfacturaMessage\` records for each ANAF message (sent invoices, received invoices, processing errors, buyer messages).
+Syncs the ANAF message list for all active tokens (or filtered by CUI). Creates or updates \`EfacturaMessage\` records for each ANAF message (sent invoices, received invoices, processing errors, buyer messages). A listed message without a usable id is skipped with a warning and not counted.
 
 **Feature flag:** \`features.sync_messages\`
 
-**Recommended schedule:** Every 15 minutes
-\`\`\`php
-Schedule::job(new SyncMessages)->everyFifteenMinutes();
-\`\`\`
+**Recommended schedule:** see [Recommended Scheduling](#recommended-scheduling).
 
 ---
 
@@ -146,10 +139,7 @@ Rows older than \`efactura.jobs.stale_uploading_minutes\` (default 30) are parke
 
 Set \`jobs.stale_uploading_minutes\` to \`0\` or less to make it a no-op.
 
-**Recommended schedule:** Every 15 minutes
-\`\`\`php
-Schedule::job(new SweepStaleUploads)->everyFifteenMinutes();
-\`\`\`
+**Recommended schedule:** see [Recommended Scheduling](#recommended-scheduling).
 
 ---
 
@@ -180,10 +170,7 @@ Safety net for uploads left stranded in \`Failed\` by a safe-to-resubmit error �
 - \`rate_limit.retry_batch_size\` (env: \`EFACTURA_RATE_LIMIT_RETRY_BATCH\`, default: 250) — Max uploads to reset per run
 - \`rate_limit.retry_max_age_days\` (env: \`EFACTURA_RATE_LIMIT_RETRY_MAX_DAYS\`, default: 7) — Ignore uploads older than this many days
 
-**Recommended schedule:** Every 30 minutes
-\`\`\`php
-Schedule::job(new RetryRateLimitedUploads)->everyThirtyMinutes();
-\`\`\`
+**Recommended schedule:** see [Recommended Scheduling](#recommended-scheduling).
 
 ---
 
@@ -211,7 +198,7 @@ Preparation (steps 3–4) is strictly **before** anything is transmitted, so a f
 **Rate limit handling:** two distinct mechanisms, depending on *when* the limit is hit:
 
 - **Pre-flight (step 1)** — quota already exhausted: the job \`release()\`s itself with a delay matching the bucket reset (min 10s) and returns. The upload row is untouched (stays \`Pending\`), and **no event fires**.
-- **Mid-call** — the limit is hit during the API call. \`UploadService\` marks the upload \`Failed\` with \`failure_reason = rate_limited\` and fires **\`InvoiceRateLimited\`** (*not* \`InvoiceFailed\`). \`ProcessSingleUpload\` re-reads the row, sees a retryable \`failure_reason\`, calls \`resetForRetry()\` (atomic; refuses non-retryable reasons) and \`release(60)\`s itself.
+- **Mid-call** — the limit is hit during the API call. \`UploadService\` releases the row back to \`Pending\` with \`failure_reason = rate_limited\` and fires **\`InvoiceRateLimited\`** (*not* \`InvoiceFailed\`). \`ProcessSingleUpload\` re-reads the row, sees \`Pending\` / \`rate_limited\`, and \`release(60)\`s itself.
 
 > **Changed in v3.0.0.** The mid-call path used to write a \`RATE_LIMIT_EXCEEDED:\` marker into the
 > free-text \`errors\` payload and fire \`InvoiceFailed\` — a false alarm followed by a successful
@@ -250,6 +237,20 @@ Checks one specific upload's processing status at ANAF. Used for targeted status
 
 ## Recommended Scheduling
 
+The package schedules nothing itself. This is the one recommended cadence per job (the README's "Recommended schedule" table states the same); the quotas are the SDK's daily per-message and per-CUI limits.
+
+| Job | Recommended cadence | Why |
+|-----|---------------------|-----|
+| \`ProcessPendingUploads\` | Every 5 minutes | Only dispatches queued uploads. Uploads count against the global per-minute limit (and, for RASP, a per-CUI daily one), not a per-document one |
+| \`CheckUploadStatuses\` | Every 10 minutes | Each poll uses one of the upload index's daily status reads (SDK \`status_per_day_message\`, default 50): about 8 hours of polling before the limit. An upload at its limit is skipped until it resets; the others are still polled |
+| \`DownloadResponses\` | Every 15 minutes | Each attempt uses one of the download id's daily downloads (SDK \`download_per_day_message\`, default 5); a successful download happens once |
+| \`RetryRateLimitedUploads\` | Every 30 minutes | A safety net: \`ProcessSingleUpload\` normally re-drives its own rate-limited upload. The interval gives an exhausted quota time to recover |
+| \`SweepStaleUploads\` | Every 15 minutes | With \`jobs.stale_uploading_minutes\` at 30, a stranded upload is parked within 45 minutes |
+| \`SyncMessages\` | Hourly | One message-list call per CUI per run (SDK \`simple_list_per_day_cui\`, default 750) |
+| \`DownloadReceivedInvoices\` | Hourly | Downloads what \`SyncMessages\` listed; each message's download uses one of its 5 daily downloads |
+
+\`jobs.max_staleness_seconds\` (120) is shorter than every interval, so a run delayed in the queue is dropped instead of overlapping the next one.
+
 \`\`\`php
 // In routes/console.php (Laravel 11+) or app/Console/Kernel.php
 
@@ -262,10 +263,10 @@ use BeeCoded\\EFactura\\Jobs\\SweepStaleUploads;
 use BeeCoded\\EFactura\\Jobs\\DownloadReceivedInvoices;
 
 Schedule::job(new ProcessPendingUploads)->everyFiveMinutes();
-Schedule::job(new CheckUploadStatuses)->everyFiveMinutes();
-Schedule::job(new DownloadResponses)->everyFiveMinutes();
-Schedule::job(new SyncMessages)->everyFifteenMinutes();
+Schedule::job(new CheckUploadStatuses)->everyTenMinutes();
+Schedule::job(new DownloadResponses)->everyFifteenMinutes();
 Schedule::job(new RetryRateLimitedUploads)->everyThirtyMinutes();
+Schedule::job(new SyncMessages)->hourly();
 
 // New in v3.0.0 — do not omit. Nothing else rescues an upload stranded in
 // "uploading" by a SIGKILL'd worker (which never gets to run failed()).

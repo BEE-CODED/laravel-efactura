@@ -39,6 +39,7 @@ use Illuminate\Support\Carbon;
  * @property Carbon|null $processed_at
  * @property int $response_attempts
  * @property Carbon|null $response_failed_at
+ * @property int $status_failures
  * @property Carbon $created_at
  * @property Carbon $updated_at
  * @property-read EfacturaToken|null $token
@@ -77,6 +78,7 @@ class EfacturaUpload extends Model
         'processed_at',
         'response_attempts',
         'response_failed_at',
+        'status_failures',
     ];
 
     protected $casts = [
@@ -90,6 +92,7 @@ class EfacturaUpload extends Model
         'processed_at' => 'datetime',
         'response_attempts' => 'integer',
         'response_failed_at' => 'datetime',
+        'status_failures' => 'integer',
     ];
 
     public function token(): BelongsTo

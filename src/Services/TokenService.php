@@ -20,8 +20,10 @@ use BeeCoded\EFacturaSdk\Facades\EFacturaSdkAuth;
 use BeeCoded\EFacturaSdk\Services\ApiClients\EFacturaClient;
 use BeeCoded\EFacturaSdk\Support\Validators\VatNumberValidator;
 use Illuminate\Contracts\Cache\LockTimeoutException;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 
 class TokenService
 {
@@ -236,34 +238,6 @@ class TokenService
     }
 
     /**
-     * Is this in-memory grant newer than the one currently stored?
-     *
-     * Expiry is the only ordering signal ANAF gives us: each refresh mints a
-     * token with a later expiry, so a later `expiresAt` means a later refresh.
-     * Equal expiries lose deliberately — if two workers refreshed within the
-     * same second, whoever already persisted wins, and ours is the spent one.
-     *
-     * Both sides are compared at whole-second precision, because that is all the
-     * stored value has: `expires_at` is a `timestamp` column, so the database
-     * truncates the microseconds an in-memory Carbon carries. Comparing raw, our
-     * copy is strictly greater than an identical stored expiry for any sub-second
-     * remainder — so the tie above would never happen, and this guard would do
-     * nothing in the one window it exists for.
-     */
-    protected function isFresherThanStored(OAuthTokensData $tokens, EfacturaToken $token): bool
-    {
-        if ($tokens->expiresAt === null || $token->expires_at === null) {
-            // Nothing to compare. ANAF always sends expires_in, so this is the
-            // pathological case; keep the old always-save behaviour rather than
-            // silently dropping a refresh we know succeeded.
-            return true;
-        }
-
-        return $tokens->expiresAt->clone()->startOfSecond()
-            ->greaterThan($token->expires_at->clone()->startOfSecond());
-    }
-
-    /**
      * Execute an API operation with concurrent-safe token handling.
      *
      * This method optimizes for parallel processing while preventing token refresh race conditions:
@@ -273,11 +247,16 @@ class TokenService
      *    - If still expiring: refresh it explicitly, then release the lock
      *    - If already refreshed by another process: just release the lock
      *    Either way the operation itself runs AFTER the lock is released.
-     * 3. After API call: if SDK unexpectedly refreshed, persist with lock protection
+     * 3. After the API call (also when it threw): if the SDK refreshed, persist the new
+     *    grant with a conditional write, then record last_used_at
      *
      * This allows parallel API calls when tokens are fresh, while serializing only
      * the refresh itself. The lock is never held across the API operation, because
      * the SDK acquires the same cache key internally and would deadlock against us.
+     *
+     * Bookkeeping after the call never replaces the operation's result or exception:
+     * its failures are logged (critical when a refreshed grant could not be saved),
+     * never thrown.
      *
      * @template T
      *
@@ -285,8 +264,10 @@ class TokenService
      * @param  callable(EFacturaClient): T  $operation  The API operation to execute
      * @return T The result of the operation
      *
-     * @throws LockTimeoutException If the lock cannot be acquired within 30 seconds
+     * @throws LockTimeoutException If the refresh lock cannot be acquired within 30 seconds
      * @throws \RuntimeException If the token has been deactivated
+     * @throws \Throwable Whatever the operation throws, unchanged; or a failed save of a
+     *                    token refreshed before the operation (nothing was sent yet)
      */
     public function executeWithClient(EfacturaToken $token, callable $operation): mixed
     {
@@ -310,18 +291,56 @@ class TokenService
     protected function executeWithoutLock(EfacturaToken $token, callable $operation): mixed
     {
         $client = $this->createClient($token);
-        $result = $operation($client);
 
-        // Handle any refresh that occurred during the operation
-        if ($client->wasTokenRefreshed()) {
-            // Edge case: SDK detected invalid token and refreshed
-            // Persist with lock protection to avoid race conditions
-            $this->persistTokenRefreshWithLock($token, $client);
-        } else {
-            $token->update(['last_used_at' => now()]);
+        try {
+            return $operation($client);
+        } finally {
+            // In finally so a refresh the SDK made during a call that then threw is still saved.
+            $this->recordClientUse($token, $client);
         }
+    }
 
-        return $result;
+    /**
+     * Save a grant the SDK refreshed during the call, then record last_used_at.
+     *
+     * Never throws: this runs after ANAF has answered (or failed), and a bookkeeping
+     * failure that replaced the result would lose, for example, an upload index ANAF
+     * has already assigned. Only the exception class is logged, because a message can
+     * carry the ciphertext being written.
+     */
+    private function recordClientUse(EfacturaToken $token, EFacturaClient $client): void
+    {
+        $tokenSaved = true;
+
+        try {
+            if ($client->wasTokenRefreshed()) {
+                $tokenSaved = false;
+                $written = $this->saveRefreshedTokens($token, $client->getTokens());
+                $tokenSaved = true;
+
+                $token->refresh();
+
+                if ($written) {
+                    rescue(fn () => event(new TokenRefreshed($token)));
+                }
+            }
+
+            $token->update(['last_used_at' => now()]);
+        } catch (\Throwable $e) {
+            if (!$tokenSaved) {
+                Log::critical('EFactura: refreshed token could not be saved; re-authorisation may be needed', [
+                    'cui' => $token->cui,
+                    'exception' => $e::class,
+                ]);
+
+                return;
+            }
+
+            Log::warning('EFactura: token bookkeeping after an ANAF call failed', [
+                'cui' => $token->cui,
+                'exception' => $e::class,
+            ]);
+        }
     }
 
     /**
@@ -381,66 +400,77 @@ class TokenService
      *
      * Caller MUST hold the "efactura:token_refresh:{cui}" lock: ANAF rotates refresh
      * tokens, so a concurrent double refresh would invalidate the good one.
+     *
+     * A failed save is rethrown: ANAF has already rotated the grant, so it is logged
+     * critical, but nothing has been transmitted yet.
      */
     protected function refreshToken(EfacturaToken $token): void
     {
         $newTokens = app(AnafAuthenticatorInterface::class)
             ->refreshAccessToken($token->refresh_token);
 
-        $this->updateTokenFromOAuth($token, $newTokens);
+        try {
+            $written = $this->saveRefreshedTokens($token, $newTokens);
+        } catch (\Throwable $e) {
+            Log::critical('EFactura: refreshed token could not be saved; re-authorisation may be needed', [
+                'cui' => $token->cui,
+                'exception' => $e::class,
+            ]);
 
-        event(new TokenRefreshed($token));
+            throw $e;
+        }
+
+        $token->refresh();
+
+        if ($written) {
+            rescue(fn () => event(new TokenRefreshed($token)));
+        }
     }
 
     /**
-     * Persist token refresh with lock protection.
+     * Persist a refreshed grant only if it is newer than the stored one.
      *
-     * Used when SDK unexpectedly refreshed during a non-locked operation.
-     * Acquires lock, reloads token, and only updates if still needed.
+     * One conditional UPDATE instead of a lock, so a lock timeout can no longer drop a
+     * grant ANAF has already rotated. Expiry is the only ordering signal ANAF gives:
+     * each refresh mints a later one. The database evaluates the condition against the
+     * row as it stands when the write lands, so whichever order concurrent refreshes
+     * commit in, the later expiry ends up stored and a stale write matches no row. An
+     * equal expiry loses: whoever persisted first wins, and ours is the spent one. The
+     * bound value has the column's whole-second precision, so that tie is real.
+     *
+     * A deactivated token is never written.
+     *
+     * @return bool Whether this grant was stored.
      */
-    protected function persistTokenRefreshWithLock(EfacturaToken $token, EFacturaClient $client): void
+    protected function saveRefreshedTokens(EfacturaToken $token, OAuthTokensData $tokens): bool
     {
-        $lockKey = "efactura:token_refresh:{$token->cui}";
-        $lock = Cache::lock($lockKey, 30);
+        // Set through a model so the encrypted and datetime casts produce the stored form.
+        $attributes = (new EfacturaToken)->forceFill([
+            'access_token' => $tokens->accessToken,
+            'refresh_token' => $tokens->refreshToken,
+            'expires_at' => $tokens->expiresAt,
+        ])->getAttributes();
 
-        try {
-            $lock->block(10);
+        $query = EfacturaToken::whereKey($token->getKey())->where('is_active', true);
 
-            // Reload token to check it's still active
-            $token->refresh();
-
-            if (!$token->is_active) {
-                // Token was deactivated - don't update it with new credentials
-                return;
-            }
-
-            $refreshed = $client->getTokens();
-
-            // Only adopt our copy if it is genuinely newer than what is stored.
-            //
-            // This used to save unconditionally, reasoning that a successful
-            // refresh means we hold THE valid tokens. That is only true if nobody
-            // refreshed after us: we persist AFTER the operation, so a sibling
-            // worker can mint and store a newer grant inside that window. ANAF
-            // invalidated our refresh token when it issued theirs, so writing
-            // ours over theirs leaves the DB holding a dead grant that no retry
-            // can recover - the company would have to re-authorise.
-            if ($this->isFresherThanStored($refreshed, $token)) {
-                $this->updateTokenFromOAuth($token, $refreshed);
-                event(new TokenRefreshed($token));
-            }
-
-            $token->update(['last_used_at' => now()]);
-        } finally {
-            $lock->release();
+        // ANAF always sends expires_in; without one there is nothing to order by, so the
+        // refresh we know succeeded is kept rather than dropped.
+        if ($attributes['expires_at'] !== null) {
+            $query->where(fn (Builder $stored) => $stored
+                ->whereNull('expires_at')
+                ->orWhere('expires_at', '<', $attributes['expires_at']));
         }
+
+        return $query->update($attributes) > 0;
     }
 
     /**
      * Handle token refresh after API call.
      * Call this after using a client to persist any refreshed tokens.
      *
-     * Note: When using executeWithClient(), this is called automatically.
+     * For a client you drive yourself (EfacturaManager::client()). executeWithClient()
+     * does not call this: it saves a refresh conditionally, see saveRefreshedTokens().
+     * This method writes unconditionally and lets its exceptions propagate.
      */
     public function handleClientTokenRefresh(EFacturaClient $client, EfacturaToken $token): void
     {
@@ -448,7 +478,7 @@ class TokenService
             $newTokens = $client->getTokens();
             $this->updateTokenFromOAuth($token, $newTokens);
 
-            event(new TokenRefreshed($token));
+            rescue(fn () => event(new TokenRefreshed($token)));
         }
 
         $token->update(['last_used_at' => now()]);

@@ -70,6 +70,8 @@ class MessageSyncService
      * Batch callers that want per-token isolation should catch around this method —
      * see syncAllMessages().
      *
+     * Listed messages without a usable id are skipped with a warning and not counted.
+     *
      * @return int How many messages were synced.
      *
      * @throws \Throwable Whatever the SDK/transport raised.
@@ -94,6 +96,18 @@ class MessageSyncService
         $synced = 0;
 
         foreach ($response->mesaje ?? [] as $message) {
+            // Without an id a message can be neither downloaded nor told apart from
+            // another: upserting it would merge every such message into one row.
+            if ($message->id === null) {
+                Log::warning('EFactura: ANAF listed a message without a usable id, skipping it', [
+                    'cui' => $token->cui,
+                    'tip' => $message->tip,
+                    'id_solicitare' => $message->idSolicitare,
+                ]);
+
+                continue;
+            }
+
             $this->upsertMessage($token, $message, $filter);
             $synced++;
         }

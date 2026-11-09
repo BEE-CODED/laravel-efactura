@@ -91,11 +91,23 @@ Hardening for the periodic batch jobs so a backlog that accumulates while the qu
 
 | Config Key | Env Var | Type | Default | Description |
 |-----------|---------|------|---------|-------------|
-| \`jobs.max_staleness_seconds\` | \`EFACTURA_JOB_MAX_STALENESS\` | int | \`120\` | A periodic batch job (\`ProcessPendingUploads\`, \`CheckUploadStatuses\`, \`DownloadResponses\`) that has waited in the queue longer than this self-discards instead of running — the next scheduled run re-scans. Safe because these jobs are idempotent all-rows scanners. Set to \`0\` to disable. Default is 2x the typical 1-minute cadence. |
+| \`jobs.max_staleness_seconds\` | \`EFACTURA_JOB_MAX_STALENESS\` | int | \`120\` | A periodic batch job (\`ProcessPendingUploads\`, \`CheckUploadStatuses\`, \`DownloadResponses\`) that has waited in the queue longer than this self-discards instead of running — the next scheduled run re-scans. Safe because these jobs are idempotent all-rows scanners. Set to \`0\` to disable. The default is shorter than every recommended interval (Job Reference, "Recommended Scheduling"), so a delayed run never overlaps the next. |
 | \`jobs.unique_for_seconds\` | \`EFACTURA_JOB_UNIQUE_FOR\` | int | \`3600\` | Lock TTL (seconds) for \`ShouldBeUniqueUntilProcessing\` on those three batch jobs and on \`SweepStaleUploads\` — the ceiling after which a job stuck unprocessed in the queue stops blocking a fresh dispatch. (\`RetryRateLimitedUploads\` hardcodes its own \`uniqueFor = 600\` and ignores this key.) |
 | \`jobs.transient_retry_delay_seconds\` | \`EFACTURA_JOB_TRANSIENT_RETRY_DELAY\` | int | \`30\` | How long \`ProcessSingleUpload\` waits before re-driving an upload that failed transiently (auth / pre-flight blip). Rate-limited retries use a fixed 60s instead. **New in v3.0.0.** |
 | \`jobs.max_transient_attempts\` | \`EFACTURA_JOB_MAX_TRANSIENT_ATTEMPTS\` | int | \`5\` | How many times a single upload job may be re-driven for a \`transient\` failure before it is declared terminal and \`InvoiceFailed\` fires. Stops a durable fault (e.g. a revoked token answering 401) from hammering ANAF for the whole retry window. Set to \`0\` to disable the cap. **New in v3.0.0.** |
 | \`jobs.stale_uploading_minutes\` | \`EFACTURA_JOB_STALE_UPLOADING_MINUTES\` | int | \`30\` | An upload left in \`uploading\` longer than this had its worker die mid-flight. \`SweepStaleUploads\` parks it as \`Failed\` / \`indeterminate\` for human reconciliation — it is **never** re-submitted, because it may already be filed. \`<= 0\` makes the sweep a no-op. **New in v3.0.0.** |
+
+---
+
+## polling
+
+Status polling of uploads in \`Processing\` (\`CheckUploadStatuses\`). **New in v4.0.**
+
+| Config Key | Env Var | Type | Default | Description |
+|-----------|---------|------|---------|-------------|
+| \`polling.max_status_failures\` | \`EFACTURA_POLLING_MAX_STATUS_FAILURES\` | int | \`5\` | How many status checks of one upload may fail **permanently** (a 4xx or unreadable 2xx answer, an index the SDK refuses, any other error once the request was handed to the SDK) before the upload is parked \`Failed\` / \`indeterminate\` for \`efactura:reconcile\`. Counted in \`efactura_uploads.status_failures\` (migration \`..._000008\`). Transient failures (5xx, network, token problems) and the per-message status rate limit are never counted, and any status answer resets the count. A published config without this key uses the default. |
+
+The wrapper's other fixed bounds are constants, not config: \`EfacturaUpload::MAX_RESPONSE_ATTEMPTS\` (3 permanent response-download failures) and \`EfacturaMessage::MAX_DOWNLOAD_ATTEMPTS\` (3 permanent received-invoice download failures, counted in \`efactura_messages.download_attempts\`).
 
 ---
 
@@ -154,6 +166,9 @@ EFACTURA_JOB_UNIQUE_FOR=3600
 EFACTURA_JOB_TRANSIENT_RETRY_DELAY=30
 EFACTURA_JOB_MAX_TRANSIENT_ATTEMPTS=5
 EFACTURA_JOB_STALE_UPLOADING_MINUTES=30
+
+# Status polling (v4.0)
+EFACTURA_POLLING_MAX_STATUS_FAILURES=5
 
 # Storage
 EFACTURA_STORAGE_DISK=local

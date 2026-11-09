@@ -93,7 +93,9 @@ return [
     | max_staleness_seconds: A batch job that has waited in the queue longer
     |                        than this self-discards instead of running (the
     |                        next scheduled run will re-scan). Set to 0 to
-    |                        disable. Default 120 (2x the 1-minute cadence).
+    |                        disable. Default 120: shorter than every
+    |                        recommended interval (README, "Recommended
+    |                        schedule"), so a delayed run never overlaps the next.
     | unique_for_seconds:    Lock TTL for ShouldBeUniqueUntilProcessing — the
     |                        ceiling after which a job stuck unprocessed in the
     |                        queue stops blocking a fresh dispatch. Default 3600.
@@ -120,6 +122,23 @@ return [
         'transient_retry_delay_seconds' => env('EFACTURA_JOB_TRANSIENT_RETRY_DELAY', 30),
         'max_transient_attempts' => env('EFACTURA_JOB_MAX_TRANSIENT_ATTEMPTS', 5),
         'stale_uploading_minutes' => env('EFACTURA_JOB_STALE_UPLOADING_MINUTES', 30),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Status Polling
+    |--------------------------------------------------------------------------
+    |
+    | max_status_failures: How many status checks of one upload may fail
+    |                      permanently (a 4xx or unreadable answer, an index the
+    |                      SDK refuses) before the upload is parked as
+    |                      indeterminate for reconciliation. Transient failures
+    |                      (5xx, network, rate limits, token problems) are never
+    |                      counted, and any successful read resets the count.
+    |
+    */
+    'polling' => [
+        'max_status_failures' => env('EFACTURA_POLLING_MAX_STATUS_FAILURES', 5),
     ],
 
     /*

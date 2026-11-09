@@ -86,8 +86,8 @@ class OAuthCallbackController extends Controller
             // Store tokens
             $token = $this->tokenService->storeToken($cui, $tokens);
 
-            // Fire event
-            event(new TokenStored($token));
+            // The token is stored: a listener failure is reported, never shown as a failed authorisation.
+            rescue(fn () => event(new TokenStored($token)));
 
             return $this->successRedirect($cui);
         } catch (\Exception $e) {

@@ -400,8 +400,8 @@ describe('an upload answer that does not say whether the document was taken in',
             '<header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" dateResponse="202407171230" ExecutionStatus="0" index_incarcare="abc"/>',
             fn () => [__('efactura::messages.upload_outcome_unknown')],
         ],
-        'success with a trailing-newline index' => [
-            json_encode(['ExecutionStatus' => '0', 'index_incarcare' => "12345\n"]),
+        'success with a spaced index' => [
+            json_encode(['ExecutionStatus' => '0', 'index_incarcare' => '12 345']),
             fn () => [__('efactura::messages.upload_outcome_unknown')],
         ],
         'success with an empty index' => [
@@ -457,7 +457,82 @@ describe('an upload answer carrying a usable index', function () {
         Event::assertNotDispatched(InvoiceFailed::class);
     })->with([
         'JSON without ExecutionStatus' => json_encode(['index_incarcare' => '12345']),
+        // The SDK trims the index, so a trailing newline still leaves a digit index.
+        'JSON with a trailing-newline index' => json_encode(['ExecutionStatus' => '0', 'index_incarcare' => "12345\n"]),
         'XML header without ExecutionStatus' => '<header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" dateResponse="202407171230" index_incarcare="12345"/>',
         'XML header with ExecutionStatus=1' => '<header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" dateResponse="202407171230" ExecutionStatus="1" index_incarcare="12345"/>',
     ]);
+});
+
+/**
+ * Topic L2: token bookkeeping after the upload call never replaces its result.
+ */
+describe('token bookkeeping after the upload call', function () {
+    it('keeps the index ANAF assigned when recording last_used_at fails', function () {
+        Http::fake([UPLOAD_URL => Http::response(json_encode(['ExecutionStatus' => '0', 'index_incarcare' => '12345']), 200)]);
+        EfacturaToken::updating(function (EfacturaToken $token) {
+            if ($token->isDirty('last_used_at')) {
+                throw new RuntimeException('last_used_at save failed');
+            }
+        });
+
+        $upload = makePendingUpload();
+        $this->uploadService->processUpload($upload);
+
+        $upload->refresh();
+        expect($upload->status)->toBe(UploadStatus::Processing)
+            ->and($upload->upload_index)->toBe('12345')
+            ->and($upload->failure_reason)->toBeNull();
+    });
+});
+
+/**
+ * Topic L3: a listener that throws is reported, never propagated, and never changes the
+ * state that was already recorded.
+ */
+describe('a throwing listener after a recorded upload state', function () {
+    beforeEach(function () {
+        foreach ([InvoiceUploaded::class, InvoiceFailed::class, InvoiceRateLimited::class] as $event) {
+            Event::listen($event, function () {
+                throw new RuntimeException('listener failed');
+            });
+        }
+    });
+
+    it('leaves an accepted upload processing with its index', function () {
+        Http::fake([UPLOAD_URL => Http::response(json_encode(['ExecutionStatus' => '0', 'index_incarcare' => '12345']), 200)]);
+
+        $upload = makePendingUpload();
+        $this->uploadService->processUpload($upload);
+
+        $upload->refresh();
+        expect($upload->status)->toBe(UploadStatus::Processing)
+            ->and($upload->upload_index)->toBe('12345')
+            ->and($upload->failure_reason)->toBeNull();
+    });
+
+    it('leaves a rejection recorded as a rejection', function () {
+        Http::fake([UPLOAD_URL => Http::response(json_encode([
+            'ExecutionStatus' => '1',
+            'Errors' => ['Fisierul nu respecta schema'],
+        ]), 200)]);
+
+        $upload = makePendingUpload();
+        $this->uploadService->processUpload($upload);
+
+        $upload->refresh();
+        expect($upload->status)->toBe(UploadStatus::Failed)
+            ->and($upload->failure_reason)->toBe(FailureReason::Validation);
+    });
+
+    it('leaves a rate-limited upload back in the pipeline', function () {
+        Http::fake([UPLOAD_URL => Http::response(['eroare' => 'Limita depasita'], 429)]);
+
+        $upload = makePendingUpload();
+        $this->uploadService->processUpload($upload);
+
+        $upload->refresh();
+        expect($upload->status)->toBe(UploadStatus::Pending)
+            ->and($upload->failure_reason)->toBe(FailureReason::RateLimited);
+    });
 });

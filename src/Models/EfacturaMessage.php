@@ -28,6 +28,7 @@ use Illuminate\Support\Carbon;
  * @property string|null $xml_path
  * @property bool $is_downloaded
  * @property Carbon|null $message_date
+ * @property int $download_attempts
  * @property Carbon $created_at
  * @property Carbon $updated_at
  * @property-read EfacturaToken|null $token
@@ -50,13 +51,21 @@ class EfacturaMessage extends Model
         'xml_path',
         'is_downloaded',
         'message_date',
+        'download_attempts',
     ];
 
     protected $casts = [
         'details' => 'array',
         'is_downloaded' => 'boolean',
         'message_date' => 'datetime',
+        'download_attempts' => 'integer',
     ];
+
+    /**
+     * Permanent download failures before a received invoice is set aside, mirroring
+     * EfacturaUpload::MAX_RESPONSE_ATTEMPTS: a broken download is not retried forever.
+     */
+    public const MAX_DOWNLOAD_ATTEMPTS = 3;
 
     public function token(): BelongsTo
     {

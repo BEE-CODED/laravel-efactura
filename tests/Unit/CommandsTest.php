@@ -1,5 +1,6 @@
 <?php
 
+use BeeCoded\EFactura\Enums\StatusCheckOutcome;
 use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
@@ -136,7 +137,8 @@ describe('EfacturaStatusCommand', function () {
         $downloadService = Mockery::mock(DownloadService::class);
         $downloadService->shouldReceive('checkStatus')
             ->once()
-            ->with(Mockery::type(EfacturaUpload::class));
+            ->with(Mockery::type(EfacturaUpload::class))
+            ->andReturn(StatusCheckOutcome::Checked);
 
         $this->app->instance(DownloadService::class, $downloadService);
 
@@ -158,7 +160,7 @@ describe('EfacturaStatusCommand', function () {
         ]);
 
         $downloadService = Mockery::mock(DownloadService::class);
-        $downloadService->shouldReceive('checkStatus')->once();
+        $downloadService->shouldReceive('checkStatus')->once()->andReturn(StatusCheckOutcome::NotPollable);
         $downloadService->shouldReceive('downloadResponse')
             ->once()
             ->with(Mockery::type(EfacturaUpload::class));
@@ -166,7 +168,9 @@ describe('EfacturaStatusCommand', function () {
         $this->app->instance(DownloadService::class, $downloadService);
 
         $this->artisan('efactura:status', ['--upload' => $upload->id])
+            ->expectsOutput("Upload #{$upload->id} was not polled: it has no ANAF upload index yet.")
             ->expectsOutput('Downloading response...')
+            ->doesntExpectOutput('Done.')
             ->assertExitCode(0);
     });
 

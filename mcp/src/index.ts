@@ -16,7 +16,7 @@ const server = new McpServer({
 // Tool 1: get-wrapper-docs (parameterized by topic)
 server.tool(
   "get-wrapper-docs",
-  "Get documentation about the Laravel e-Factura wrapper package for a specific topic. Use 'migration' for the step-by-step v2 to v3.0 upgrade guide (breaking changes, symptoms, and exact code changes).",
+  "Get documentation about the Laravel e-Factura wrapper package for a specific topic. Use 'migration' for the upgrade guides: v3.1 to v4.0 (every behaviour change), then the step-by-step v2 to v3.0 guide (breaking changes, symptoms, and exact code changes).",
   { topic: z.enum(VALID_TOPICS).describe("Documentation topic") },
   async ({ topic }) => {
     const content = wrapperDocsContent[topic];

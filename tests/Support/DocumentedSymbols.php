@@ -54,6 +54,43 @@ final class DocumentedSymbols
      */
     private const DOCUMENTED_AS_REMOVED = [
         ['class' => 'BeeCoded\\EFactura\\Services\\UploadService', 'method' => 'resetForRateLimit'],
+        // v4.0 CHANGELOG "Removed".
+        ['class' => 'BeeCoded\\EFactura\\Services\\TokenService', 'method' => 'persistTokenRefreshWithLock'],
+        ['class' => 'BeeCoded\\EFactura\\Services\\TokenService', 'method' => 'isFresherThanStored'],
+        ['class' => 'BeeCoded\\EFactura\\Services\\DownloadService', 'method' => 'isPoisonedBody'],
+    ];
+
+    /**
+     * The one recommended cadence per scheduled job, as a Laravel scheduler method.
+     *
+     * The package schedules nothing itself, so this lives only in the docs: the
+     * README's "Recommended schedule" table and the MCP job reference's
+     * "Recommended Scheduling" table. Every schedule call and every cadence cell in
+     * the docs must say the same.
+     *
+     * @var array<string, string> job => scheduler method
+     */
+    public const RECOMMENDED_CADENCES = [
+        'ProcessPendingUploads' => 'everyFiveMinutes',
+        'CheckUploadStatuses' => 'everyTenMinutes',
+        'DownloadResponses' => 'everyFifteenMinutes',
+        'RetryRateLimitedUploads' => 'everyThirtyMinutes',
+        'SweepStaleUploads' => 'everyFifteenMinutes',
+        'SyncMessages' => 'hourly',
+        'DownloadReceivedInvoices' => 'hourly',
+    ];
+
+    /**
+     * How the cadence tables word each scheduler method.
+     *
+     * @var array<string, string>
+     */
+    public const CADENCE_WORDING = [
+        'everyFiveMinutes' => 'Every 5 minutes',
+        'everyTenMinutes' => 'Every 10 minutes',
+        'everyFifteenMinutes' => 'Every 15 minutes',
+        'everyThirtyMinutes' => 'Every 30 minutes',
+        'hourly' => 'Hourly',
     ];
 
     /**
@@ -91,7 +128,10 @@ final class DocumentedSymbols
     public static function sources(): array
     {
         $root = self::packageRoot();
-        $sources = ['README.md' => (string) file_get_contents($root.'/README.md')];
+        $sources = [
+            'README.md' => (string) file_get_contents($root.'/README.md'),
+            'CHANGELOG.md' => (string) file_get_contents($root.'/CHANGELOG.md'),
+        ];
 
         foreach (glob($root.'/mcp/src/content/*.ts') ?: [] as $path) {
             // The MCP content files are TypeScript template literals holding
@@ -582,6 +622,76 @@ final class DocumentedSymbols
             }
 
             $found[$label] = $calls;
+        }
+
+        return $found;
+    }
+
+    /**
+     * Cadences the docs state for scheduled jobs, as scheduler methods.
+     *
+     * Two forms: a schedule call (`job(new CheckUploadStatuses)->everyTenMinutes()`,
+     * with or without constructor arguments) and a table row whose first cell is a
+     * scheduled job and which states a cadence ("Every 10 minutes", "Hourly"). A
+     * wording outside CADENCE_WORDING is returned verbatim, so it fails the check.
+     *
+     * @return array<string, list<array{job: string, cadence: string, ref: string}>>
+     */
+    public static function documentedCadences(): array
+    {
+        $jobs = implode('|', array_keys(self::RECOMMENDED_CADENCES));
+        $methods = array_flip(self::CADENCE_WORDING);
+        $found = [];
+
+        foreach (self::sources() as $label => $text) {
+            $refs = [];
+
+            preg_match_all("/job\\(new ({$jobs})\\b[^;\\n]*?\\)\\s*->\\s*([A-Za-z]+)\\(/", $text, $calls, PREG_SET_ORDER);
+            foreach ($calls as [$whole, $job, $method]) {
+                $refs[] = ['job' => $job, 'cadence' => $method, 'ref' => $whole];
+            }
+
+            preg_match_all("/^\\|\\s*`({$jobs})`\\s*\\|.*?\\b(Every \\d+ (?:minutes?|hours?)|Every hour|Hourly|Daily)\\b/mi", $text, $rows, PREG_SET_ORDER);
+            foreach ($rows as [$whole, $job, $wording]) {
+                $refs[] = ['job' => $job, 'cadence' => $methods[$wording] ?? $wording, 'ref' => $whole];
+            }
+
+            $found[$label] = $refs;
+        }
+
+        return $found;
+    }
+
+    /**
+     * `Class::CONSTANT` references, resolved to the class they name.
+     *
+     * Only SCREAMING_SNAKE names with an underscore, so enum cases
+     * (`UploadStatus::Pending`) and `::class` never match.
+     *
+     * @return array<string, list<array{class: string, constant: string, ref: string}>>
+     */
+    public static function classConstantReferences(): array
+    {
+        $known = self::unambiguousShortNames();
+        $found = [];
+
+        foreach (self::sources() as $label => $text) {
+            preg_match_all('/\\b([A-Z][A-Za-z0-9_]*)::([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\\b/', $text, $matches, PREG_SET_ORDER);
+
+            $refs = [];
+            foreach ($matches as [, $short, $constant]) {
+                if (!isset($known[$short])) {
+                    continue;
+                }
+
+                $refs[$short.'::'.$constant] = [
+                    'class' => $known[$short],
+                    'constant' => $constant,
+                    'ref' => $short.'::'.$constant,
+                ];
+            }
+
+            $found[$label] = array_values($refs);
         }
 
         return $found;

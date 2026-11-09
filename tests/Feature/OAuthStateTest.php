@@ -9,10 +9,13 @@
  * file that was distributed with this source code.
  */
 
+use BeeCoded\EFactura\Events\TokenStored;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Services\TokenService;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Http;
 
 /**
@@ -109,6 +112,30 @@ describe('the web authorization flow', function () {
             ->assertSessionHas('efactura_success', true);
 
         expect(EfacturaToken::where('cui', '18547290')->first()->access_token)->toBe('WEB_ACCESS');
+    });
+});
+
+describe('a throwing TokenStored listener', function () {
+    it('neither fails the callback nor leaks its message, and the token stays stored', function () {
+        Exceptions::fake();
+        Http::fake([
+            ANAF_TOKEN_URL => Http::response([
+                'access_token' => 'WEB_ACCESS',
+                'refresh_token' => 'WEB_REFRESH',
+                'expires_in' => 3600,
+            ]),
+        ]);
+        Event::listen(TokenStored::class, fn () => throw new RuntimeException('listener internals'));
+
+        $state = stateFromUrl($this->tokenService->getAuthorizationUrl('18547290'));
+
+        $this->get('/efactura/callback?code=AUTH_CODE&state='.urlencode($state))
+            ->assertSessionHas('efactura_success', true)
+            ->assertSessionHas('efactura_message', 'e-Factura authorization successful for CUI: 18547290')
+            ->assertSessionMissing('efactura_error');
+
+        expect(EfacturaToken::where('cui', '18547290')->first()->access_token)->toBe('WEB_ACCESS');
+        Exceptions::assertReported(fn (RuntimeException $e) => $e->getMessage() === 'listener internals');
     });
 });
 

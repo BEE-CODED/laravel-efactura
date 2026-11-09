@@ -11,6 +11,7 @@
 
 namespace BeeCoded\EFactura\Console\Commands;
 
+use BeeCoded\EFactura\Enums\StatusCheckOutcome;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\DownloadService;
 use BeeCoded\EFacturaSdk\Support\Validators\VatNumberValidator;
@@ -47,7 +48,19 @@ class EfacturaStatusCommand extends Command
             }
 
             $this->info("Checking status for upload #{$uploadId}...");
-            $downloadService->checkStatus($upload);
+            $outcome = $downloadService->checkStatus($upload);
+
+            if ($outcome === StatusCheckOutcome::RateLimited) {
+                $this->warn("Skipped: the per-message status limit of upload #{$uploadId} is reached, try again later.");
+
+                return self::FAILURE;
+            }
+
+            if ($outcome === StatusCheckOutcome::Failed) {
+                $this->error("The status check of upload #{$uploadId} failed; see the log.");
+
+                return self::FAILURE;
+            }
 
             $upload = $upload->fresh();
             if (!$upload) {
@@ -56,12 +69,27 @@ class EfacturaStatusCommand extends Command
                 return self::SUCCESS;
             }
 
+            if ($outcome === StatusCheckOutcome::NotPollable) {
+                $this->warn("Upload #{$uploadId} was not polled: ".match (true) {
+                    !$upload->upload_index => 'it has no ANAF upload index yet.',
+                    $upload->isTerminal() => "it is already {$upload->status->value}.",
+                    default => 'it has no e-Factura token.',
+                });
+            }
+
             if ($upload->download_id) {
                 $this->info('Downloading response...');
                 $downloadService->downloadResponse($upload);
+
+                // A skipped or failed download only logs; say so instead of implying it worked.
+                if ($upload->fresh()?->response_path === null) {
+                    $this->warn("The response of upload #{$uploadId} was not downloaded (limit reached or error; see the log). DownloadResponses retries it.");
+                }
             }
 
-            $this->info('Done.');
+            if ($outcome === StatusCheckOutcome::Checked) {
+                $this->info('Done.');
+            }
 
             return self::SUCCESS;
         }
