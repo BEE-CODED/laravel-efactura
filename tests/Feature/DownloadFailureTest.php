@@ -15,7 +15,6 @@ use BeeCoded\EFactura\Events\InvoiceFailed;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\DownloadService;
-use BeeCoded\EFacturaSdk\Enums\UploadStatusValue;
 use BeeCoded\EFacturaSdk\Exceptions\ApiException;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
@@ -35,7 +34,7 @@ use Illuminate\Support\Facades\Storage;
  */
 const STATUS_URL = 'https://api.anaf.ro/test/FCTEL/rest/stareMesaj*';
 const DOWNLOAD_URL = 'https://api.anaf.ro/test/FCTEL/rest/descarcare*';
-// SDK >=3.2 maps this stare to UploadStatusValue::NotProcessed; 3.0/3.1 drop it to null.
+// The SDK maps this stare to UploadStatusValue::NotProcessed.
 const NOT_PROCESSED_STARE = 'XML cu erori nepreluat de sistem';
 
 beforeEach(function () {
@@ -146,7 +145,7 @@ describe('checkStatus', function () {
         expect($upload->fresh()->status)->toBe(UploadStatus::Completed);
     });
 
-    it('fails an upload ANAF did not take in, without a download or retry (SDK >=3.2)', function () {
+    it('fails an upload ANAF did not take in, without a download or retry', function () {
         Event::fake([InvoiceFailed::class]);
         Http::fake([STATUS_URL => Http::response(['stare' => NOT_PROCESSED_STARE], 200)]);
 
@@ -162,25 +161,7 @@ describe('checkStatus', function () {
             ->and($upload->errors)->not->toBeEmpty();
         Event::assertDispatched(InvoiceFailed::class, fn (InvoiceFailed $e) => $e->errors !== []);
         Http::assertNotSent(fn ($request) => str_contains($request->url(), '/descarcare'));
-    })->skip(
-        fn () => UploadStatusValue::tryFrom(NOT_PROCESSED_STARE) === null,
-        'Requires an SDK that recognises the NotProcessed stare (>=3.2).',
-    );
-
-    it('keeps parking a not-taken-in upload as indeterminate on SDK 3.0/3.1', function () {
-        Http::fake([STATUS_URL => Http::response(['stare' => NOT_PROCESSED_STARE], 200)]);
-
-        $upload = makeProcessingUpload($this->token);
-
-        $this->downloadService->checkStatus($upload);
-
-        $upload->refresh();
-        expect($upload->status)->toBe(UploadStatus::Failed)
-            ->and($upload->failure_reason)->toBe(FailureReason::Indeterminate);
-    })->skip(
-        fn () => UploadStatusValue::tryFrom(NOT_PROCESSED_STARE) !== null,
-        'Only SDK 3.0/3.1 drop the NotProcessed stare to null.',
-    );
+    });
 });
 
 describe('downloadResponse', function () {

@@ -286,7 +286,7 @@ This job handles the full upload for one invoice:
 2. **XML generation** — Calls \`UblBuilder\` to generate UBL 2.1 XML from \`InvoiceData\`
 3. **Store XML** — Saves generated XML to configured storage disk/path
 4. **Upload to ANAF** — Calls \`EFacturaClient::uploadDocument()\` (or \`uploadB2CDocument()\` when the upload is B2C) with concurrent-safe token handling via \`TokenService::executeWithClient()\`
-5. **Success** — Marks upload as \`Processing\` and stores the ANAF **\`upload_index\`** (the \`indexIncarcare\` returned by the upload call). The \`download_id\` is **not** set yet — it arrives later, from \`CheckUploadStatuses\`
+5. **Success** — When the answer carries a numeric \`indexIncarcare\`, marks upload as \`Processing\` and stores it as the ANAF **\`upload_index\`**, whatever \`ExecutionStatus\` says (ANAF assigns an index only to a document it took in; the status check decides the outcome). The \`download_id\` is **not** set yet — it arrives later, from \`CheckUploadStatuses\`. \`ExecutionStatus=1\` without an index is \`Failed\` / \`validation\`; any other answer without a usable index is \`Failed\` / \`indeterminate\`
 6. Fires \`InvoiceUploaded\` event
 
 ### 4. CheckUploadStatuses (scheduled)
@@ -337,8 +337,8 @@ the **authoritative** classification — never substring-match \`errors\`.
 | \`rate_limited\` | ANAF quota exhausted (pre-flight limiter or a real HTTP 429). Rejected before filing. The row stays **\`Pending\`**, not \`Failed\` | Yes |
 | \`transient\` | Auth/token failure or pre-flight error, provably before ANAF accepted anything | Yes, up to \`jobs.max_transient_attempts\` |
 | \`abandoned\` | Gave up: a \`transient\` failure outlived \`jobs.max_transient_attempts\`, or the \`retryUntil\` window expired while the row was still unsent. Provably never filed, so **no reconciliation needed** | No |
-| \`indeterminate\` | **Delivery UNKNOWN** — worker died around the POST, or 5xx/transport loss. May already be filed | **Never** — \`efactura:reconcile\` |
-| \`validation\` | ANAF rejected the document on its merits, or it was never valid (4xx, bad XML) | No |
+| \`indeterminate\` | **Delivery UNKNOWN** — worker died around the POST, 5xx/transport loss, an unreadable 2xx upload answer, or an upload answer without a usable index and status (non-numeric index, success without an index, no recognised \`ExecutionStatus\`). May already be filed | **Never** — \`efactura:reconcile\` |
+| \`validation\` | ANAF rejected the document on its merits, or it was never valid (4xx, \`ExecutionStatus=1\` without an upload index, bad XML) | No |
 | \`configuration\` | Local problem — no token, model no longer implements the contract | No |
 
 \`FailureReason::isRetryable()\` is true **only** where the document provably never entered ANAF's
@@ -512,6 +512,14 @@ The \`EfacturaToken\` model stores:
 >
 > Reads and writes are transparent: \`$token->access_token\` returns the plaintext credential, and
 > \`TokenService\` needs no changes. Nothing queries these columns by value, so no lookups break.
+
+## Upgrading to v4.0 (upload answer classification)
+
+v4 requires SDK 4.0, which reports an upload \`ExecutionStatus\` that is missing or not exactly 0/1 as
+unknown. An upload answer with a numeric \`indexIncarcare\` is now \`Processing\` with that index
+(it was \`Failed\` / \`validation\`). An unreadable 2xx answer, or one without a usable index and status,
+is now \`Failed\` / \`indeterminate\` (it was \`validation\`): these need \`efactura:reconcile\`, and
+\`queueUpload()\` throws \`DuplicateUploadException\` for them instead of recycling the row. No migration.
 
 ## Upgrading an existing install to v3.0 (token encryption)
 

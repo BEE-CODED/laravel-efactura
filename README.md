@@ -2,6 +2,24 @@
 
 A Laravel package that wraps [bee-coded/laravel-efactura-sdk](https://packagist.org/packages/bee-coded/laravel-efactura-sdk) to provide token storage, job scheduling, and easy model integration for Romanian e-Factura (ANAF SPV) compliance.
 
+## Upgrading to v4.0
+
+v4 requires `bee-coded/laravel-efactura-sdk` 4.0, which reports an upload answer whose
+`ExecutionStatus` is missing or not exactly 0/1 as unknown instead of guessing.
+
+Two kinds of upload answer used to be recorded as a rejection (`failure_reason = validation`) and
+are now recorded differently:
+
+- an answer that carries a numeric `index_incarcare` is `Processing` with that index and fires
+  `InvoiceUploaded`, whatever its `ExecutionStatus` says; the normal status check then decides;
+- an answer that does not say whether ANAF took the document in (an unreadable 2xx body, an index
+  that is not numeric, success without an index, no recognised status) is `Failed` with
+  `failure_reason = indeterminate` and fires `InvoiceFailed`.
+
+Those indeterminate uploads now need [reconciliation](#reconciliation-indeterminate-uploads):
+`queueUpload()` refuses them with `DuplicateUploadException` instead of recycling them, because
+re-sending could file the invoice twice. No migration is needed.
+
 ## Upgrading to v3.0 — read before deploying
 
 v3 encrypts the ANAF credentials already in your database and adds a unique index to
@@ -254,7 +272,7 @@ Your `APP_KEY` was never load-bearing for e-Factura before. It is now.
 
 - PHP 8.4+
 - Laravel 11.x, 12.x, or 13.x
-- `bee-coded/laravel-efactura-sdk` ^3.0 (installed automatically)
+- `bee-coded/laravel-efactura-sdk` ^4.0 (installed automatically)
 - ANAF SPV OAuth credentials
 - A stable, backed-up `APP_KEY` — it encrypts the stored ANAF credentials
 - A shared, persistent cache store (redis, memcached, database — **not `array`**), for the OAuth
@@ -953,15 +971,17 @@ Pending → Uploading → Processing → Completed
 ## Reconciliation (indeterminate uploads)
 
 Some failures leave delivery genuinely **unknown**: the worker died around the POST (job timeout,
-SIGKILL, deploy), or the transport failed ambiguously (5xx, dropped connection). ANAF may or may not
-have filed the document.
+SIGKILL, deploy), the transport failed ambiguously (5xx, dropped connection), ANAF sent an
+unreadable 2xx upload answer, or its answer had no usable index and status (a non-numeric index,
+success without an index, no recognised status). ANAF may or may not have filed the document. An
+answer with a numeric index is not one of these: it is polled like any other upload.
 
 These are parked as `Failed` with `failure_reason = indeterminate` and are **never re-submitted
 automatically** — re-sending would risk double-filing a legal invoice. `queueUpload()` also refuses
 to recycle such a row, throwing `DuplicateUploadException`.
 
 Resolving them requires a human, because ANAF's message listing carries no invoice number to match
-on and a stranded upload never received an `index_incarcare`:
+on and an indeterminate upload has no usable `index_incarcare`:
 
 ```bash
 # What needs checking, with the CUI + claim time to search SPV around

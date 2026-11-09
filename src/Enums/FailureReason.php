@@ -45,8 +45,9 @@ enum FailureReason: string
 
     /**
      * We do not know whether ANAF filed the document. The process died after the
-     * claim (job timeout / SIGKILL), or the transport failed in a way that cannot
-     * distinguish "never arrived" from "arrived and the response was lost".
+     * claim (job timeout / SIGKILL), the transport failed in a way that cannot
+     * distinguish "never arrived" from "arrived and the response was lost", or ANAF's
+     * answer did not say (an unreadable 2xx body, an index or status that cannot be used).
      *
      * NEVER auto-resubmitted. Requires human reconciliation against ANAF.
      */

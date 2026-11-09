@@ -193,7 +193,7 @@ describe('UploadService', function () {
                     return true;
                 }
 
-                public string $indexIncarcare = 'INDEX123';
+                public string $indexIncarcare = '5001234';
             };
 
             $this->tokenService->shouldReceive('executeWithClient')
@@ -204,7 +204,7 @@ describe('UploadService', function () {
 
             $this->upload->refresh();
             expect($this->upload->status)->toBe(UploadStatus::Processing)
-                ->and($this->upload->upload_index)->toBe('INDEX123')
+                ->and($this->upload->upload_index)->toBe('5001234')
                 ->and($this->upload->uploaded_at)->not->toBeNull()
                 ->and($this->upload->xml_path)->not->toBeNull();
 
@@ -229,6 +229,13 @@ describe('UploadService', function () {
                 {
                     return false;
                 }
+
+                public function isFailed(): bool
+                {
+                    return true;
+                }
+
+                public ?string $indexIncarcare = null;
 
                 public array $errors = ['Validation error', 'Another error'];
             };
@@ -524,7 +531,7 @@ describe('UploadService', function () {
                     return true;
                 }
 
-                public string $indexIncarcare = 'INDEX';
+                public string $indexIncarcare = '5001235';
             };
 
             $this->tokenService->shouldReceive('getToken')->andReturn($this->token);

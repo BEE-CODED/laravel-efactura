@@ -185,7 +185,12 @@ class UploadService
         }
 
         // A failed upload is provably not filed (indeterminate is excluded above), so
-        // the row can be recycled for a fresh attempt.
+        // the row can be recycled for a fresh attempt. That holds because every other
+        // reason is recorded only on proof: the document never left (pre-transmission,
+        // rate limit, configuration) or ANAF refused it (a 4xx, an explicit
+        // ExecutionStatus=1 without an upload index, a rejected status poll). Any answer
+        // that proves neither — 5xx, transport loss, an unreadable 2xx body, an index or
+        // status that cannot be used — is recorded Indeterminate by transmit().
         $existing->update([
             'efactura_token_id' => $tokenId,
             'status' => UploadStatus::Pending,
@@ -433,18 +438,43 @@ class UploadService
                 }
             );
 
-            if ($response->isSuccessful()) {
-                $this->markUploadAsProcessing($upload, $response->indexIncarcare);
+            $index = $response->indexIncarcare;
+
+            // ANAF assigns an upload index only to a document it took in, so a usable index
+            // means it is in the pipeline whatever ExecutionStatus says. Polling is read-only
+            // and decides the outcome (including a rejection).
+            if ($index !== null && preg_match('/^[0-9]{1,64}$/D', $index) === 1) {
+                $this->markUploadAsProcessing($upload, $index);
                 event(new InvoiceUploaded($upload));
 
                 return;
             }
 
-            // ANAF answered, and answered "no". That is a verdict on the document.
+            // ANAF explicitly answered ExecutionStatus=1 and assigned no index: a verdict on
+            // the document, which was not taken in.
+            if ($index === null && $response->isFailed()) {
+                $this->failTerminally(
+                    $upload,
+                    $response->errors ?? ['Unknown error'],
+                    FailureReason::Validation
+                );
+
+                return;
+            }
+
+            // Every other answer does not say whether the document was taken in: an index
+            // that cannot be polled, success without an index, or no recognised status.
+            // Re-sending could DOUBLE-FILE it, so it is parked for reconciliation.
+            Log::error('EFactura: Upload answer has no usable index or status', [
+                'upload_id' => $upload->id,
+                'upload_index' => $index,
+            ]);
+
+            // The "outcome unknown" warning leads, so ANAF's text is never read as a rejection.
             $this->failTerminally(
                 $upload,
-                $response->errors ?? ['Unknown error'],
-                FailureReason::Validation
+                [__('efactura::messages.upload_outcome_unknown'), ...array_values(array_filter($response->errors ?? [], fn (string $error): bool => trim($error) !== ''))],
+                FailureReason::Indeterminate
             );
         } catch (RateLimitExceededException $e) {
             // The SDK's CLIENT-SIDE pre-flight limiter refused to make the call.
@@ -528,20 +558,22 @@ class UploadService
             return;
         }
 
-        // Two shapes arrive here, and both are ambiguous — ANAF may have accepted the
-        // document and then failed to tell us — so neither may be auto-resubmitted:
+        // Three shapes arrive here, and all are ambiguous — ANAF may have accepted the
+        // document and then failed to tell us — so none may be auto-resubmitted:
         //
         //   - a 5xx RESPONSE, which the SDK collapses to 502
         //     (`$response->status() >= 500 ? 502 : $response->status()`);
         //   - a transport failure with no response at all, which the SDK reports as 500
-        //     (`new ApiException($exception->getMessage(), 500, ...)` in BaseApiClient).
+        //     (`new ApiException($exception->getMessage(), 500, ...)` in BaseApiClient);
+        //   - a 2xx response whose body the SDK could not read ("Unable to parse upload
+        //     response", carrying the 2xx status): the POST was delivered and may be filed.
         //
         // There is deliberately no `statusCode === 0` branch: nothing in the SDK ever
         // produces one. Every `new ApiException(` passes 500, 502, or $response->status(),
         // and the constructor's $statusCode has no default — so that branch was dead code,
         // and the comment claiming transport failures arrive as 0 was simply false.
-        if ($e->statusCode >= 500) {
-            Log::error('EFactura: Upload failed with an indeterminate transport error', [
+        if ($e->statusCode >= 500 || ($e->statusCode >= 200 && $e->statusCode < 300)) {
+            Log::error('EFactura: Upload failed with an indeterminate transport error or unreadable answer', [
                 'upload_id' => $upload->id,
                 'status_code' => $e->statusCode,
                 'error' => $e->getMessage(),

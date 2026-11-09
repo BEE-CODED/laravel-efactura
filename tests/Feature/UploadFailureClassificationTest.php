@@ -13,6 +13,8 @@ use BeeCoded\EFactura\Enums\FailureReason;
 use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Events\InvoiceFailed;
 use BeeCoded\EFactura\Events\InvoiceRateLimited;
+use BeeCoded\EFactura\Events\InvoiceUploaded;
+use BeeCoded\EFactura\Exceptions\DuplicateUploadException;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\UploadService;
@@ -349,4 +351,113 @@ describe('failure classification is carried in a dedicated column', function () 
         expect($upload->status)->toBe(UploadStatus::Failed)
             ->and($upload->failure_reason)->toBe(FailureReason::Validation);
     });
+});
+
+/**
+ * ANAF's upload answer reached us but does not prove the document was NOT taken in.
+ * Recording it as a rejection (Validation) let queueUpload() recycle the row and file the
+ * invoice twice; it must be parked for reconciliation instead.
+ */
+describe('an upload answer that does not say whether the document was taken in', function () {
+    it('parks an unreadable 2xx body as indeterminate and refuses to recycle it', function (string $body) {
+        Event::fake([InvoiceFailed::class, InvoiceUploaded::class]);
+        Http::fake([UPLOAD_URL => Http::response($body, 200)]);
+
+        $upload = makePendingUpload();
+        $this->uploadService->processUpload($upload);
+
+        $upload->refresh();
+        expect($upload->status)->toBe(UploadStatus::Failed)
+            ->and($upload->failure_reason)->toBe(FailureReason::Indeterminate)
+            ->and($upload->upload_index)->toBeNull();
+        Event::assertDispatched(InvoiceFailed::class);
+        Event::assertNotDispatched(InvoiceUploaded::class);
+
+        expect(fn () => $this->uploadService->queueUpload($this->invoice))
+            ->toThrow(DuplicateUploadException::class);
+        expect($upload->fresh()->failure_reason)->toBe(FailureReason::Indeterminate);
+    })->with([
+        'HTML page' => '<!DOCTYPE html><html><head><title>Eroare</title></head><body><h1>Serviciu indisponibil</h1></body></html>',
+        'malformed XML' => '<?xml version="1.0" encoding="UTF-8"?><header ExecutionStatus="0" index_incarcare="12345"',
+    ]);
+
+    it('parks an answer without a usable index or status as indeterminate', function (string $body, array $expectedErrors) {
+        Event::fake([InvoiceFailed::class, InvoiceUploaded::class]);
+        Http::fake([UPLOAD_URL => Http::response($body, 200)]);
+
+        $upload = makePendingUpload();
+        $this->uploadService->processUpload($upload);
+
+        $upload->refresh();
+        expect($upload->status)->toBe(UploadStatus::Failed)
+            ->and($upload->failure_reason)->toBe(FailureReason::Indeterminate)
+            ->and($upload->upload_index)->toBeNull()
+            ->and($upload->errors)->toBe($expectedErrors);
+        Event::assertDispatched(InvoiceFailed::class, fn (InvoiceFailed $e) => $e->errors === $expectedErrors);
+        Event::assertNotDispatched(InvoiceUploaded::class);
+    })->with([
+        'success with a non-numeric index' => [
+            '<header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" dateResponse="202407171230" ExecutionStatus="0" index_incarcare="abc"/>',
+            fn () => [__('efactura::messages.upload_outcome_unknown')],
+        ],
+        'success with a trailing-newline index' => [
+            json_encode(['ExecutionStatus' => '0', 'index_incarcare' => "12345\n"]),
+            fn () => [__('efactura::messages.upload_outcome_unknown')],
+        ],
+        'success with an empty index' => [
+            json_encode(['ExecutionStatus' => '0', 'index_incarcare' => '']),
+            fn () => [__('efactura::messages.upload_outcome_unknown')],
+        ],
+        'success without an index' => [
+            '<header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" dateResponse="202407171230" ExecutionStatus="0"/>',
+            fn () => [__('efactura::messages.upload_outcome_unknown')],
+        ],
+        'errors without a status' => [
+            json_encode(['Errors' => ['Eroare la procesare', '']]),
+            fn () => [__('efactura::messages.upload_outcome_unknown'), 'Eroare la procesare'],
+        ],
+        'an unrecognised status without an index' => [
+            json_encode(['ExecutionStatus' => '9']),
+            fn () => [__('efactura::messages.upload_outcome_unknown')],
+        ],
+    ]);
+
+    it('still rejects an explicit ExecutionStatus=1 without an index as a validation failure', function () {
+        Http::fake([UPLOAD_URL => Http::response(json_encode([
+            'ExecutionStatus' => '1',
+            'Errors' => ['Fisierul nu respecta schema'],
+        ]), 200)]);
+
+        $upload = makePendingUpload();
+        $this->uploadService->processUpload($upload);
+
+        $upload->refresh();
+        expect($upload->failure_reason)->toBe(FailureReason::Validation)
+            ->and($upload->errors)->toBe(['Fisierul nu respecta schema']);
+    });
+});
+
+/**
+ * ANAF assigns an upload index only to a document it took in. Dropping that index and
+ * recording a rejection lost the only handle on a filed invoice.
+ */
+describe('an upload answer carrying a usable index', function () {
+    it('is processing with that index whatever ExecutionStatus says', function (string $body) {
+        Event::fake([InvoiceFailed::class, InvoiceUploaded::class]);
+        Http::fake([UPLOAD_URL => Http::response($body, 200)]);
+
+        $upload = makePendingUpload();
+        $this->uploadService->processUpload($upload);
+
+        $upload->refresh();
+        expect($upload->status)->toBe(UploadStatus::Processing)
+            ->and($upload->upload_index)->toBe('12345')
+            ->and($upload->failure_reason)->toBeNull();
+        Event::assertDispatched(InvoiceUploaded::class);
+        Event::assertNotDispatched(InvoiceFailed::class);
+    })->with([
+        'JSON without ExecutionStatus' => json_encode(['index_incarcare' => '12345']),
+        'XML header without ExecutionStatus' => '<header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" dateResponse="202407171230" index_incarcare="12345"/>',
+        'XML header with ExecutionStatus=1' => '<header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" dateResponse="202407171230" ExecutionStatus="1" index_incarcare="12345"/>',
+    ]);
 });

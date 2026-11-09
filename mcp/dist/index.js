@@ -21272,7 +21272,7 @@ This job handles the full upload for one invoice:
 2. **XML generation** \u2014 Calls \`UblBuilder\` to generate UBL 2.1 XML from \`InvoiceData\`
 3. **Store XML** \u2014 Saves generated XML to configured storage disk/path
 4. **Upload to ANAF** \u2014 Calls \`EFacturaClient::uploadDocument()\` (or \`uploadB2CDocument()\` when the upload is B2C) with concurrent-safe token handling via \`TokenService::executeWithClient()\`
-5. **Success** \u2014 Marks upload as \`Processing\` and stores the ANAF **\`upload_index\`** (the \`indexIncarcare\` returned by the upload call). The \`download_id\` is **not** set yet \u2014 it arrives later, from \`CheckUploadStatuses\`
+5. **Success** \u2014 When the answer carries a numeric \`indexIncarcare\`, marks upload as \`Processing\` and stores it as the ANAF **\`upload_index\`**, whatever \`ExecutionStatus\` says (ANAF assigns an index only to a document it took in; the status check decides the outcome). The \`download_id\` is **not** set yet \u2014 it arrives later, from \`CheckUploadStatuses\`. \`ExecutionStatus=1\` without an index is \`Failed\` / \`validation\`; any other answer without a usable index is \`Failed\` / \`indeterminate\`
 6. Fires \`InvoiceUploaded\` event
 
 ### 4. CheckUploadStatuses (scheduled)
@@ -21323,8 +21323,8 @@ the **authoritative** classification \u2014 never substring-match \`errors\`.
 | \`rate_limited\` | ANAF quota exhausted (pre-flight limiter or a real HTTP 429). Rejected before filing. The row stays **\`Pending\`**, not \`Failed\` | Yes |
 | \`transient\` | Auth/token failure or pre-flight error, provably before ANAF accepted anything | Yes, up to \`jobs.max_transient_attempts\` |
 | \`abandoned\` | Gave up: a \`transient\` failure outlived \`jobs.max_transient_attempts\`, or the \`retryUntil\` window expired while the row was still unsent. Provably never filed, so **no reconciliation needed** | No |
-| \`indeterminate\` | **Delivery UNKNOWN** \u2014 worker died around the POST, or 5xx/transport loss. May already be filed | **Never** \u2014 \`efactura:reconcile\` |
-| \`validation\` | ANAF rejected the document on its merits, or it was never valid (4xx, bad XML) | No |
+| \`indeterminate\` | **Delivery UNKNOWN** \u2014 worker died around the POST, 5xx/transport loss, an unreadable 2xx upload answer, or an upload answer without a usable index and status (non-numeric index, success without an index, no recognised \`ExecutionStatus\`). May already be filed | **Never** \u2014 \`efactura:reconcile\` |
+| \`validation\` | ANAF rejected the document on its merits, or it was never valid (4xx, \`ExecutionStatus=1\` without an upload index, bad XML) | No |
 | \`configuration\` | Local problem \u2014 no token, model no longer implements the contract | No |
 
 \`FailureReason::isRetryable()\` is true **only** where the document provably never entered ANAF's
@@ -21497,6 +21497,14 @@ The \`EfacturaToken\` model stores:
 >
 > Reads and writes are transparent: \`$token->access_token\` returns the plaintext credential, and
 > \`TokenService\` needs no changes. Nothing queries these columns by value, so no lookups break.
+
+## Upgrading to v4.0 (upload answer classification)
+
+v4 requires SDK 4.0, which reports an upload \`ExecutionStatus\` that is missing or not exactly 0/1 as
+unknown. An upload answer with a numeric \`indexIncarcare\` is now \`Processing\` with that index
+(it was \`Failed\` / \`validation\`). An unreadable 2xx answer, or one without a usable index and status,
+is now \`Failed\` / \`indeterminate\` (it was \`validation\`): these need \`efactura:reconcile\`, and
+\`queueUpload()\` throws \`DuplicateUploadException\` for them instead of recycling the row. No migration.
 
 ## Upgrading an existing install to v3.0 (token encryption)
 
@@ -22635,9 +22643,9 @@ public function __construct(public EfacturaUpload $upload, public array $errors 
 
 | Source | Situation | \`failure_reason\` |
 |--------|-----------|------------------|
-| \`UploadService::failTerminally()\` | ANAF rejected the document, XML/model invalid, no token, 4xx, or an ambiguous 5xx/transport loss | \`validation\`, \`configuration\`, \`indeterminate\` |
-| \`DownloadService::checkStatus()\` (i.e. \`CheckUploadStatuses\`) | ANAF processed the document and rejected it on its merits; or (SDK 3.2+) ANAF gave a final rejection without a response archive ("XML cu erori nepreluat de sistem") \u2014 no download, never resubmitted automatically | \`validation\` |
-| \`DownloadService::checkStatus()\` (via \`parkUnrecognisableStatus()\`) | ANAF returned no recognisable status for the upload index (an unknown index, or on SDK 3.0/3.1 the "XML cu erori nepreluat de sistem" status, which those versions cannot read) \u2014 delivery UNKNOWN | \`indeterminate\` |
+| \`UploadService::failTerminally()\` | ANAF rejected the document (4xx, or \`ExecutionStatus=1\` without an upload index), XML/model invalid, no token; or delivery UNKNOWN: an ambiguous 5xx/transport loss, an unreadable 2xx upload answer, or an answer without a usable index and status (a non-numeric index, success without an index, no recognised status) | \`validation\`, \`configuration\`, \`indeterminate\` |
+| \`DownloadService::checkStatus()\` (i.e. \`CheckUploadStatuses\`) | ANAF processed the document and rejected it on its merits; or ANAF gave a final rejection without a response archive ("XML cu erori nepreluat de sistem") \u2014 no download, never resubmitted automatically | \`validation\` |
+| \`DownloadService::checkStatus()\` (via \`parkUnrecognisableStatus()\`) | ANAF returned no recognisable status for the upload index (e.g. an unknown index) \u2014 delivery UNKNOWN | \`indeterminate\` |
 | \`ProcessSingleUpload::failed()\` / \`SweepStaleUploads\` (via \`parkStrandedUploadAsIndeterminate()\`) | The worker died around the POST \u2014 delivery UNKNOWN | \`indeterminate\` |
 | \`ProcessSingleUpload::failed()\` (via \`abandonUnsentUpload()\`) | The \`retryUntil\` deadline expired while the row was still waiting to be sent \u2014 it never reached ANAF | \`abandoned\` |
 | \`ProcessSingleUpload\` transient cap exhausted (via \`abandonFailure()\`) | A \`transient\` failure did not clear within \`jobs.max_transient_attempts\` | \`abandoned\` |
@@ -23013,7 +23021,7 @@ Processes one upload end-to-end:
 3. **XML generation** \u2014 Generates UBL 2.1 XML from the uploadable model's \`toEfacturaData()\`
 4. **Store XML** \u2014 Persists XML to storage disk
 5. **Upload** \u2014 Calls \`EFacturaClient::uploadDocument()\` \u2014 or \`uploadB2CDocument()\` when \`is_b2c\` is set \u2014 via \`TokenService::executeWithClient()\` for concurrent-safe token handling
-6. **Success** \u2014 Marks \`Processing\` and stores the \`upload_index\` (ANAF's \`indexIncarcare\`); fires \`InvoiceUploaded\`. **\`download_id\` is still null here** \u2014 it is only set later, by \`CheckUploadStatuses\`, when ANAF reports the document ready
+6. **Success** \u2014 A numeric \`indexIncarcare\` in the answer marks \`Processing\` and stores it as \`upload_index\`, whatever \`ExecutionStatus\` says; fires \`InvoiceUploaded\`. Without a usable index, \`ExecutionStatus=1\` is \`Failed\` / \`validation\` and anything else (including an unreadable 2xx body) is \`Failed\` / \`indeterminate\`. **\`download_id\` is still null here** \u2014 it is only set later, by \`CheckUploadStatuses\`, when ANAF reports the document ready
 
 Steps 1\u20132 are in that order: the pre-flight runs in \`handle()\`, *before* \`UploadService::processUpload()\` claims the row. A quota-exhausted release therefore never touches the upload.
 

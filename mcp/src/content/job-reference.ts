@@ -202,7 +202,7 @@ Processes one upload end-to-end:
 3. **XML generation** — Generates UBL 2.1 XML from the uploadable model's \`toEfacturaData()\`
 4. **Store XML** — Persists XML to storage disk
 5. **Upload** — Calls \`EFacturaClient::uploadDocument()\` — or \`uploadB2CDocument()\` when \`is_b2c\` is set — via \`TokenService::executeWithClient()\` for concurrent-safe token handling
-6. **Success** — Marks \`Processing\` and stores the \`upload_index\` (ANAF's \`indexIncarcare\`); fires \`InvoiceUploaded\`. **\`download_id\` is still null here** — it is only set later, by \`CheckUploadStatuses\`, when ANAF reports the document ready
+6. **Success** — A numeric \`indexIncarcare\` in the answer marks \`Processing\` and stores it as \`upload_index\`, whatever \`ExecutionStatus\` says; fires \`InvoiceUploaded\`. Without a usable index, \`ExecutionStatus=1\` is \`Failed\` / \`validation\` and anything else (including an unreadable 2xx body) is \`Failed\` / \`indeterminate\`. **\`download_id\` is still null here** — it is only set later, by \`CheckUploadStatuses\`, when ANAF reports the document ready
 
 Steps 1–2 are in that order: the pre-flight runs in \`handle()\`, *before* \`UploadService::processUpload()\` claims the row. A quota-exhausted release therefore never touches the upload.
 

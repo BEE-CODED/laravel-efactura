@@ -107,9 +107,9 @@ public function __construct(public EfacturaUpload $upload, public array $errors 
 
 | Source | Situation | \`failure_reason\` |
 |--------|-----------|------------------|
-| \`UploadService::failTerminally()\` | ANAF rejected the document, XML/model invalid, no token, 4xx, or an ambiguous 5xx/transport loss | \`validation\`, \`configuration\`, \`indeterminate\` |
-| \`DownloadService::checkStatus()\` (i.e. \`CheckUploadStatuses\`) | ANAF processed the document and rejected it on its merits; or (SDK 3.2+) ANAF gave a final rejection without a response archive ("XML cu erori nepreluat de sistem") — no download, never resubmitted automatically | \`validation\` |
-| \`DownloadService::checkStatus()\` (via \`parkUnrecognisableStatus()\`) | ANAF returned no recognisable status for the upload index (an unknown index, or on SDK 3.0/3.1 the "XML cu erori nepreluat de sistem" status, which those versions cannot read) — delivery UNKNOWN | \`indeterminate\` |
+| \`UploadService::failTerminally()\` | ANAF rejected the document (4xx, or \`ExecutionStatus=1\` without an upload index), XML/model invalid, no token; or delivery UNKNOWN: an ambiguous 5xx/transport loss, an unreadable 2xx upload answer, or an answer without a usable index and status (a non-numeric index, success without an index, no recognised status) | \`validation\`, \`configuration\`, \`indeterminate\` |
+| \`DownloadService::checkStatus()\` (i.e. \`CheckUploadStatuses\`) | ANAF processed the document and rejected it on its merits; or ANAF gave a final rejection without a response archive ("XML cu erori nepreluat de sistem") — no download, never resubmitted automatically | \`validation\` |
+| \`DownloadService::checkStatus()\` (via \`parkUnrecognisableStatus()\`) | ANAF returned no recognisable status for the upload index (e.g. an unknown index) — delivery UNKNOWN | \`indeterminate\` |
 | \`ProcessSingleUpload::failed()\` / \`SweepStaleUploads\` (via \`parkStrandedUploadAsIndeterminate()\`) | The worker died around the POST — delivery UNKNOWN | \`indeterminate\` |
 | \`ProcessSingleUpload::failed()\` (via \`abandonUnsentUpload()\`) | The \`retryUntil\` deadline expired while the row was still waiting to be sent — it never reached ANAF | \`abandoned\` |
 | \`ProcessSingleUpload\` transient cap exhausted (via \`abandonFailure()\`) | A \`transient\` failure did not clear within \`jobs.max_transient_attempts\` | \`abandoned\` |
