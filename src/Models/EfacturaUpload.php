@@ -46,6 +46,7 @@ use Illuminate\Support\Carbon;
  * @property-read Model $uploadable
  *
  * @method static Builder|static pending()
+ * @method static Builder|static awaitingDispatch()
  * @method static Builder|static processing()
  * @method static Builder|static needsStatusCheck()
  * @method static Builder|static needsResponseDownload()
@@ -133,6 +134,26 @@ class EfacturaUpload extends Model
     public function scopePending(Builder $query): Builder
     {
         return $query->where('status', UploadStatus::Pending);
+    }
+
+    /**
+     * Pending uploads no job is on: no failure_reason (a rate-limited row's job still owns
+     * it), and untouched for longer than a transient release plus a minute. A job's
+     * resetForRetry() clears the reason while the job waits out that release, a job
+     * released by the quota pre-check touches the row, and a freshly queued row may have
+     * its own job queued; a second job would double the transient cap. A new row is
+     * therefore taken only after the same window.
+     *
+     * shortcut: a released job a busy queue starts more than a minute late can meet a second
+     * one; both are safe (the claim is atomic). Raise the margin if queues lag longer.
+     */
+    public function scopeAwaitingDispatch(Builder $query): Builder
+    {
+        $releasedBefore = now()->subSeconds((int) config('efactura.jobs.transient_retry_delay_seconds', 30) + 60);
+
+        return $query->where('status', UploadStatus::Pending)
+            ->whereNull('failure_reason')
+            ->where('updated_at', '<', $releasedBefore);
     }
 
     public function scopeProcessing(Builder $query): Builder

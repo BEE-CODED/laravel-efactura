@@ -12,10 +12,12 @@
 namespace BeeCoded\EFactura\Services;
 
 use BeeCoded\EFactura\Events\TokenRefreshed;
+use BeeCoded\EFactura\Exceptions\RefreshCooldownException;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFacturaSdk\Contracts\AnafAuthenticatorInterface;
 use BeeCoded\EFacturaSdk\Data\Auth\AuthUrlSettingsData;
 use BeeCoded\EFacturaSdk\Data\Auth\OAuthTokensData;
+use BeeCoded\EFacturaSdk\Exceptions\AuthenticationException;
 use BeeCoded\EFacturaSdk\Facades\EFacturaSdkAuth;
 use BeeCoded\EFacturaSdk\Services\ApiClients\EFacturaClient;
 use BeeCoded\EFacturaSdk\Support\Validators\VatNumberValidator;
@@ -32,6 +34,12 @@ class TokenService
      * If a token expires within this window, operations acquire a lock to safely handle refresh.
      */
     private const TOKEN_EXPIRY_BUFFER_SECONDS = 120; // 2 minutes
+
+    /**
+     * How long a grant whose refresh ANAF refused (HTTP 400/401) is not offered again.
+     * Keyed by the refresh token, so a new grant is tried at once.
+     */
+    private const REFUSED_REFRESH_COOLDOWN_SECONDS = 900; // 15 minutes
 
     /**
      * Get active token for CUI.
@@ -216,6 +224,10 @@ class TokenService
      * invalidate the grant the sibling just obtained, forcing the company to
      * re-authorise. The SDK only adopts what we return if it is genuinely
      * fresher, so a client that minted its own tokens is not dragged backwards.
+     *
+     * The tokenPersister closure is the write side: the SDK calls it with the
+     * grant it just minted while it still holds that lock, so the next worker to
+     * take the lock reloads the new refresh token instead of spending the old one.
      */
     public function createClient(EfacturaToken $token): EFacturaClient
     {
@@ -223,7 +235,36 @@ class TokenService
             $token->getVatNumber(),
             $token->toOAuthTokensData(),
             tokenReloader: fn (): ?OAuthTokensData => $this->reloadTokensFromStore($token),
+            tokenPersister: fn (OAuthTokensData $tokens) => $this->persistClientRefresh($token, $tokens),
         );
+    }
+
+    /**
+     * Save a grant the SDK refreshed, from inside the SDK's refresh lock.
+     *
+     * Never throws, so the call goes on: the save is tried again after it
+     * (executeWithClient(), or handleClientTokenRefresh() for a hand-driven client),
+     * and that attempt reports a failure.
+     */
+    protected function persistClientRefresh(EfacturaToken $token, OAuthTokensData $tokens): void
+    {
+        try {
+            if (!$this->saveRefreshedTokens($token, $tokens)) {
+                return;
+            }
+        } catch (\Throwable $e) {
+            Log::warning('EFactura: refreshed token could not be saved under the refresh lock; retried after the call', [
+                'cui' => $token->cui,
+                'exception' => $e::class,
+            ]);
+
+            return;
+        }
+
+        rescue(function () use ($token) {
+            $token->refresh();
+            event(new TokenRefreshed($token));
+        });
     }
 
     /**
@@ -247,8 +288,9 @@ class TokenService
      *    - If still expiring: refresh it explicitly, then release the lock
      *    - If already refreshed by another process: just release the lock
      *    Either way the operation itself runs AFTER the lock is released.
-     * 3. After the API call (also when it threw): if the SDK refreshed, persist the new
-     *    grant with a conditional write, then record last_used_at
+     * 3. If the SDK refreshes during the call, it saves the grant under its own lock
+     *    (createClient()'s tokenPersister). After the call (also when it threw) the same
+     *    conditional write is tried again, a no-op once stored, then last_used_at is recorded
      *
      * This allows parallel API calls when tokens are fresh, while serializing only
      * the refresh itself. The lock is never held across the API operation, because
@@ -266,11 +308,19 @@ class TokenService
      *
      * @throws LockTimeoutException If the refresh lock cannot be acquired within 30 seconds
      * @throws \RuntimeException If the token has been deactivated
+     * @throws RefreshCooldownException If ANAF refused to refresh this grant within the last
+     *                                  15 minutes (nothing is sent)
+     * @throws AuthenticationException If the refresh itself fails
      * @throws \Throwable Whatever the operation throws, unchanged; or a failed save of a
      *                    token refreshed before the operation (nothing was sent yet)
      */
     public function executeWithClient(EfacturaToken $token, callable $operation): mixed
     {
+        // Every call, not only the refresh path: a deactivated grant must not file or poll.
+        if (!$token->is_active) {
+            throw new \RuntimeException("Token for CUI {$token->cui} has been deactivated");
+        }
+
         // Check if token is expiring soon and needs protected refresh
         if ($token->isExpiringSoon(self::TOKEN_EXPIRY_BUFFER_SECONDS)) {
             return $this->executeWithRefreshLock($token, $operation);
@@ -302,6 +352,10 @@ class TokenService
 
     /**
      * Save a grant the SDK refreshed during the call, then record last_used_at.
+     *
+     * The tokenPersister has normally stored the grant already; this write then matches
+     * no row (an equal expiry loses) and fires nothing. It stores the grant only when the
+     * persister's save failed.
      *
      * Never throws: this runs after ANAF has answered (or failed), and a bookkeeping
      * failure that replaced the result would lose, for example, an upload index ANAF
@@ -368,14 +422,22 @@ class TokenService
      */
     protected function executeWithRefreshLock(EfacturaToken $token, callable $operation): mixed
     {
+        // Before the lock, so every later row of a run skips a dead grant without asking ANAF.
+        // Keyed on the stored grant, so a re-authorisation mid-run is tried at once.
+        $token->refresh();
+        $this->guardRefreshCooldown($token);
+
         $lockKey = "efactura:token_refresh:{$token->cui}";
-        $lock = Cache::lock($lockKey, 120); // 2 minute lock timeout
+        // Outlives the refresh request, as the SDK's own lock does (same timeout, same margin).
+        $lock = Cache::lock($lockKey, (int) ceil(EFacturaClient::getTimeoutDuration()) + 30);
 
         try {
             $lock->block(30); // Wait up to 30 seconds for lock
 
             // Reload token from DB - another process might have refreshed it
             $token->refresh();
+            // A worker that held the lock while we waited may have been refused: don't ask again.
+            $this->guardRefreshCooldown($token);
 
             if (!$token->is_active) {
                 throw new \RuntimeException("Token for CUI {$token->cui} has been deactivated");
@@ -384,7 +446,21 @@ class TokenService
             // Re-check if token still needs refresh after reload.
             // If another process already refreshed it, there is nothing to do here.
             if ($token->isExpiringSoon(self::TOKEN_EXPIRY_BUFFER_SECONDS)) {
-                $this->refreshToken($token);
+                try {
+                    $this->refreshToken($token);
+                } catch (AuthenticationException $e) {
+                    // ANAF refused this grant. Not deactivated: it may be a passing fault.
+                    if (in_array($e->getCode(), [400, 401], true)) {
+                        // The value is the expiry, so a waiting job can sleep exactly that long.
+                        Cache::put(
+                            $this->refusedRefreshKey($token),
+                            now()->addSeconds(self::REFUSED_REFRESH_COOLDOWN_SECONDS)->getTimestamp(),
+                            self::REFUSED_REFRESH_COOLDOWN_SECONDS,
+                        );
+                    }
+
+                    throw $e;
+                }
             }
         } finally {
             // Always release BEFORE running the operation - the SDK needs this key free.
@@ -393,6 +469,44 @@ class TokenService
 
         // Token is fresh now; run the operation without holding the shared key.
         return $this->executeWithoutLock($token, $operation);
+    }
+
+    /**
+     * Seconds left of the cooldown after ANAF refused to refresh this grant (0 when none).
+     *
+     * Read from the token as given, without reloading it: a re-authorised grant read stale
+     * only waits until the next run.
+     */
+    public function refreshCooldownSeconds(EfacturaToken $token): int
+    {
+        try {
+            $until = Cache::get($this->refusedRefreshKey($token));
+        } catch (\Throwable) {
+            // An unreadable token or cache is no cooldown: the call itself reports the failure.
+            return 0;
+        }
+
+        // Redis hands a stored int back as a numeric string.
+        return is_numeric($until) ? max(0, (int) $until - now()->getTimestamp()) : 0;
+    }
+
+    /**
+     * @throws RefreshCooldownException
+     */
+    private function guardRefreshCooldown(EfacturaToken $token): void
+    {
+        if ($this->refreshCooldownSeconds($token) > 0) {
+            throw new RefreshCooldownException(
+                "ANAF refused to refresh the token for CUI {$token->cui} recently; it is not retried "
+                    .'for '.(self::REFUSED_REFRESH_COOLDOWN_SECONDS / 60).' minutes. Re-authorise the company if it keeps failing.',
+                401,
+            );
+        }
+    }
+
+    private function refusedRefreshKey(EfacturaToken $token): string
+    {
+        return "efactura:token_refresh_refused:{$token->getKey()}:".sha1((string) $token->refresh_token);
     }
 
     /**
@@ -468,15 +582,16 @@ class TokenService
      * Handle token refresh after API call.
      * Call this after using a client to persist any refreshed tokens.
      *
-     * For a client you drive yourself (EfacturaManager::client()). executeWithClient()
-     * does not call this: it saves a refresh conditionally, see saveRefreshedTokens().
-     * This method writes unconditionally and lets its exceptions propagate.
+     * For a client you drive yourself (EfacturaManager::client()); executeWithClient()
+     * does not call this. A client from createClient() has normally saved the grant
+     * under the SDK's lock already. This stores it with the same conditional write (only
+     * a fresher grant, never on a deactivated token) and fires TokenRefreshed only if it
+     * stored it. Its exceptions propagate.
      */
     public function handleClientTokenRefresh(EFacturaClient $client, EfacturaToken $token): void
     {
-        if ($client->wasTokenRefreshed()) {
-            $newTokens = $client->getTokens();
-            $this->updateTokenFromOAuth($token, $newTokens);
+        if ($client->wasTokenRefreshed() && $this->saveRefreshedTokens($token, $client->getTokens())) {
+            $token->refresh();
 
             rescue(fn () => event(new TokenRefreshed($token)));
         }

@@ -55,6 +55,10 @@ return [
     |
     | retry_window_hours: How long a single upload job can keep retrying
     |                     before failing permanently (default: 24 hours).
+    |                     RetryRateLimitedUploads re-dispatches a pending
+    |                     rate-limited upload only once it has not changed
+    |                     for this long, and touches it when it does, so a
+    |                     queued re-dispatch is not doubled by later runs.
     | retry_batch_size:   How many failed rate-limited uploads to reset
     |                     per RetryRateLimitedUploads run (default: 250).
     | retry_max_age_days: Don't retry uploads older than this (default: 7 days).
@@ -104,9 +108,10 @@ return [
     |                        How long ProcessSingleUpload waits before re-driving an
     |                        upload that failed transiently (auth/pre-flight blip).
     | max_transient_attempts:
-    |                        How many times a single upload job may be re-driven for
-    |                        a transient failure before it is declared terminal and
-    |                        InvoiceFailed fires. Stops a durable fault (e.g. a
+    |                        How many transient failures a single queued upload job
+    |                        may have before it is declared terminal and InvoiceFailed
+    |                        fires. Counted in the cache for retry_window_hours;
+    |                        rate-limit releases do not count. Stops a durable fault (e.g. a
     |                        revoked token answering 401) from hammering ANAF for
     |                        the whole retry window. Set to 0 to disable the cap.
     | stale_uploading_minutes:
@@ -161,11 +166,19 @@ return [
     |
     | Configure the OAuth callback routes provided by this package.
     |
+    | middleware: Applied to both routes. The default requires a logged-in user,
+    |             but `auth` alone lets ANY logged-in user start an authorization
+    |             for ANY CUI. Add your own check that the user may act for that
+    |             company (for example a `can:` middleware on the `cui` route
+    |             parameter), or disable these routes and run the flow from your
+    |             own controller. The callback also needs the logged-in browser,
+    |             including after the `efactura:auth` command.
+    |
     */
     'routes' => [
         'enabled' => env('EFACTURA_ROUTES_ENABLED', true),
         'prefix' => env('EFACTURA_ROUTES_PREFIX', 'efactura'),
-        'middleware' => ['web'],
+        'middleware' => ['web', 'auth'],
         'success_redirect' => env('EFACTURA_SUCCESS_REDIRECT', '/'),
         'error_redirect' => env('EFACTURA_ERROR_REDIRECT', '/'),
     ],

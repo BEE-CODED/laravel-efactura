@@ -97,8 +97,9 @@ class MessageSyncService
 
         foreach ($response->mesaje ?? [] as $message) {
             // Without an id a message can be neither downloaded nor told apart from
-            // another: upserting it would merge every such message into one row.
-            if ($message->id === null) {
+            // another: upserting it would merge every such message into one row. ANAF ids
+            // are digits; the SDK refuses to download anything else.
+            if ($message->id === null || !ctype_digit($message->id)) {
                 Log::warning('EFactura: ANAF listed a message without a usable id, skipping it', [
                     'cui' => $token->cui,
                     'tip' => $message->tip,
@@ -260,11 +261,13 @@ class MessageSyncService
      */
     protected function determineMessageType(MessageDetailsData $messageData, ?MessageFilter $filter): string
     {
-        $type = match (strtoupper(trim($messageData->tip))) {
+        $tip = strtoupper(trim($messageData->tip));
+
+        // A buyer message's tip comes in variants ("MESAJ CUMPARATOR PRIMIT / ... TRANSMIS").
+        $type = str_starts_with($tip, 'MESAJ CUMPARATOR') ? 'received' : match ($tip) {
             'FACTURA TRIMISA' => 'sent',
             'FACTURA PRIMITA' => 'received',
             'ERORI FACTURA' => 'error',
-            'MESAJ CUMPARATOR' => 'received',
             default => null,
         };
 

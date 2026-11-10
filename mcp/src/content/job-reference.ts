@@ -197,7 +197,7 @@ Preparation (steps 3–4) is strictly **before** anything is transmitted, so a f
 
 **Rate limit handling:** two distinct mechanisms, depending on *when* the limit is hit:
 
-- **Pre-flight (step 1)** — quota already exhausted: the job \`release()\`s itself with a delay matching the bucket reset (min 10s) and returns. The upload row is untouched (stays \`Pending\`), and **no event fires**.
+- **Pre-flight (step 1)** — quota already exhausted: the job \`release()\`s itself with a delay matching the bucket reset (min 10s) and returns. The upload row stays \`Pending\` (v4.0: only its \`updated_at\` is touched, so \`ProcessPendingUploads\` does not add a second job), and **no event fires**.
 - **Mid-call** — the limit is hit during the API call. \`UploadService\` releases the row back to \`Pending\` with \`failure_reason = rate_limited\` and fires **\`InvoiceRateLimited\`** (*not* \`InvoiceFailed\`). \`ProcessSingleUpload\` re-reads the row, sees \`Pending\` / \`rate_limited\`, and \`release(60)\`s itself.
 
 > **Changed in v3.0.0.** The mid-call path used to write a \`RATE_LIMIT_EXCEEDED:\` marker into the
@@ -206,11 +206,13 @@ Preparation (steps 3–4) is strictly **before** anything is transmitted, so a f
 > Also new: a genuine ANAF **HTTP 429** arrives as \`ApiException(429)\` (the SDK's \`isRetryable()\`
 > excludes 429) and is now treated as a rate limit. Before v3 it became a permanent \`Failed\`.
 
-So the job recovers its **own** rate-limited upload. \`RetryRateLimitedUploads\` is the **safety net** for rows stranded in \`Failed\` — e.g. the worker died between the mark and the reset, or the retry window expired.
+So the job recovers its **own** rate-limited upload. \`RetryRateLimitedUploads\` is the **safety net** for rows stranded in \`Failed\` — e.g. the worker died between the mark and the reset, or the retry window expired — and for a \`pending\` / \`rate_limited\` row that has not changed for \`rate_limit.retry_window_hours\` (v4.0: a younger one may still have its job, so it is left alone). \`ProcessPendingUploads\` never dispatches a \`pending\` row with a \`failure_reason\`.
 
-**Transient failures** (auth/token blip) are re-driven after \`jobs.transient_retry_delay_seconds\` (default 30), capped at \`jobs.max_transient_attempts\` (default 5; \`0\` disables the cap). The cap stops a durable fault — a revoked token answering 401 forever — from hammering ANAF for the whole retry window. Once exhausted, the row stays \`Failed\` and \`InvoiceFailed\` fires as a genuine terminal signal.
+**Transient failures** (auth/token blip) are re-driven after \`jobs.transient_retry_delay_seconds\` (default 30), capped at \`jobs.max_transient_attempts\` (default 5; \`0\` disables the cap) transient failures of one queued job. The count lives in the cache (\`efactura:upload:{id}:transient:{job uuid}\`, kept for \`rate_limit.retry_window_hours\`), not in \`attempts()\`, so rate-limit releases do not use it up (v4.0). The cap stops a durable fault — a revoked token answering 401 forever — from hammering ANAF for the whole retry window. Once exhausted, the row becomes \`Failed\` / \`abandoned\` and \`InvoiceFailed\` fires as a genuine terminal signal. An XML file that cannot be written to the storage disk is a \`transient\` failure (v4.0; it was \`validation\`) and fires no \`InvoiceFailed\`.
 
-**\`failed()\` — new in v3.0.0.** When the job dies permanently (timeout, retry window expiry, uncaught error), \`failed()\` calls \`parkStrandedUploadAsIndeterminate()\`, transitioning a row still stuck in \`Uploading\` to \`Failed\` / \`indeterminate\` and firing \`InvoiceFailed\`. It deliberately does **not** reset to \`Pending\`: the process may have died *after* the POST reached ANAF, so re-driving would double-file a legal invoice. Rows are resolved by \`php artisan efactura:reconcile\`.
+**\`failed()\` — new in v3.0.0.** When the job dies permanently (timeout, retry window expiry, uncaught error), \`failed()\` handles two kinds of row:
+- **\`Uploading\`**: \`parkStrandedUploadAsIndeterminate()\` moves it to \`Failed\` / \`indeterminate\` and fires \`InvoiceFailed\`. It deliberately does **not** reset to \`Pending\`: the process may have died *after* the POST reached ANAF, so re-driving would double-file a legal invoice. Rows are resolved by \`php artisan efactura:reconcile\`.
+- **\`Pending\`** (waiting out a rate limit, a transient retry or a refused grant's refresh cooldown) or \`Failed\` with a retryable reason: nothing was sent, so \`abandonUnsentUpload()\` moves it to \`Failed\` / \`abandoned\` and fires \`InvoiceFailed\`. A grant that stays refused ends its uploads this way after at most \`rate_limit.retry_window_hours\`; usually its job's transient cap ends them first, since each ask after a cooldown spends one attempt (about (\`jobs.max_transient_attempts\` − 1) × the 15-minute cooldown, about an hour at the defaults).
 
 Before v3 \`failed()\` only wrote a log line, so such rows sat in \`Uploading\` forever. A SIGKILL never runs \`failed()\` at all — that is what \`SweepStaleUploads\` is for.
 

@@ -13,6 +13,7 @@ declare(strict_types=1);
 
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
 /**
@@ -28,6 +29,20 @@ use Illuminate\Support\Facades\Schema;
  * download fails permanently. Past the cap it leaves the download query.
  *
  * Existing rows start at 0, which is correct: none has been counted yet.
+ *
+ * DATA: a 3.x `failed` / `validation` row that has an upload index but no download id is
+ * moved to `indeterminate`. 3.x wrote that shape only for a `nok` status without a download
+ * id (an unknown index or "Nu aveti dreptul" answer, no verdict on the document); it never
+ * stored the index on a failed upload answer, so 3.x upload-answer failures have no index
+ * and are not moved. queueUpload() recycles `validation` rows, so re-queueing a moved row
+ * would file it twice. 4.0 writes the shape only for "XML cu erori nepreluat de sistem"
+ * (ANAF did not take the file in: final, no download id). A rejection with ANAF's error
+ * report (a download id) stays `validation`. Idempotent before 4.0 writes rows; re-running
+ * it after a rollback (down() does not revert the data) also moves 4.0's own "nepreluat"
+ * rows to `indeterminate`, the safe direction (never re-sent automatically).
+ *
+ * Run it before queue workers start the 4.0 code: 4.0 writes `status_failures` right after
+ * ANAF accepts an upload.
  *
  * RE-ENTRANT: DDL auto-commits on MySQL and is unwrapped on SQLite, so an interrupt
  * can land between the two columns. Each is guarded on its own state.
@@ -47,6 +62,13 @@ return new class extends Migration
                 $table->unsignedTinyInteger('download_attempts')->default(0);
             });
         }
+
+        DB::table('efactura_uploads')
+            ->where('status', 'failed')
+            ->where('failure_reason', 'validation')
+            ->whereNotNull('upload_index')
+            ->whereNull('download_id')
+            ->update(['failure_reason' => 'indeterminate']);
     }
 
     public function down(): void

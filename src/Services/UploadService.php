@@ -18,7 +18,9 @@ use BeeCoded\EFactura\Events\InvoiceFailed;
 use BeeCoded\EFactura\Events\InvoiceRateLimited;
 use BeeCoded\EFactura\Events\InvoiceUploaded;
 use BeeCoded\EFactura\Exceptions\DuplicateUploadException;
+use BeeCoded\EFactura\Exceptions\RefreshCooldownException;
 use BeeCoded\EFactura\Jobs\ProcessSingleUpload;
+use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFacturaSdk\Data\Invoice\UploadOptionsData;
 use BeeCoded\EFacturaSdk\Enums\StandardType;
@@ -175,6 +177,17 @@ class UploadService
         int $tokenId,
         array $attributes,
     ): EfacturaUpload {
+        return $this->reuseUpload($existing, $tokenId, $attributes, reread: false);
+    }
+
+    /**
+     * @param  array<string, mixed>  $attributes
+     * @param  bool  $reread  Whether the row was already re-read after losing a race.
+     *
+     * @throws DuplicateUploadException
+     */
+    private function reuseUpload(EfacturaUpload $existing, int $tokenId, array $attributes, bool $reread): EfacturaUpload
+    {
         if ($existing->failure_reason?->needsReconciliation()) {
             throw DuplicateUploadException::indeterminate($existing);
         }
@@ -196,18 +209,39 @@ class UploadService
         // ExecutionStatus=1 without an upload index, a rejected status poll). Any answer
         // that proves neither — 5xx, transport loss, an unreadable 2xx body, an index or
         // status that cannot be used — is recorded Indeterminate by transmit().
-        $existing->update([
-            'efactura_token_id' => $tokenId,
-            'status' => UploadStatus::Pending,
-            'failure_reason' => null,
-            'errors' => null,
-            'upload_index' => null,
-            'download_id' => null,
-            'response_path' => null,
-            'uploaded_at' => null,
-            'processed_at' => null,
-            ...$attributes,
-        ]);
+        //
+        // Guarded on the state just read: a worker may re-drive or re-classify the row in
+        // between, and resetting an in-flight row to Pending would file it twice.
+        $recycled = EfacturaUpload::where('id', $existing->id)
+            ->where('status', UploadStatus::Failed)
+            ->where('failure_reason', $existing->failure_reason)
+            ->update([
+                'efactura_token_id' => $tokenId,
+                'status' => UploadStatus::Pending,
+                'failure_reason' => null,
+                'errors' => null,
+                'upload_index' => null,
+                'download_id' => null,
+                'response_path' => null,
+                'uploaded_at' => null,
+                'processed_at' => null,
+                'response_attempts' => 0,
+                'response_failed_at' => null,
+                'status_failures' => 0,
+                ...$attributes,
+            ]) > 0;
+
+        if (!$recycled) {
+            if ($reread) {
+                throw new DuplicateUploadException(
+                    "Upload {$existing->id} kept changing while it was being re-queued; queue it again.",
+                    $existing->refresh(),
+                );
+            }
+
+            // Decide again on what the row is now: in flight, indeterminate, or failed anew.
+            return $this->reuseUpload($existing->refresh(), $tokenId, $attributes, reread: true);
+        }
 
         return $existing->refresh();
     }
@@ -314,6 +348,14 @@ class UploadService
             return;
         }
 
+        // ANAF refused this grant recently, so the call would be refused before anything is
+        // sent: leave the row Pending and skip building and storing the XML. The job waits.
+        if ($this->tokenService->refreshCooldownSeconds($upload->token) > 0) {
+            Log::info('EFactura: Token refresh is cooling down, upload waits', ['upload_id' => $upload->id]);
+
+            return;
+        }
+
         // PHASE 1 — preparation. Everything here happens strictly BEFORE anything is
         // transmitted, so a failure proves nothing was filed. A broken invoice or a
         // broken model is the author's data problem: terminal, no point retrying.
@@ -331,7 +373,6 @@ class UploadService
             }
 
             $xml = $this->generateXml($model);
-            $xmlPath = $this->storeXml($upload, $xml);
 
             $uploadOptions = new UploadOptionsData(
                 standard: StandardType::from($upload->standard),
@@ -345,6 +386,20 @@ class UploadService
             ]);
 
             $this->failBeforeTransmission($upload, [$e->getMessage()], FailureReason::Validation);
+
+            return;
+        }
+
+        // Storage is not the invoice's fault: retried, not recorded as a rejection.
+        try {
+            $xmlPath = $this->storeXml($upload, $xml);
+        } catch (\Throwable $e) {
+            Log::error('EFactura: Upload XML could not be stored, will retry', [
+                'upload_id' => $upload->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            $this->failBeforeTransmission($upload, [$e->getMessage()], FailureReason::Transient);
 
             return;
         }
@@ -386,6 +441,9 @@ class UploadService
         $upload->xml_path = $xmlPath;
         $upload->failure_reason = null;
         $upload->errors = null;
+        // These are the row's values now: a model read earlier (e.g. while Failed) must not
+        // let a later update() skip writing a status equal to the stale one.
+        $upload->syncOriginalAttributes(['status', 'xml_path', 'failure_reason', 'errors']);
 
         return true;
     }
@@ -396,6 +454,8 @@ class UploadService
      * Guarded on `status = pending`: preparation now runs BEFORE the atomic claim, so a
      * concurrent worker may legitimately own the row by the time we get here. This path
      * must never rewrite an in-flight or already-filed outcome.
+     *
+     * InvoiceFailed fires only for a reason that is not retried.
      *
      * @param  array<int, string>  $errors
      */
@@ -410,7 +470,7 @@ class UploadService
                 'processed_at' => now(),
             ]) > 0;
 
-        if ($failed) {
+        if ($failed && !$reason->isRetryable()) {
             rescue(fn () => event(new InvoiceFailed($upload->refresh(), $errors)));
         }
     }
@@ -447,9 +507,10 @@ class UploadService
 
             $index = $response->indexIncarcare;
 
-            // ANAF assigns an upload index only to a document it took in, so a usable index
-            // means it is in the pipeline whatever ExecutionStatus says. Polling is read-only
-            // and decides the outcome (including a rejection).
+            // ANAF assigns an upload index only to a document it received, so a usable index
+            // means its outcome is decided under that index whatever ExecutionStatus says.
+            // Polling is read-only and reads that outcome (including a rejection, or a file
+            // ANAF did not take in).
             if ($index !== null && preg_match(self::UPLOAD_INDEX_PATTERN, $index) === 1) {
                 $this->markUploadAsProcessing($upload, $index);
                 rescue(fn () => event(new InvoiceUploaded($upload)));
@@ -487,6 +548,16 @@ class UploadService
             // The SDK's CLIENT-SIDE pre-flight limiter refused to make the call.
             // Nothing was sent.
             $this->markAsRateLimited($upload, $e->getMessage(), $e->retryAfterSeconds);
+        } catch (RefreshCooldownException $e) {
+            // Refused before anything was sent, without asking ANAF: hand the claim back, so
+            // the job waits the cooldown out instead of spending a transient attempt.
+            Log::info('EFactura: Token refresh is cooling down, upload waits', [
+                'upload_id' => $upload->id,
+            ]);
+
+            EfacturaUpload::where('id', $upload->id)
+                ->where('status', UploadStatus::Uploading)
+                ->update(['status' => UploadStatus::Pending, 'errors' => [$e->getMessage()]]);
         } catch (AuthenticationException $e) {
             // Either the token refresh failed (before the call) or ANAF answered 401
             // (rejected, not filed). Both prove the document did not enter the pipeline.
@@ -623,16 +694,19 @@ class UploadService
             'error' => $message,
         ]);
 
-        EfacturaUpload::where('id', $upload->id)
+        $released = EfacturaUpload::where('id', $upload->id)
             ->where('status', UploadStatus::Uploading)
             ->update([
                 'status' => UploadStatus::Pending,
                 'failure_reason' => FailureReason::RateLimited,
                 'errors' => [$message],
                 'processed_at' => null,
-            ]);
+            ]) > 0;
 
-        rescue(fn () => event(new InvoiceRateLimited($upload->refresh(), [$message], $retryAfterSeconds)));
+        // A row a sweep or failed() already parked was not rate-limited by this write.
+        if ($released) {
+            rescue(fn () => event(new InvoiceRateLimited($upload->refresh(), [$message], $retryAfterSeconds)));
+        }
     }
 
     /**
@@ -648,16 +722,6 @@ class UploadService
         $this->markUploadAsFailed($upload, $errors, reason: $reason);
 
         rescue(fn () => event(new InvoiceFailed($upload, $errors)));
-    }
-
-    /**
-     * Mark upload as uploading.
-     */
-    public function markUploadAsUploading(EfacturaUpload $upload): void
-    {
-        $upload->update([
-            'status' => UploadStatus::Uploading,
-        ]);
     }
 
     /**
@@ -915,6 +979,12 @@ class UploadService
             'uploaded_at' => now(),
             'processed_at' => null,
             'status_failures' => 0,
+            // A parked row's response belonged to the outcome it was parked with; the
+            // next status check records the download id for this index.
+            'download_id' => null,
+            'response_path' => null,
+            'response_attempts' => 0,
+            'response_failed_at' => null,
         ]) > 0;
 
         if ($resolved) {
@@ -934,32 +1004,53 @@ class UploadService
      * because a human verified the absence — which is exactly why nothing automatic
      * is allowed to make this call.
      *
-     * Refused for an upload that has an upload index: ANAF issues one only for a
-     * document it took in, so re-sending it would double-file the invoice.
+     * Refused by default for an upload that has an upload index: ANAF received that
+     * document and decides its outcome under the index (filed, rejected, or not taken in),
+     * so re-sending it could double-file the invoice. When ANAF keeps answering that index
+     * with an error, an operator who checked SPV under it and did not find the invoice
+     * opts in with $despiteIndex: the index is cleared, kept in `errors` and logged.
      *
+     * @param  bool  $despiteIndex  The operator checked SPV under the upload index and the
+     *                              invoice is not there.
      * @return bool Whether the upload was actually awaiting reconciliation.
      *
-     * @throws \InvalidArgumentException When the parked upload has an ANAF upload index.
+     * @throws \InvalidArgumentException When the parked upload has an ANAF upload index and
+     *                                   $despiteIndex is false.
      */
-    public function resolveIndeterminateAsNotFiled(EfacturaUpload $upload): bool
+    public function resolveIndeterminateAsNotFiled(EfacturaUpload $upload, bool $despiteIndex = false): bool
     {
         $indexed = $this->indeterminateQuery($upload)->whereNotNull('upload_index')->value('upload_index');
 
-        if ($indexed !== null) {
+        if ($indexed !== null && !$despiteIndex) {
             throw new \InvalidArgumentException(
-                "Upload {$upload->id} has ANAF upload index {$indexed}: ANAF issues an index only for a document "
-                    .'it took in, so it cannot be resolved as not filed.'
+                "Upload {$upload->id} has ANAF upload index {$indexed}: ANAF decides its outcome under that index, "
+                    .'so it cannot be resolved as not filed.'
             );
         }
 
-        $resolved = $this->indeterminateQuery($upload)->update([
+        // Guarded on the index just read, so the note names the index that was cleared.
+        $resolved = $this->indeterminateQuery($upload)->where('upload_index', $indexed)->update([
             'status' => UploadStatus::Pending,
             'failure_reason' => null,
-            'errors' => null,
+            'errors' => $indexed === null ? null : [
+                "Resolved as not filed by an operator who checked SPV under ANAF upload index {$indexed}.",
+            ],
             'processed_at' => null,
+            'upload_index' => null,
+            'uploaded_at' => null,
+            'download_id' => null,
+            'response_path' => null,
+            'response_attempts' => 0,
+            'response_failed_at' => null,
+            'status_failures' => 0,
         ]) > 0;
 
-        if ($resolved) {
+        if ($resolved && $indexed !== null) {
+            Log::warning('EFactura: Indexed indeterminate upload reconciled as not filed on the operator\'s word, re-queued', [
+                'upload_id' => $upload->id,
+                'upload_index' => $indexed,
+            ]);
+        } elseif ($resolved) {
             Log::info('EFactura: Indeterminate upload reconciled as not filed, re-queued', [
                 'upload_id' => $upload->id,
             ]);
@@ -1026,15 +1117,16 @@ class UploadService
      * retryUntil. With `rate_limits.enabled = false`, which is exactly when real
      * ANAF 429s reach us and the quota pre-flight is skipped, that is unbounded
      * hammering: it saturates the 1000/60min quota hard enough to stop it
-     * resetting. A genuinely queued row has failure_reason NULL, because
-     * resetForRetry() clears it — so the reason is what tells "nobody is on this"
-     * apart from "a job is waiting one out".
+     * resetting. A job waiting out a transient failure has cleared the reason
+     * (resetForRetry()), but has just touched the row, so rows touched since
+     * creation within a transient release plus a minute are skipped too; see
+     * EfacturaUpload::scopeAwaitingDispatch().
      *
      * @return int|null How many uploads were dispatched, or null if the CUI is unknown.
      */
     public function dispatchPendingUploads(?string $cui = null): ?int
     {
-        $query = EfacturaUpload::pending()->whereNull('failure_reason');
+        $query = EfacturaUpload::awaitingDispatch();
 
         if ($cui) {
             $token = $this->tokenService->getToken($cui);
@@ -1048,12 +1140,53 @@ class UploadService
 
         $dispatched = 0;
 
-        $query->each(function (EfacturaUpload $upload) use (&$dispatched) {
+        $query->with('token')->each(function (EfacturaUpload $upload) use (&$dispatched) {
+            // Its job, if any, sleeps the cooldown out; a new one would only stack on it.
+            if ($upload->token && $this->tokenService->refreshCooldownSeconds($upload->token) > 0) {
+                return;
+            }
+
             ProcessSingleUpload::dispatch($upload);
             $dispatched++;
         });
 
         return $dispatched;
+    }
+
+    /**
+     * Pending uploads the last dispatch or synchronous run left out, by reason.
+     *
+     * `owned`: rows a job may still be on, which dispatchPendingUploads() skips (a rate-limited
+     * row, or one touched within a transient release plus a minute, including a fresh one; see
+     * EfacturaUpload::scopeAwaitingDispatch()). `cooling`: rows on a grant ANAF recently refused
+     * to refresh, which both dispatchers and processPendingUploads() skip until the cooldown ends.
+     *
+     * @return array{owned: int, cooling: int}|null Null if the CUI is unknown.
+     */
+    public function pendingLeftOut(?string $cui = null): ?array
+    {
+        $pending = EfacturaUpload::pending();
+        $awaiting = EfacturaUpload::awaitingDispatch();
+
+        if ($cui) {
+            $token = $this->tokenService->getToken($cui);
+            if (!$token) {
+                return null;
+            }
+            $pending->forToken($token);
+            $awaiting->forToken($token);
+        }
+
+        $coolingTokenIds = EfacturaToken::whereIn('id', (clone $pending)->select('efactura_token_id'))
+            ->get()
+            ->filter(fn (EfacturaToken $grant): bool => $this->tokenService->refreshCooldownSeconds($grant) > 0)
+            ->modelKeys();
+
+        return [
+            'owned' => (clone $pending)->whereNotIn('efactura_token_id', $coolingTokenIds)->count()
+                - $awaiting->whereNotIn('efactura_token_id', $coolingTokenIds)->count(),
+            'cooling' => $pending->whereIn('efactura_token_id', $coolingTokenIds)->count(),
+        ];
     }
 
     /**
@@ -1065,7 +1198,11 @@ class UploadService
      * Previously it ploughed through the whole backlog, marking every invoice past
      * ANAF's quota permanently Failed and firing an InvoiceFailed storm.
      *
-     * @return int How many uploads were processed before stopping.
+     * Every Pending row is taken, including a rate-limited or fresh one: no job owns a row on
+     * this path, and the claim is atomic should a queued job also hold it. Rows on a grant
+     * whose token refresh is cooling down are skipped and left Pending for a later run.
+     *
+     * @return int How many uploads were processed before stopping (skipped rows not counted).
      */
     public function processPendingUploads(?string $cui = null): int
     {
@@ -1084,6 +1221,10 @@ class UploadService
         $processed = 0;
 
         foreach ($query->lazyById() as $upload) {
+            if ($upload->token && $this->tokenService->refreshCooldownSeconds($upload->token) > 0) {
+                continue;
+            }
+
             $this->processUpload($upload);
             $processed++;
 
@@ -1126,7 +1267,9 @@ class UploadService
             now()->format('Ymd_His')
         );
 
-        Storage::disk($disk)->put($filename, $xml);
+        if (!Storage::disk($disk)->put($filename, $xml)) {
+            throw new \RuntimeException("Could not store the upload XML at {$filename} on disk {$disk}");
+        }
 
         return $filename;
     }

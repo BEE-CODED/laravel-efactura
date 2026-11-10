@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   tests:
-    # composer.json allows Laravel 11, 12 and 13 but only one is ever installed
+    # composer.json allows Laravel 12 and 13 but only one is ever installed
     # locally, so the matrix is the only thing that checks the range we advertise.
     name: PHP ${{ matrix.php }} / Laravel ${{ matrix.laravel }} / ${{ matrix.dependency-version }}
     runs-on: ubuntu-latest
@@ -23,26 +23,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        php: ['8.4']
-        laravel: ['11.*', '12.*', '13.*']
+        php: ['8.4', '8.5']
+        laravel: ['12.*', '13.*']
         dependency-version: [prefer-lowest, prefer-stable]
         include:
-          - laravel: '11.*'
-            testbench: '9.*'
           - laravel: '12.*'
             testbench: '10.*'
           - laravel: '13.*'
             testbench: '11.*'
         exclude:
-          # Laravel 11 and 13 are tested prefer-stable only. Laravel 13's prefer-lowest
-          # cannot resolve test deps (pest 3.0 / phpunit 11) that predate it; Laravel 11's
-          # prefer-lowest pins the oldest 11.0 patch (advisory-flagged, an older pest with
-          # buggy duplicate-test detection, and a cache-state edge in the CLI OAuth flow).
-          # Real 11.x/13.x installs run current patches, which prefer-stable covers;
-          # Laravel 12 still runs a full prefer-lowest.
-          - laravel: '11.*'
-            dependency-version: prefer-lowest
+          # Laravel 13 is tested prefer-stable only: its prefer-lowest cannot resolve test
+          # deps (pest 3.0 / phpunit 11) that predate it. Real 13.x installs run current
+          # patches, which prefer-stable covers; Laravel 12 still runs a full prefer-lowest.
           - laravel: '13.*'
+            dependency-version: prefer-lowest
+          # The dependency floors predate PHP 8.5, so prefer-lowest runs on 8.4 only.
+          - php: '8.5'
             dependency-version: prefer-lowest
 
     steps:
@@ -58,8 +54,8 @@ jobs:
       - name: Install dependencies
         run: |
           # Composer 2.8+ refuses to install security-advisory-flagged releases, and
-          # every laravel/framework 11.x that testbench 9.x needs currently carries one.
-          # We still support Laravel 11, so unblock it for CI only (never shipped).
+          # prefer-lowest resolves the oldest framework patches we allow, which can carry
+          # one. Unblock them for CI only (never shipped).
           composer config --global policy.advisories.block false
           composer require "illuminate/support:${{ matrix.laravel }}" "orchestra/testbench:${{ matrix.testbench }}" --no-interaction --no-update
           composer update --${{ matrix.dependency-version }} --prefer-dist --no-interaction
@@ -81,7 +77,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16
+        image: postgres:18
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -120,6 +116,84 @@ jobs:
             exit 1
           fi
       - name: Full suite on Postgres
+        run: vendor/bin/pest
+
+  mariadb:
+    # Hosts run MariaDB/MySQL too. REPEATABLE READ cannot see a race winner committed after the
+    # caller's snapshot, so the create/constraint race tests skip here (see the README's
+    # queueUpload() note); everything else, including migration 000008's data move, runs.
+    name: MariaDB
+    runs-on: ubuntu-latest
+
+    services:
+      mariadb:
+        image: mariadb:11.8
+        env:
+          MARIADB_ROOT_PASSWORD: root
+          MARIADB_DATABASE: efactura_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DB_CONNECTION: mariadb
+      DB_HOST: 127.0.0.1
+      DB_PORT: 3306
+      DB_DATABASE: efactura_test
+      DB_USERNAME: root
+      DB_PASSWORD: root
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: dom, curl, libxml, mbstring, zip, pdo_mysql
+          coverage: none
+      - run: composer update --prefer-dist --no-interaction
+      - name: Full suite on MariaDB
+        run: vendor/bin/pest
+
+  redis:
+    # Production hosts keep the refresh cooldown, locks and counters in Redis, which hands
+    # values back as strings where the array store keeps ints. The refused-grant cooldown read
+    # broke only on Redis (an is_int() check never matched), so the array-store jobs above
+    # could not catch it. sqlite :memory: as in the main tests job; tests/TestCase.php gives
+    # each test its own cache prefix on a non-array store.
+    name: Redis cache
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7.4
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      CACHE_STORE: redis
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: 6379
+      # phpredis (the extension below): predis is not a dev dependency of this package.
+      REDIS_CLIENT: phpredis
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: dom, curl, libxml, mbstring, zip, sqlite3, pdo_sqlite, redis
+          coverage: none
+      - run: composer update --prefer-dist --no-interaction
+      - name: Full suite on the Redis cache store
         run: vendor/bin/pest
 
   static-analysis:

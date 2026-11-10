@@ -64,6 +64,18 @@ class EfacturaUploadCommand extends Command
 
         $this->info("Queued {$dispatched} pending upload(s) for processing.");
 
+        $leftOut = $uploadService->pendingLeftOut($cui) ?? ['owned' => 0, 'cooling' => 0];
+        if ($leftOut['owned'] + $leftOut['cooling'] > 0) {
+            $this->comment(sprintf(
+                'Left out %d pending upload(s): %d recently queued or rate-limited (a later run takes the recent ones once '
+                    .'they are idle; rate-limited ones are retried by their own job or the rate-limit retry), '
+                    .'%d on a company whose token refresh ANAF refused recently (taken after the cooldown).',
+                $leftOut['owned'] + $leftOut['cooling'],
+                $leftOut['owned'],
+                $leftOut['cooling'],
+            ));
+        }
+
         if ($dispatched > 0) {
             $this->comment('Ensure a queue worker is running on the "'
                 .(config('efactura.queue') ?? 'default').'" queue.');
@@ -79,6 +91,11 @@ class EfacturaUploadCommand extends Command
         $processed = $uploadService->processPendingUploads($cui);
 
         $this->info("Processed {$processed} upload(s).");
+
+        $cooling = $uploadService->pendingLeftOut($cui)['cooling'] ?? 0;
+        if ($cooling > 0) {
+            $this->comment("Skipped {$cooling} upload(s) of a company whose token refresh ANAF refused recently; a later run takes them after the cooldown.");
+        }
 
         return self::SUCCESS;
     }

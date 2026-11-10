@@ -96,10 +96,12 @@ describe('ProcessPendingUploads Job', function () {
             'standard' => 'UBL',
         ]);
 
-        $tokenService = Mockery::mock(TokenService::class);
+        // A freshly queued row may have its own job queued: taken after a transient release plus a minute.
+        (new ProcessPendingUploads)->handle(app(TokenService::class));
+        Queue::assertNothingPushed();
 
-        $job = new ProcessPendingUploads;
-        $job->handle($tokenService);
+        $this->travel(91)->seconds();
+        (new ProcessPendingUploads)->handle(app(TokenService::class));
 
         Queue::assertPushed(ProcessSingleUpload::class, fn ($j) => $j->upload->id === $upload->id);
     });
@@ -834,8 +836,11 @@ describe('ProcessSingleUpload transient retry', function () {
         $rateLimiter = Mockery::mock(RateLimiter::class);
         $rateLimiter->shouldReceive('isEnabled')->andReturn(false);
 
+        // Many attempts already, all of them rate-limit releases: those must not count
+        // toward the transient cap, so this first transient failure is re-driven.
         $fakeQueueJob = Mockery::mock(Job::class);
-        $fakeQueueJob->shouldReceive('attempts')->andReturn(1);
+        $fakeQueueJob->shouldReceive('attempts')->andReturn(5);
+        $fakeQueueJob->shouldReceive('uuid')->andReturn('job-uuid-1');
         $fakeQueueJob->shouldReceive('release')->with(30)->once();
 
         $job = new ProcessSingleUpload($upload);
@@ -883,9 +888,9 @@ describe('ProcessSingleUpload transient retry', function () {
             [app(TokenService::class)]
         );
         $uploadService->shouldReceive('processUpload')
-            ->once()
+            ->times(5)
             ->andReturnUsing(function () use ($upload) {
-                $upload->update([
+                EfacturaUpload::whereKey($upload->id)->update([
                     'status' => UploadStatus::Failed,
                     'failure_reason' => FailureReason::Transient,
                     'errors' => ['Token refresh lock timeout'],
@@ -895,13 +900,17 @@ describe('ProcessSingleUpload transient retry', function () {
         $rateLimiter = Mockery::mock(RateLimiter::class);
         $rateLimiter->shouldReceive('isEnabled')->andReturn(false);
 
+        // One queued job, re-driven after each of the first four transient failures.
         $fakeQueueJob = Mockery::mock(Job::class);
-        $fakeQueueJob->shouldReceive('attempts')->andReturn(5);
-        $fakeQueueJob->shouldNotReceive('release');
+        $fakeQueueJob->shouldReceive('uuid')->andReturn('job-uuid-1');
+        $fakeQueueJob->shouldReceive('release')->times(4);
 
         $job = new ProcessSingleUpload($upload);
         $job->setJob($fakeQueueJob);
-        $job->handle($uploadService, $rateLimiter);
+
+        foreach (range(1, 5) as $attempt) {
+            $job->handle($uploadService, $rateLimiter);
+        }
 
         $upload->refresh();
 
@@ -918,6 +927,49 @@ describe('ProcessSingleUpload transient retry', function () {
 
         expect($upload->fresh()->status)->toBe(UploadStatus::Failed);
         Queue::assertNothingPushed();
+    });
+
+    // Without a queue job the counter key ended in an empty segment that every such run shared.
+    it('counts transient failures per instance when handle() runs without a queue job', function () {
+        config([
+            'efactura.enabled' => true,
+            'efactura.features.upload_invoices' => true,
+            'efactura.jobs.max_transient_attempts' => 2,
+        ]);
+
+        Event::fake([InvoiceFailed::class]);
+
+        $upload = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => 'pending',
+            'standard' => 'UBL',
+        ]);
+
+        $uploadService = Mockery::mock(
+            UploadService::class.'[processUpload]',
+            [app(TokenService::class)]
+        );
+        $uploadService->shouldReceive('processUpload')
+            ->times(2)
+            ->andReturnUsing(function () use ($upload) {
+                EfacturaUpload::whereKey($upload->id)->update([
+                    'status' => UploadStatus::Failed,
+                    'failure_reason' => FailureReason::Transient,
+                    'errors' => ['Token refresh lock timeout'],
+                ]);
+            });
+
+        $rateLimiter = Mockery::mock(RateLimiter::class);
+        $rateLimiter->shouldReceive('isEnabled')->andReturn(false);
+
+        // Two separate runs, one transient failure each: neither has used up its cap.
+        (new ProcessSingleUpload($upload))->handle($uploadService, $rateLimiter);
+        (new ProcessSingleUpload($upload->fresh()))->handle($uploadService, $rateLimiter);
+
+        expect($upload->fresh()->status)->toBe(UploadStatus::Pending);
+        Event::assertNotDispatched(InvoiceFailed::class);
     });
 
     /**
@@ -1135,6 +1187,26 @@ describe('RetryRateLimitedUploads Job', function () {
 
         // Only 2 should be dispatched (batch size limit)
         Queue::assertPushed(ProcessSingleUpload::class, 2);
+    });
+
+    it('re-dispatches a stale released row once, not again on the next run while its job is queued', function () {
+        config(['efactura.rate_limit.retry_window_hours' => 24]);
+        Queue::fake();
+
+        $upload = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => UploadStatus::Pending,
+            'failure_reason' => FailureReason::RateLimited,
+            'standard' => 'UBL',
+        ]);
+        EfacturaUpload::where('id', $upload->id)->update(['updated_at' => now()->subHours(25)]);
+
+        (new RetryRateLimitedUploads)->handle();
+        (new RetryRateLimitedUploads)->handle();
+
+        Queue::assertPushed(ProcessSingleUpload::class, 1);
     });
 });
 

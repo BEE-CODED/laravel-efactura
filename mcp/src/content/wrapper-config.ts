@@ -56,7 +56,7 @@ Configuration for handling ANAF rate limits and retry behavior.
 
 | Config Key | Env Var | Type | Default | Description |
 |-----------|---------|------|---------|-------------|
-| \`rate_limit.retry_window_hours\` | \`EFACTURA_RATE_LIMIT_RETRY_HOURS\` | int | \`24\` | How long (in hours) a single \`ProcessSingleUpload\` job keeps retrying via \`retryUntil()\` before the **job** stops being retried and is handed to the failed-job handler. |
+| \`rate_limit.retry_window_hours\` | \`EFACTURA_RATE_LIMIT_RETRY_HOURS\` | int | \`24\` | How long (in hours) a single \`ProcessSingleUpload\` job keeps retrying via \`retryUntil()\` before the **job** stops being retried and is handed to the failed-job handler. Also how long \`RetryRateLimitedUploads\` leaves a \`pending\` / \`rate_limited\` row alone (v4.0), and how long the transient-failure count is kept. |
 | \`rate_limit.retry_batch_size\` | \`EFACTURA_RATE_LIMIT_RETRY_BATCH\` | int | \`250\` | Maximum number of rate-limited failed uploads to reset to Pending per \`RetryRateLimitedUploads\` job run. Prevents overwhelming the queue on large backlogs. |
 | \`rate_limit.retry_max_age_days\` | \`EFACTURA_RATE_LIMIT_RETRY_MAX_DAYS\` | int | \`7\` | \`RetryRateLimitedUploads\` ignores failed uploads older than this many days. Prevents retrying very stale uploads indefinitely. |
 
@@ -67,8 +67,10 @@ Configuration for handling ANAF rate limits and retry behavior.
 > parked as \`Failed\` / \`indeterminate\` (via \`parkStrandedUploadAsIndeterminate()\`) and
 > \`InvoiceFailed\` fires — it is **not** returned to \`Pending\`, because the job may have died after
 > the POST reached ANAF and re-driving would double-file a legal invoice. Resolve with
-> \`php artisan efactura:reconcile\`. A row left \`Pending\` (e.g. after a rate-limit reset) is
-> untouched and picked up again by \`ProcessPendingUploads\`.
+> \`php artisan efactura:reconcile\`. A row still \`Pending\` (waiting out a rate limit, a transient
+> retry or a refused grant's refresh cooldown), or \`Failed\` with a retryable reason, was never
+> sent, so it is abandoned: \`Failed\` / \`abandoned\` and \`InvoiceFailed\` fires
+> (\`abandonUnsentUpload()\`). It is not picked up again by \`ProcessPendingUploads\`.
 >
 > Previously \`failed()\` only wrote a log line and performed no status transition, so rows left in
 > \`Uploading\` **stalled indefinitely** with nothing to surface them.
@@ -94,7 +96,7 @@ Hardening for the periodic batch jobs so a backlog that accumulates while the qu
 | \`jobs.max_staleness_seconds\` | \`EFACTURA_JOB_MAX_STALENESS\` | int | \`120\` | A periodic batch job (\`ProcessPendingUploads\`, \`CheckUploadStatuses\`, \`DownloadResponses\`) that has waited in the queue longer than this self-discards instead of running — the next scheduled run re-scans. Safe because these jobs are idempotent all-rows scanners. Set to \`0\` to disable. The default is shorter than every recommended interval (Job Reference, "Recommended Scheduling"), so a delayed run never overlaps the next. |
 | \`jobs.unique_for_seconds\` | \`EFACTURA_JOB_UNIQUE_FOR\` | int | \`3600\` | Lock TTL (seconds) for \`ShouldBeUniqueUntilProcessing\` on those three batch jobs and on \`SweepStaleUploads\` — the ceiling after which a job stuck unprocessed in the queue stops blocking a fresh dispatch. (\`RetryRateLimitedUploads\` hardcodes its own \`uniqueFor = 600\` and ignores this key.) |
 | \`jobs.transient_retry_delay_seconds\` | \`EFACTURA_JOB_TRANSIENT_RETRY_DELAY\` | int | \`30\` | How long \`ProcessSingleUpload\` waits before re-driving an upload that failed transiently (auth / pre-flight blip). Rate-limited retries use a fixed 60s instead. **New in v3.0.0.** |
-| \`jobs.max_transient_attempts\` | \`EFACTURA_JOB_MAX_TRANSIENT_ATTEMPTS\` | int | \`5\` | How many times a single upload job may be re-driven for a \`transient\` failure before it is declared terminal and \`InvoiceFailed\` fires. Stops a durable fault (e.g. a revoked token answering 401) from hammering ANAF for the whole retry window. Set to \`0\` to disable the cap. **New in v3.0.0.** |
+| \`jobs.max_transient_attempts\` | \`EFACTURA_JOB_MAX_TRANSIENT_ATTEMPTS\` | int | \`5\` | How many \`transient\` failures a single queued upload job may have before it is declared terminal (\`abandoned\`) and \`InvoiceFailed\` fires. Counted in the cache per job (v4.0); rate-limit releases do not count. Stops a durable fault (e.g. a revoked token answering 401) from hammering ANAF for the whole retry window. Set to \`0\` to disable the cap. **New in v3.0.0.** |
 | \`jobs.stale_uploading_minutes\` | \`EFACTURA_JOB_STALE_UPLOADING_MINUTES\` | int | \`30\` | An upload left in \`uploading\` longer than this had its worker die mid-flight. \`SweepStaleUploads\` parks it as \`Failed\` / \`indeterminate\` for human reconciliation — it is **never** re-submitted, because it may already be filed. \`<= 0\` makes the sweep a no-op. **New in v3.0.0.** |
 
 ---
@@ -130,7 +132,7 @@ OAuth callback routes configuration.
 |-----------|---------|------|---------|-------------|
 | \`routes.enabled\` | \`EFACTURA_ROUTES_ENABLED\` | bool | \`true\` | Register the built-in OAuth routes (\`GET /{prefix}/auth/{cui}\` and \`GET /{prefix}/callback\`). Set to \`false\` if you handle OAuth manually. |
 | \`routes.prefix\` | \`EFACTURA_ROUTES_PREFIX\` | string | \`'efactura'\` | URL prefix for OAuth routes. Default routes are \`/efactura/auth/{cui}\` and \`/efactura/callback\`. |
-| \`routes.middleware\` | *(not env)* | array | \`['web']\` | Laravel middleware applied to OAuth routes. Modify in \`config/efactura.php\` directly. \`'web'\` is the default because the callback redirects with flashed session data (\`efactura_success\`, \`efactura_cui\`, \`efactura_message\`). **As of v3.0.0 the OAuth state itself no longer needs the session** — it lives in the cache — so a session-less stack works if you also replace the redirect handling. |
+| \`routes.middleware\` | *(not env)* | array | \`['web', 'auth']\` | Laravel middleware applied to both OAuth routes. Modify in \`config/efactura.php\` directly. **v4.0: the default adds \`auth\`** (it was \`['web']\`), so a guest is sent to the login page. \`auth\` does not check that the user may act for that CUI: add a check such as \`'can:authorize-efactura,cui'\` (a Gate receiving the \`cui\` route parameter), or disable the routes and run the flow yourself. The callback needs the logged-in browser too, including after \`efactura:auth\`. \`'web'\` is needed because the callback redirects with flashed session data (\`efactura_success\`, \`efactura_cui\`, \`efactura_message\`). **As of v3.0.0 the OAuth state itself no longer needs the session** — it lives in the cache — so a session-less stack works if you also replace the redirect handling. |
 | \`routes.success_redirect\` | \`EFACTURA_SUCCESS_REDIRECT\` | string | \`'/'\` | URL to redirect to after successful OAuth authorization. |
 | \`routes.error_redirect\` | \`EFACTURA_ERROR_REDIRECT\` | string | \`'/'\` | URL to redirect to if OAuth authorization fails or state validation fails. |
 

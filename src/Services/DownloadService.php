@@ -87,14 +87,19 @@ class DownloadService
                     ]);
                 }
 
-                $this->uploadService->markUploadAsCompleted($upload, $response->idDescarcare);
+                // As UploadService::markUploadAsCompleted(), guarded; see recordVerdict().
+                $this->recordVerdict($upload, [
+                    'status' => UploadStatus::Completed,
+                    'download_id' => $response->idDescarcare,
+                    'processed_at' => now(),
+                    ...($response->idDescarcare === null ? ['errors' => [__('efactura::messages.completed_without_download_id')]] : []),
+                ]);
 
                 return StatusCheckOutcome::Checked;
             }
 
             if ($response->isFailed()) {
-                // The SDK reads a bare <header><Errors/> answer (an unknown index, "Nu aveti
-                // dreptul") as nok without a download id: no verdict on the document.
+                // A nok without a download id is no verdict on the document either.
                 if ($response->idDescarcare === null) {
                     $this->parkAsIndeterminate($upload, [
                         __('efactura::messages.status_nok_without_download_id', ['index' => $upload->upload_index]),
@@ -106,13 +111,9 @@ class DownloadService
 
                 $errors = $response->errors ?? [__('efactura::messages.processing_failed_at_anaf')];
                 // ANAF processed the document and rejected it on its merits: terminal.
-                $this->uploadService->markUploadAsFailed(
-                    $upload,
-                    $errors,
-                    $response->idDescarcare,
-                    FailureReason::Validation,
-                );
-                rescue(fn () => event(new InvoiceFailed($upload, $response->errors ?? [])));
+                if ($this->recordFailure($upload, $errors, $response->idDescarcare, FailureReason::Validation)) {
+                    rescue(fn () => event(new InvoiceFailed($upload, $errors)));
+                }
 
                 return StatusCheckOutcome::Checked;
             }
@@ -121,14 +122,27 @@ class DownloadService
             if ($response->isNotProcessed()) {
                 $errors = $response->errors ?: [__('efactura::messages.not_processed_at_anaf')];
                 // Validation is not retryable: the document is never re-submitted automatically.
-                $this->uploadService->markUploadAsFailed($upload, $errors, null, FailureReason::Validation);
-                rescue(fn () => event(new InvoiceFailed($upload, $errors)));
+                if ($this->recordFailure($upload, $errors, null, FailureReason::Validation)) {
+                    rescue(fn () => event(new InvoiceFailed($upload, $errors)));
+                }
 
                 return StatusCheckOutcome::Checked;
             }
 
             if ($response->isInProgress()) {
                 // The ONLY legitimate no-op: ANAF said, in so many words, "not yet".
+                return StatusCheckOutcome::Checked;
+            }
+
+            // An error-only answer (an XML <Errors/> header or a JSON "eroare": an unknown
+            // index, "Nu aveti dreptul") is no verdict on the document. Park it, keeping
+            // ANAF's words on the row for whoever reconciles it.
+            if ($response->hasAnafError()) {
+                $this->parkAsIndeterminate($upload, [
+                    __('efactura::messages.status_nok_without_download_id', ['index' => $upload->upload_index]),
+                    ...array_values($response->errors ?? []),
+                ], $response->idDescarcare);
+
                 return StatusCheckOutcome::Checked;
             }
 
@@ -289,15 +303,55 @@ class DownloadService
      */
     protected function parkAsIndeterminate(EfacturaUpload $upload, array $errors, ?string $downloadId = null): void
     {
+        if (!$this->recordFailure($upload, $errors, $downloadId, FailureReason::Indeterminate)) {
+            return;
+        }
+
         Log::error('EFactura: parking upload for reconciliation', [
             'upload_id' => $upload->id,
             'upload_index' => $upload->upload_index,
             'errors' => $errors,
         ]);
 
-        $this->uploadService->markUploadAsFailed($upload, $errors, $downloadId, FailureReason::Indeterminate);
-
         rescue(fn () => event(new InvoiceFailed($upload, $errors)));
+    }
+
+    /**
+     * Record a status verdict only on a row that is still Processing.
+     *
+     * Overlapping status runs can both hold the row; only the one whose write lands
+     * records the verdict, and only it announces it.
+     *
+     * @param  array<string, mixed>  $attributes
+     * @return bool Whether this call recorded it.
+     */
+    private function recordVerdict(EfacturaUpload $upload, array $attributes): bool
+    {
+        $recorded = EfacturaUpload::where('id', $upload->id)
+            ->where('status', UploadStatus::Processing)
+            ->update($attributes) > 0;
+
+        if ($recorded) {
+            $upload->refresh();
+        }
+
+        return $recorded;
+    }
+
+    /**
+     * As UploadService::markUploadAsFailed(), guarded; see recordVerdict().
+     *
+     * @param  array<int, mixed>  $errors
+     */
+    private function recordFailure(EfacturaUpload $upload, array $errors, ?string $downloadId, FailureReason $reason): bool
+    {
+        return $this->recordVerdict($upload, [
+            'status' => UploadStatus::Failed,
+            'failure_reason' => $reason,
+            'errors' => $errors,
+            'processed_at' => now(),
+            ...($downloadId !== null ? ['download_id' => $downloadId] : []),
+        ]);
     }
 
     /**
@@ -334,16 +388,6 @@ class DownloadService
                 }
             );
 
-            $path = $this->storeResponse($upload, $response->content);
-            $upload->update([
-                'response_path' => $path,
-            ]);
-
-            // Only fire InvoiceProcessed for successful uploads, not error report downloads
-            if ($upload->status === UploadStatus::Completed) {
-                rescue(fn () => event(new InvoiceProcessed($upload)));
-            }
-
         } catch (RateLimitExceededException $e) {
             if ($this->skipsOnlyThisMessage($e, ['upload_id' => $upload->id])) {
                 return;
@@ -367,6 +411,42 @@ class DownloadService
                 'status_code' => $e instanceof ApiException ? $e->statusCode : null,
                 'error' => $e->getMessage(),
             ]);
+
+            return;
+        }
+
+        // ANAF delivered: a failure to keep the file is ours, so it is retried by the next
+        // run without counting against the download attempts.
+        try {
+            $path = $this->storeResponse($upload, $response->content);
+
+            // Guarded: an overlapping run may have stored it already, and announced it; and a
+            // row re-queued meanwhile (a new or no download id) must not get this attempt's file.
+            $stored = EfacturaUpload::where('id', $upload->id)
+                ->where('download_id', $upload->download_id)
+                ->whereNull('response_path')
+                ->update(['response_path' => $path]) > 0;
+        } catch (\Throwable $e) {
+            Log::error('EFactura: downloaded response could not be stored', [
+                'upload_id' => $upload->id,
+                'exception' => $e::class,
+                'error' => $e->getMessage(),
+            ]);
+
+            return;
+        }
+
+        if (!$stored) {
+            $this->deleteLostFile($path, EfacturaUpload::whereKey($upload->id)->value('response_path'));
+
+            return;
+        }
+
+        $upload->refresh();
+
+        // Only fire InvoiceProcessed for successful uploads, not error report downloads
+        if ($upload->status === UploadStatus::Completed) {
+            rescue(fn () => event(new InvoiceProcessed($upload)));
         }
     }
 
@@ -397,15 +477,15 @@ class DownloadService
             'body_sample' => $e instanceof ApiException ? $e->details : null,
         ]);
 
-        $upload->update([
+        // Count this attempt so needsResponseDownload() eventually stops selecting the
+        // row instead of re-hitting ANAF forever; increment() so overlapping runs both
+        // count. `now()` records the most recent failure for the reconcile view. Only for
+        // the download id this run asked for: a row re-queued meanwhile starts at zero.
+        EfacturaUpload::whereKey($upload->id)->where('download_id', $upload->download_id)->increment('response_attempts', 1, [
             'errors' => array_values(array_unique(array_merge(
                 $upload->errors ?? [],
                 [$e->getMessage()],
             ))),
-            // Count this attempt so needsResponseDownload() eventually stops
-            // selecting the row instead of re-hitting ANAF forever. `now()`
-            // records the most recent failure for the reconcile view.
-            'response_attempts' => $upload->response_attempts + 1,
             'response_failed_at' => now(),
         ]);
     }
@@ -444,11 +524,6 @@ class DownloadService
                 }
             );
 
-            $path = $this->storeMessageDownload($message, $response->content);
-            $this->markMessageAsDownloaded($message, $path);
-
-            rescue(fn () => event(new InvoiceReceived($message)));
-
         } catch (RateLimitExceededException $e) {
             // Same reasoning as checkStatus(): once ANAF has said "no more", walking the
             // rest of the backlog only re-confirms it, unless only this message is blocked.
@@ -473,9 +548,36 @@ class DownloadService
             }
 
             $this->recordMessageDownloadFailure($message, $e, $requested);
+
+            return;
         } catch (\Throwable $e) {
             $this->recordMessageDownloadFailure($message, $e, $requested);
+
+            return;
         }
+
+        // As for responses: a storage failure is retried without counting an attempt.
+        try {
+            $path = $this->storeMessageDownload($message, $response->content);
+            $marked = $this->markMessageAsDownloaded($message, $path);
+        } catch (\Throwable $e) {
+            Log::error('EFactura: downloaded message could not be stored', [
+                'message_id' => $message->id,
+                'exception' => $e::class,
+                'error' => $e->getMessage(),
+            ]);
+
+            return;
+        }
+
+        // An overlapping run stored it first, and announced it.
+        if (!$marked) {
+            $this->deleteLostFile($path, EfacturaMessage::whereKey($message->id)->value('xml_path'));
+
+            return;
+        }
+
+        rescue(fn () => event(new InvoiceReceived($message)));
     }
 
     /**
@@ -499,14 +601,35 @@ class DownloadService
     }
 
     /**
-     * Mark message as downloaded.
+     * Mark message as downloaded, only if no other run has.
+     *
+     * @return bool Whether this call marked it.
      */
-    public function markMessageAsDownloaded(EfacturaMessage $message, ?string $xmlPath = null): void
+    public function markMessageAsDownloaded(EfacturaMessage $message, ?string $xmlPath = null): bool
     {
-        $message->update([
-            'is_downloaded' => true,
-            'xml_path' => $xmlPath,
-        ]);
+        $marked = EfacturaMessage::whereKey($message->id)
+            ->where('is_downloaded', false)
+            ->update(['is_downloaded' => true, 'xml_path' => $xmlPath]) > 0;
+
+        if ($marked) {
+            $message->refresh();
+        }
+
+        return $marked;
+    }
+
+    /**
+     * Remove the file a run stored but lost the guarded write for.
+     *
+     * Kept when the winner stored the same name (both runs wrote it in the same second).
+     */
+    private function deleteLostFile(string $path, ?string $storedPath): void
+    {
+        if ($path === $storedPath) {
+            return;
+        }
+
+        rescue(fn () => Storage::disk(config('efactura.storage.disk', 'local'))->delete($path));
     }
 
     /**
@@ -526,7 +649,24 @@ class DownloadService
             $query->forToken($token);
         }
 
-        $query->each(fn (EfacturaUpload $upload) => $this->checkStatus($upload));
+        // A grant in its refresh cooldown would refuse every row: say so once per token.
+        $coolingDown = [];
+
+        $query->each(function (EfacturaUpload $upload) use (&$coolingDown) {
+            if ($upload->token && ($seconds = $this->tokenService->refreshCooldownSeconds($upload->token)) > 0) {
+                if (!isset($coolingDown[$upload->token->id])) {
+                    $coolingDown[$upload->token->id] = true;
+                    Log::warning('EFactura: Token refresh is cooling down, status checks wait', [
+                        'cui' => $upload->token->cui,
+                        'retry_in_seconds' => $seconds,
+                    ]);
+                }
+
+                return;
+            }
+
+            $this->checkStatus($upload);
+        });
     }
 
     /**
@@ -587,7 +727,9 @@ class DownloadService
             now()->format('Ymd_His')
         );
 
-        Storage::disk($disk)->put($filename, $content);
+        if (!Storage::disk($disk)->put($filename, $content)) {
+            throw new \RuntimeException("Could not store the response at {$filename} on disk {$disk}");
+        }
 
         return $filename;
     }
@@ -608,7 +750,9 @@ class DownloadService
             now()->format('Ymd_His')
         );
 
-        Storage::disk($disk)->put($filename, $content);
+        if (!Storage::disk($disk)->put($filename, $content)) {
+            throw new \RuntimeException("Could not store the received invoice at {$filename} on disk {$disk}");
+        }
 
         return $filename;
     }

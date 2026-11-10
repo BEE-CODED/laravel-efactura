@@ -385,6 +385,16 @@ describe('MessageSyncService', function () {
             expect(EfacturaMessage::first()->type)->toBe('received');
         });
 
+        it('classifies every MESAJ CUMPARATOR variant as received, whatever the filter', function () {
+            $this->tokenService->shouldReceive('executeWithClient')
+                ->once()
+                ->andReturn(anafListResponse([anafMessage(['tip' => 'MESAJ CUMPARATOR PRIMIT / MESAJ CUMPARATOR TRANSMIS'])]));
+
+            $this->messageSyncService->syncMessages($this->token, MessageFilter::InvoiceSent);
+
+            expect(EfacturaMessage::first()->type)->toBe('received');
+        });
+
         it('trusts tip over a contradicting filter', function () {
             // ANAF's tip is authoritative. A PRIMITA message must not be recorded as
             // sent just because the caller passed the InvoiceSent filter.
@@ -410,8 +420,8 @@ describe('MessageSyncService', function () {
         /**
          * This test used to assert ONLY the silent 'sent' fallback — it blessed the
          * bug. The production sync path (SyncMessages job) passes NO filter, so an
-         * unrecognised `tip` lands here. If ANAF ever qualifies a tip (say
-         * "MESAJ CUMPARATOR PRIMIT"), a RECEIVED invoice is recorded as 'sent', never
+         * unrecognised `tip` lands here. If ANAF ever adds a tip (say
+         * "FACTURA PRIMITA B2G"), a RECEIVED invoice is recorded as 'sent', never
          * matches ->received(), and is never downloaded — with nothing in the log to
          * say so. The fallback itself is a reasonable default; the SILENCE is the bug.
          */
@@ -420,7 +430,7 @@ describe('MessageSyncService', function () {
 
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andReturn(anafListResponse([anafMessage(['tip' => 'MESAJ CUMPARATOR PRIMIT'])]));
+                ->andReturn(anafListResponse([anafMessage(['tip' => 'FACTURA PRIMITA B2G'])]));
 
             $this->messageSyncService->syncMessages($this->token, null);
 
@@ -429,7 +439,7 @@ describe('MessageSyncService', function () {
             Log::shouldHaveReceived('warning')
                 ->once()
                 ->withArgs(fn (string $message, array $context) => str_contains($message, 'unrecognised message type')
-                    && $context['tip'] === 'MESAJ CUMPARATOR PRIMIT'
+                    && $context['tip'] === 'FACTURA PRIMITA B2G'
                     && $context['fell_back_to'] === 'sent');
         });
 
@@ -438,7 +448,7 @@ describe('MessageSyncService', function () {
 
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andReturn(anafListResponse([anafMessage(['tip' => 'MESAJ CUMPARATOR PRIMIT'])]));
+                ->andReturn(anafListResponse([anafMessage(['tip' => 'FACTURA PRIMITA B2G'])]));
 
             $this->messageSyncService->syncMessages($this->token, MessageFilter::InvoiceReceived);
 

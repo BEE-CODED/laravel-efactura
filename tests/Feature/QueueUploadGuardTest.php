@@ -56,7 +56,7 @@ beforeEach(function () {
 
 /**
  * Run $assertions against a faithfully simulated create/constraint race, then
- * clean up. POSTGRES-ONLY — skips on sqlite, with a real reason.
+ * clean up. POSTGRES-ONLY — skips on every other driver, with a real reason.
  *
  * A genuine race winner is a different request that has already COMMITTED on
  * another connection. That is what makes it survive queueFor()'s savepoint
@@ -75,6 +75,12 @@ function raceWinnerTest(object $test, Closure $assertions): void
 {
     if (DB::connection()->getDriverName() === 'sqlite') {
         test()->markTestSkipped('Requires a driver that poisons transactions and shares a database across connections (Postgres). Runs on the CI Postgres job.');
+    }
+
+    if (DB::connection()->getDriverName() !== 'pgsql') {
+        // MySQL/MariaDB run REPEATABLE READ: the test's RefreshDatabase transaction keeps its
+        // snapshot from before the winner committed, so the recovery re-read cannot see it.
+        test()->markTestSkipped('Requires READ COMMITTED inside the test transaction (Postgres); under MySQL/MariaDB REPEATABLE READ the recovery re-read cannot see a winner committed after the snapshot. Runs on the CI Postgres job.');
     }
 
     $default = config('database.default');
@@ -362,6 +368,76 @@ describe('re-uploading after a failure', function () {
 
         expect(EfacturaUpload::count())->toBe(1);
         expect($first->fresh()->status)->toBe(UploadStatus::Failed);
+    });
+
+    /**
+     * The hint offered a bare --not-filed, which resolveIndeterminateAsNotFiled() refuses for
+     * an upload ANAF gave an index.
+     */
+    it('suggests --filed with its index, or --not-filed --despite-index, for an indexed indeterminate upload', function () {
+        $first = $this->uploadService->queueUpload($this->invoice);
+        $first->update([
+            'status' => UploadStatus::Failed,
+            'failure_reason' => FailureReason::Indeterminate,
+            'upload_index' => '5001130255',
+        ]);
+
+        try {
+            $this->uploadService->queueUpload($this->invoice);
+            $this->fail('Expected DuplicateUploadException');
+        } catch (DuplicateUploadException $e) {
+            expect($e->getMessage())->toContain("--filed={$first->id} --index=5001130255")
+                ->toContain("--not-filed={$first->id} --despite-index")
+                ->not->toContain("--not-filed={$first->id}`");
+        }
+    });
+
+    /**
+     * The recycled row kept the old attempt's counters, so its new response was never
+     * downloaded (needsResponseDownload() stops at MAX_RESPONSE_ATTEMPTS).
+     */
+    it('starts the new attempt with fresh download and status counters', function () {
+        $first = $this->uploadService->queueUpload($this->invoice);
+        $first->update([
+            'status' => UploadStatus::Failed,
+            'failure_reason' => FailureReason::Validation,
+            'download_id' => '9001',
+            'response_attempts' => 3,
+            'response_failed_at' => now(),
+            'status_failures' => 2,
+        ]);
+
+        $second = $this->uploadService->queueUpload($this->invoice);
+
+        expect($second->response_attempts)->toBe(0)
+            ->and($second->response_failed_at)->toBeNull()
+            ->and($second->status_failures)->toBe(0);
+    });
+
+    /**
+     * The recycle was an unguarded update of the row as read. A worker that re-drove it
+     * in between (here: claimed it for transmission) had its in-flight row reset to
+     * Pending, and the next worker filed the invoice a second time.
+     */
+    it('does not recycle a failed row another worker re-drove after it was read', function () {
+        $first = $this->uploadService->queueUpload($this->invoice);
+        $first->update(['status' => UploadStatus::Failed, 'failure_reason' => FailureReason::Transient]);
+
+        $fired = false;
+        EfacturaUpload::retrieved(function (EfacturaUpload $upload) use (&$fired) {
+            if ($fired) {
+                return;
+            }
+
+            $fired = true;
+            DB::table('efactura_uploads')->where('id', $upload->id)
+                ->update(['status' => UploadStatus::Uploading->value, 'failure_reason' => null]);
+        });
+
+        $this->uploadService->queueUpload($this->invoice);
+
+        expect($fired)->toBeTrue()
+            ->and($first->fresh()->status)->toBe(UploadStatus::Uploading);
     });
 });
 

@@ -9,14 +9,17 @@
  * file that was distributed with this source code.
  */
 
+use BeeCoded\EFactura\EfacturaServiceProvider;
 use BeeCoded\EFactura\Events\TokenStored;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Services\TokenService;
+use Illuminate\Routing\RouteCollection;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Route;
 
 /**
  * The OAuth CSRF state must be verifiable WITHOUT the initiating session.
@@ -189,5 +192,24 @@ describe('CSRF protection remains real', function () {
         $this->tokenService->validateOAuthState($state);
 
         expect(Cache::has('efactura:oauth_state:'.$decoded['token']))->toBeFalse();
+    });
+});
+
+describe('the shipped route middleware', function () {
+    /**
+     * With ['web'] alone, anyone could start an authorization for any CUI and, if a
+     * company user approved it, bind that company's grant. TestCase forces ['web'], so
+     * this re-registers the package routes with the value config/efactura.php ships.
+     */
+    it('does not send a guest to ANAF', function () {
+        $shipped = (require __DIR__.'/../../config/efactura.php')['routes']['middleware'];
+        config(['efactura.routes.middleware' => $shipped]);
+
+        Route::setRoutes(new RouteCollection);
+        Route::get('login', fn () => 'login')->name('login');
+        (fn () => $this->registerRoutes())->call(app()->getProvider(EfacturaServiceProvider::class));
+        Route::getRoutes()->refreshNameLookups();
+
+        $this->get('/efactura/auth/18547290')->assertRedirect('/login');
     });
 });

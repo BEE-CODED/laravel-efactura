@@ -82,8 +82,13 @@ class EfacturaStatusCommand extends Command
                 $downloadService->downloadResponse($upload);
 
                 // A skipped or failed download only logs; say so instead of implying it worked.
-                if ($upload->fresh()?->response_path === null) {
-                    $this->warn("The response of upload #{$uploadId} was not downloaded (limit reached or error; see the log). DownloadResponses retries it.");
+                $after = $upload->fresh();
+                if ($after !== null && $after->response_path === null) {
+                    $this->warn("The response of upload #{$uploadId} was not downloaded (limit reached or error; see the log). ".(
+                        $after->response_attempts < EfacturaUpload::MAX_RESPONSE_ATTEMPTS
+                            ? 'DownloadResponses retries it.'
+                            : "It failed {$after->response_attempts} times and is no longer downloaded automatically."
+                    ));
                 }
             }
 

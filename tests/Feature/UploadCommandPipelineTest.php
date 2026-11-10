@@ -14,6 +14,7 @@ use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Jobs\ProcessSingleUpload;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
+use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFactura\Tests\Fixtures\TestInvoice;
 use Illuminate\Support\Facades\Queue;
@@ -69,6 +70,8 @@ describe('efactura:upload by default', function () {
 
         $a = makePending(1);
         $b = makePending(2);
+        // A row is taken once its own job, if any, would have run.
+        $this->travel(91)->seconds();
 
         $this->artisan('efactura:upload')->assertExitCode(0);
 
@@ -81,11 +84,39 @@ describe('efactura:upload by default', function () {
         Queue::fake();
 
         $upload = makePending(1);
+        // Old enough to be taken, so an inline upload would have sent it.
+        $this->travel(91)->seconds();
 
         $this->artisan('efactura:upload')->assertExitCode(0);
 
         // Still pending: the job owns the actual transmission.
+        Queue::assertPushed(ProcessSingleUpload::class, 1);
         expect($upload->fresh()->status)->toBe(UploadStatus::Pending);
+    });
+
+    it('says how many pending rows it left out and why', function () {
+        Queue::fake();
+
+        $cooling = EfacturaToken::create([
+            'cui' => '87654321',
+            'access_token' => 'test',
+            'refresh_token' => 'test',
+            'expires_at' => now()->addHour(),
+            'is_active' => true,
+        ]);
+        makePending(1);
+        makePending(2, $cooling);
+        makePending(3, $cooling);
+        $this->travel(91)->seconds();
+        makePending(4); // fresh: its own job may still be queued
+        coolDownGrant($cooling, 600);
+
+        $this->artisan('efactura:upload')
+            ->expectsOutputToContain('Queued 1 pending upload(s)')
+            ->expectsOutputToContain('Left out 3 pending upload(s): 1 recently queued or rate-limited (a later run takes '
+                .'the recent ones once they are idle; rate-limited ones are retried by their own job or the rate-limit retry), '
+                .'2 on a company whose token refresh ANAF refused recently')
+            ->assertExitCode(0);
     });
 
     it('filters by CUI', function () {
@@ -101,6 +132,7 @@ describe('efactura:upload by default', function () {
 
         $mine = makePending(1);
         makePending(2, $otherToken);
+        $this->travel(91)->seconds();
 
         $this->artisan('efactura:upload', ['--cui' => '12345678'])->assertExitCode(0);
 
@@ -123,6 +155,7 @@ describe('efactura:upload --sync', function () {
 
         $uploadService = Mockery::mock(UploadService::class);
         $uploadService->shouldReceive('processPendingUploads')->once()->with(null)->andReturn(1);
+        $uploadService->shouldReceive('pendingLeftOut')->andReturn(['owned' => 0, 'cooling' => 0]);
         app()->instance(UploadService::class, $uploadService);
 
         $this->artisan('efactura:upload', ['--sync' => true])->assertExitCode(0);
@@ -139,8 +172,9 @@ describe('efactura:upload --sync', function () {
         $first = makePending(1);
         $second = makePending(2);
         $third = makePending(3);
+        $this->travel(91)->seconds();
 
-        $uploadService = Mockery::mock(UploadService::class)->makePartial();
+        $uploadService = Mockery::mock(UploadService::class.'[processUpload]', [app(TokenService::class)]);
         $uploadService->shouldReceive('processUpload')
             ->once()
             ->andReturnUsing(function (EfacturaUpload $upload) {
@@ -158,5 +192,23 @@ describe('efactura:upload --sync', function () {
         // The rest are untouched, still queued for a later run.
         expect($second->fresh()->status)->toBe(UploadStatus::Pending)
             ->and($third->fresh()->status)->toBe(UploadStatus::Pending);
+    });
+
+    it('prints the rows of a cooling grant as skipped, not processed', function () {
+        $cooling = EfacturaToken::create([
+            'cui' => '87654321',
+            'access_token' => 'test',
+            'refresh_token' => 'test',
+            'expires_at' => now()->addHour(),
+            'is_active' => true,
+        ]);
+        makePending(1, $cooling);
+        makePending(2, $cooling);
+        coolDownGrant($cooling, 600);
+
+        $this->artisan('efactura:upload', ['--sync' => true])
+            ->expectsOutputToContain('Processed 0 upload(s).')
+            ->expectsOutputToContain('Skipped 2 upload(s) of a company whose token refresh ANAF refused recently')
+            ->assertExitCode(0);
     });
 });

@@ -122,7 +122,7 @@ This trait provides:
 - \`efacturaCompleted()\` — Status = Completed
 - \`efacturaFailed()\` — Status = Failed
 - \`efacturaProcessed()\` — Status IN (Completed, Failed)
-- \`efacturaAwaitingResponse()\` — Completed, has a \`download_id\`, but no \`response_path\` yet
+- \`efacturaAwaitingResponse()\` — Completed, has a \`download_id\`, no \`response_path\` yet, and \`response_attempts\` under \`EfacturaUpload::MAX_RESPONSE_ATTEMPTS\` (v4.0), so \`DownloadResponses\` will still fetch it
 
 ## Step 3: Queue Upload
 

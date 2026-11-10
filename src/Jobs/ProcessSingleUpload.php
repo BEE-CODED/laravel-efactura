@@ -14,8 +14,10 @@ declare(strict_types=1);
 namespace BeeCoded\EFactura\Jobs;
 
 use BeeCoded\EFactura\Enums\FailureReason;
+use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Events\InvoiceFailed;
 use BeeCoded\EFactura\Models\EfacturaUpload;
+use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFacturaSdk\Services\RateLimiter;
 use Illuminate\Bus\Queueable;
@@ -23,7 +25,9 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 use Throwable;
 
 class ProcessSingleUpload implements ShouldQueue
@@ -35,6 +39,9 @@ class ProcessSingleUpload implements ShouldQueue
     public int $maxExceptions = 3;
 
     private \DateTimeImmutable $retryDeadline;
+
+    /** Counter key segment for a run without a queue job (handle() called directly). */
+    private ?string $runId = null;
 
     public function __construct(
         public EfacturaUpload $upload,
@@ -57,6 +64,13 @@ class ProcessSingleUpload implements ShouldQueue
     public function handle(UploadService $uploadService, RateLimiter $rateLimiter): void
     {
         if (!config('efactura.enabled') || !config('efactura.features.upload_invoices')) {
+            // This job ends without a release, so a row it was waiting out a rate limit for is
+            // handed to ProcessPendingUploads, which skips a row that still has a reason.
+            EfacturaUpload::whereKey($this->upload->getKey())
+                ->where('status', UploadStatus::Pending)
+                ->where('failure_reason', FailureReason::RateLimited)
+                ->update(['failure_reason' => null]);
+
             return;
         }
 
@@ -70,6 +84,12 @@ class ProcessSingleUpload implements ShouldQueue
                     'upload_id' => $this->upload->id,
                     'delay_seconds' => $delay,
                 ]);
+
+                // Touched, so the scheduler sees the row as owned by this waiting job.
+                EfacturaUpload::whereKey($this->upload->getKey())
+                    ->where('status', UploadStatus::Pending)
+                    ->whereNull('failure_reason')
+                    ->update(['updated_at' => now()]);
 
                 $this->release($delay);
 
@@ -87,13 +107,17 @@ class ProcessSingleUpload implements ShouldQueue
 
         $reason = $this->upload->failure_reason;
 
-        // A rate-limited upload never leaves Pending — it is still in the pipeline,
-        // waiting out ANAF's quota, so there is no failed state to reset. Just wait.
-        if ($this->upload->isPending() && $reason === FailureReason::RateLimited) {
-            $delay = $this->retryDelayFor($reason);
+        // A rate-limited upload never leaves Pending — it is still in the pipeline, waiting
+        // out ANAF's quota, so there is no failed state to reset. Pending with no reason was
+        // refused by the token refresh cooldown before anything was sent. Either way wait, at
+        // least the rest of a running cooldown, without spending a transient attempt.
+        if ($this->upload->isPending() && ($reason === null || $reason === FailureReason::RateLimited)) {
+            $cooldown = $this->upload->token ? app(TokenService::class)->refreshCooldownSeconds($this->upload->token) : 0;
+            $delay = max($cooldown, $this->retryDelayFor($reason ?? FailureReason::Transient));
 
-            Log::info('EFactura: Upload rate-limited, releasing for a later attempt', [
+            Log::info('EFactura: Upload still pending, releasing for a later attempt', [
                 'upload_id' => $this->upload->id,
+                'failure_reason' => $reason?->value,
                 'delay_seconds' => $delay,
             ]);
 
@@ -178,6 +202,10 @@ class ProcessSingleUpload implements ShouldQueue
      * Transient failures get a bounded number of re-drives. Without a cap, a durable
      * fault (a revoked token answering 401 forever) would release every few seconds
      * for the whole retry window and hammer ANAF.
+     *
+     * Counted per queued job in the cache, not with attempts(): that also counts every
+     * rate-limit release, so a job that had waited out a few limits gave up on its first
+     * transient failure.
      */
     private function transientAttemptsExhausted(FailureReason $reason): bool
     {
@@ -187,7 +215,17 @@ class ProcessSingleUpload implements ShouldQueue
 
         $max = (int) config('efactura.jobs.max_transient_attempts', 5);
 
-        return $max > 0 && $this->attempts() >= $max;
+        if ($max <= 0) {
+            return false;
+        }
+
+        $runId = $this->job?->uuid() ?? ($this->runId ??= (string) Str::uuid());
+        $key = "efactura:upload:{$this->upload->id}:transient:{$runId}";
+
+        // add() first so the counter carries a TTL on every store.
+        Cache::add($key, 0, now()->addHours((int) config('efactura.rate_limit.retry_window_hours', 24)));
+
+        return (int) Cache::increment($key) >= $max;
     }
 
     /**
@@ -208,7 +246,7 @@ class ProcessSingleUpload implements ShouldQueue
     {
         Log::error('EFactura: Transient upload failure did not clear, giving up', [
             'upload_id' => $this->upload->id,
-            'attempts' => $this->attempts(),
+            'transient_attempts' => (int) config('efactura.jobs.max_transient_attempts', 5),
         ]);
 
         $uploadService->abandonFailure($this->upload, $reason, $this->recordedErrors());

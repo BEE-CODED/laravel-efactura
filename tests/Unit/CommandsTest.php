@@ -45,6 +45,7 @@ describe('EfacturaUploadCommand', function () {
         config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true]);
 
         $uploadService = Mockery::mock(UploadService::class);
+        $uploadService->shouldReceive('pendingLeftOut')->andReturn(['owned' => 0, 'cooling' => 0]);
         $uploadService->shouldReceive('dispatchPendingUploads')
             ->once()
             ->with(null)
@@ -61,6 +62,7 @@ describe('EfacturaUploadCommand', function () {
         config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true]);
 
         $uploadService = Mockery::mock(UploadService::class);
+        $uploadService->shouldReceive('pendingLeftOut')->andReturn(['owned' => 0, 'cooling' => 0]);
         $uploadService->shouldReceive('processPendingUploads')
             ->once()
             ->with(null)
@@ -78,6 +80,7 @@ describe('EfacturaUploadCommand', function () {
         config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true]);
 
         $uploadService = Mockery::mock(UploadService::class);
+        $uploadService->shouldReceive('pendingLeftOut')->andReturn(['owned' => 0, 'cooling' => 0]);
         $uploadService->shouldReceive('dispatchPendingUploads')
             ->once()
             ->with('12345678')
@@ -93,6 +96,7 @@ describe('EfacturaUploadCommand', function () {
         config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true]);
 
         $uploadService = Mockery::mock(UploadService::class);
+        $uploadService->shouldReceive('pendingLeftOut')->andReturn(['owned' => 0, 'cooling' => 0]);
         $uploadService->shouldReceive('dispatchPendingUploads')
             ->once()
             ->with('12345678')

@@ -1,9 +1,13 @@
 <?php
 
+use BeeCoded\EFactura\Events\TokenStored;
 use BeeCoded\EFactura\Http\Controllers\OAuthCallbackController;
+use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Services\TokenService;
-use Illuminate\Contracts\Container\BindingResolutionException;
+use BeeCoded\EFacturaSdk\Data\Auth\OAuthTokensData;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Http;
 
 beforeEach(function () {
     $this->tokenService = Mockery::mock(TokenService::class);
@@ -106,51 +110,67 @@ describe('OAuthCallbackController', function () {
             expect(session('efactura_message'))->toContain('Invalid or expired state');
         });
 
-        it('validates state before exchanging code', function () {
-            // Test the state validation path - SDK exchange requires configuration
-            config(['efactura.routes.error_redirect' => '/error']);
+        it('exchanges the code with ANAF after validating state and stores the tokens', function () {
+            config(['efactura.routes.success_redirect' => '/success']);
+            Event::fake([TokenStored::class]);
+            Http::fake(['logincert.anaf.ro/anaf-oauth2/v1/token' => Http::response([
+                'access_token' => 'new-access',
+                'refresh_token' => 'new-refresh',
+                'expires_in' => 3600,
+            ])]);
 
             $this->tokenService->shouldReceive('validateOAuthState')
                 ->with('valid_state')
                 ->once()
                 ->andReturn('12345678');
+            $this->tokenService->shouldReceive('storeToken')
+                ->once()
+                ->withArgs(fn (string $cui, OAuthTokensData $tokens) => $cui === '12345678'
+                    && $tokens->accessToken === 'new-access'
+                    && $tokens->refreshToken === 'new-refresh')
+                ->andReturn(new EfacturaToken);
 
             $request = Request::create('/callback', 'GET', [
                 'code' => 'auth_code',
                 'state' => 'valid_state',
             ]);
 
-            // The actual SDK call will fail without proper config,
-            // but we verify the flow reaches the exchange step
-            try {
-                $this->controller->callback($request);
-            } catch (BindingResolutionException) {
-                // Expected - SDK not configured
-            }
-
-            // State was validated if we got this far
-            expect(true)->toBeTrue();
-        });
-
-        it('handles exceptions during token exchange', function () {
-            // Verify exception handling path exists
-            config(['efactura.routes.error_redirect' => '/error']);
-
-            $this->tokenService->shouldReceive('validateOAuthState')
-                ->with('valid_state')
-                ->once()
-                ->andReturn('12345678');
-
-            $request = Request::create('/callback', 'GET', [
-                'code' => 'auth_code',
-                'state' => 'valid_state',
-            ]);
-
-            // SDK will throw because it's not configured
             $response = $this->controller->callback($request);
 
-            // Should redirect to error page
-            expect($response->getTargetUrl())->toContain('/error');
+            expect($response->getTargetUrl())->toContain('/success')
+                ->and(session('efactura_success'))->toBeTrue();
+            Http::assertSent(fn ($request) => $request->url() === 'https://logincert.anaf.ro/anaf-oauth2/v1/token'
+                && $request['grant_type'] === 'authorization_code'
+                && $request['code'] === 'auth_code');
+            Event::assertDispatched(TokenStored::class);
+        });
+
+        it('redirects with ANAF\'s error when the token exchange is refused', function () {
+            config(['efactura.routes.error_redirect' => '/error']);
+            Http::fake(['logincert.anaf.ro/anaf-oauth2/v1/token' => Http::response([
+                'error' => 'invalid_grant',
+                'error_description' => 'Authorization code expired',
+            ], 400)]);
+
+            $this->tokenService->shouldReceive('validateOAuthState')
+                ->with('valid_state')
+                ->once()
+                ->andReturn('12345678');
+            $this->tokenService->shouldNotReceive('storeToken');
+
+            $request = Request::create('/callback', 'GET', [
+                'code' => 'auth_code',
+                'state' => 'valid_state',
+            ]);
+
+            $response = $this->controller->callback($request);
+
+            // The exact ANAF message: a blocked stray request or a missing config would read differently.
+            expect($response->getTargetUrl())->toContain('/error')
+                ->and(session('efactura_message'))->toBe(
+                    'Failed to exchange authorization code: Token exchange failed: invalid_grant: Authorization code expired'
+                );
+            Http::assertSentCount(1);
         });
     });
 

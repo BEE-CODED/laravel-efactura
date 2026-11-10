@@ -18,6 +18,7 @@ use BeeCoded\EFactura\Jobs\RetryRateLimitedUploads;
 use BeeCoded\EFactura\Jobs\SweepStaleUploads;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
+use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
@@ -309,6 +310,7 @@ describe('rate-limited rows awaiting release', function () {
             'failure_reason' => FailureReason::RateLimited,
         ]);
 
+        $this->travel(91)->seconds();
         $dispatched = app(UploadService::class)->dispatchPendingUploads();
 
         expect($dispatched)->toBe(1);
@@ -317,5 +319,164 @@ describe('rate-limited rows awaiting release', function () {
             ProcessSingleUpload::class,
             fn (ProcessSingleUpload $job) => $job->upload->is($fresh)
         );
+    });
+});
+
+describe('scheduled jobs and a row with a live job', function () {
+    /**
+     * The scheduled jobs dispatched a second ProcessSingleUpload onto a row whose own job
+     * was still waiting out a rate limit: ProcessPendingUploads every tick, and
+     * RetryRateLimitedUploads for a row released moments ago. The synchronous batch
+     * re-sent such a row inside its own job's wait.
+     */
+    it('dispatches a rate-limited pending row only once nothing can still be working it', function () {
+        config(['efactura.rate_limit.retry_window_hours' => 24]);
+        Queue::fake();
+
+        $fresh = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => UploadStatus::Pending,
+        ]);
+        $released = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 2,
+            'status' => UploadStatus::Pending,
+            'failure_reason' => FailureReason::RateLimited,
+        ]);
+
+        $this->travel(91)->seconds();
+        app()->call([new ProcessPendingUploads, 'handle']);
+        Queue::assertPushed(ProcessSingleUpload::class, 1);
+        Queue::assertPushed(ProcessSingleUpload::class, fn (ProcessSingleUpload $job) => $job->upload->is($fresh));
+
+        (new RetryRateLimitedUploads)->handle();
+        Queue::assertPushed(ProcessSingleUpload::class, 1);
+
+        // Past the retry window its own job is over, so only the retry job recovers it.
+        EfacturaUpload::where('id', $released->id)->update(['updated_at' => now()->subHours(25)]);
+        (new RetryRateLimitedUploads)->handle();
+        Queue::assertPushed(ProcessSingleUpload::class, 2);
+        Queue::assertPushed(ProcessSingleUpload::class, fn (ProcessSingleUpload $job) => $job->upload->is($released));
+    });
+
+    // A re-queued failure keeps its first created_at; its released job's own deadline bounds it.
+    it('recovers a released rate-limited row older than the retry age', function () {
+        config(['efactura.rate_limit.retry_max_age_days' => 7]);
+        Queue::fake();
+
+        $released = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 2,
+            'status' => UploadStatus::Pending,
+            'failure_reason' => FailureReason::RateLimited,
+        ]);
+        EfacturaUpload::where('id', $released->id)->update([
+            'created_at' => now()->subDays(10),
+            'updated_at' => now()->subHours(25),
+        ]);
+
+        (new RetryRateLimitedUploads)->handle();
+
+        Queue::assertPushed(ProcessSingleUpload::class, fn (ProcessSingleUpload $job) => $job->upload->is($released));
+    });
+
+    // The job ends without a release while uploads are off, so nothing would own the row.
+    it('hands a rate-limited row back to the scheduler when its job finds uploads disabled', function () {
+        Queue::fake();
+
+        $released = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 2,
+            'status' => UploadStatus::Pending,
+            'failure_reason' => FailureReason::RateLimited,
+        ]);
+
+        config(['efactura.features.upload_invoices' => false]);
+        app()->call([new ProcessSingleUpload($released), 'handle']);
+
+        config(['efactura.features.upload_invoices' => true]);
+        $this->travel(5)->minutes();
+        app()->call([new ProcessPendingUploads, 'handle']);
+
+        Queue::assertPushed(ProcessSingleUpload::class, fn (ProcessSingleUpload $job) => $job->upload->is($released));
+    });
+
+    // No job owns a row on the synchronous path: a row it left rate-limited was never retried.
+    it('retries a rate-limited row and sends a fresh one at once from the synchronous batch', function () {
+        $rateLimited = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            // Any loadable model: the batch eager-loads the uploadable.
+            'uploadable_type' => EfacturaToken::class,
+            'uploadable_id' => $this->token->id,
+            'status' => UploadStatus::Pending,
+            'failure_reason' => FailureReason::RateLimited,
+        ]);
+        $fresh = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => EfacturaToken::class,
+            'uploadable_id' => $this->token->id + 1000,
+            'status' => UploadStatus::Pending,
+        ]);
+
+        $service = Mockery::mock(UploadService::class.'[processUpload]', [app(TokenService::class)]);
+        // Its claim clears the reason, as the real one does.
+        $service->shouldReceive('processUpload')->with(Mockery::on(fn ($upload) => $upload->is($rateLimited)))->once()
+            ->andReturnUsing(fn (EfacturaUpload $upload) => $upload->update(['status' => UploadStatus::Processing, 'failure_reason' => null]));
+        $service->shouldReceive('processUpload')->with(Mockery::on(fn ($upload) => $upload->is($fresh)))->once();
+
+        expect($service->processPendingUploads())->toBe(2);
+    });
+
+    it('skips the rows of a grant whose token refresh is cooling down in the synchronous batch', function () {
+        EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => EfacturaToken::class,
+            'uploadable_id' => $this->token->id,
+            'status' => UploadStatus::Pending,
+        ]);
+        coolDownGrant($this->token, 600);
+
+        $service = Mockery::mock(UploadService::class.'[processUpload]', [app(TokenService::class)]);
+        $service->shouldNotReceive('processUpload');
+
+        expect($service->processPendingUploads())->toBe(0)
+            ->and($service->pendingLeftOut())->toBe(['owned' => 0, 'cooling' => 1]);
+    });
+
+    // resetForRetry() clears the reason while the job waits out its transient release.
+    it('leaves a row its job just reset for a transient retry to that job', function () {
+        config(['efactura.jobs.transient_retry_delay_seconds' => 30]);
+        Queue::fake();
+
+        $reset = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => EfacturaToken::class,
+            'uploadable_id' => $this->token->id,
+            'status' => UploadStatus::Pending,
+        ]);
+        // Queued ten minutes ago and never touched since: nobody is on it.
+        $fresh = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => EfacturaToken::class,
+            'uploadable_id' => $this->token->id + 1000,
+            'status' => UploadStatus::Pending,
+        ]);
+        $this->travel(10)->minutes();
+        $reset->update(['status' => UploadStatus::Failed, 'failure_reason' => FailureReason::Transient]);
+        expect(app(UploadService::class)->resetForRetry($reset))->toBeTrue();
+
+        app()->call([new ProcessPendingUploads, 'handle']);
+        expect(app(UploadService::class)->dispatchPendingUploads())->toBe(1);
+        Queue::assertPushed(ProcessSingleUpload::class, 2);
+        Queue::assertNotPushed(ProcessSingleUpload::class, fn (ProcessSingleUpload $job) => $job->upload->is($reset));
+
+        // Its job did not come back for it: the next tick recovers it.
+        $this->travel(2)->minutes();
+        expect(app(UploadService::class)->dispatchPendingUploads())->toBe(2);
     });
 });

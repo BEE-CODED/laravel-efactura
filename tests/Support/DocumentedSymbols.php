@@ -58,6 +58,7 @@ final class DocumentedSymbols
         ['class' => 'BeeCoded\\EFactura\\Services\\TokenService', 'method' => 'persistTokenRefreshWithLock'],
         ['class' => 'BeeCoded\\EFactura\\Services\\TokenService', 'method' => 'isFresherThanStored'],
         ['class' => 'BeeCoded\\EFactura\\Services\\DownloadService', 'method' => 'isPoisonedBody'],
+        ['class' => 'BeeCoded\\EFactura\\Services\\UploadService', 'method' => 'markUploadAsUploading'],
     ];
 
     /**

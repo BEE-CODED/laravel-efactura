@@ -217,9 +217,9 @@ return new class extends Migration
      * open it?" (a question about the key). Conflating the two is what let a
      * wrong-key MAC failure masquerade as "already plaintext".
      *
-     * Hand-rolled rather than calling Encrypter::appearsEncrypted(): that helper
-     * is a late addition to the 11.x line, and this package supports
-     * illuminate/* ^11.0 — where it does not exist.
+     * Hand-rolled rather than calling Encrypter::appearsEncrypted(): that helper is a
+     * late Laravel 12 addition (12.50+), absent from the earlier 12.x releases this
+     * package still allows (laravel/framework 12.27.1 and later).
      */
     private function looksLikeCryptEnvelope(string $value): bool
     {

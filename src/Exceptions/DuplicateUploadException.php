@@ -32,11 +32,16 @@ class DuplicateUploadException extends \RuntimeException
 
     public static function indeterminate(EfacturaUpload $upload): self
     {
+        // ANAF decides an indexed upload's outcome under its index, so --not-filed needs --despite-index then.
+        $resolution = $upload->upload_index !== null
+            ? "`php artisan efactura:reconcile --filed={$upload->id} --index={$upload->upload_index}` once you have found it in SPV, "
+                ."or `php artisan efactura:reconcile --not-filed={$upload->id} --despite-index` if you checked SPV under that index and it is not there."
+            : "`php artisan efactura:reconcile --filed={$upload->id} --index=<index_incarcare>` "
+                ."or `php artisan efactura:reconcile --not-filed={$upload->id}`.";
+
         return new self(
             "Cannot re-queue upload {$upload->id}: its delivery to ANAF is indeterminate. "
-                .'Re-submitting could double-file this invoice. Reconcile it first with '
-                ."`php artisan efactura:reconcile --filed={$upload->id} --index=<index_incarcare>` "
-                ."or `php artisan efactura:reconcile --not-filed={$upload->id}`.",
+                .'Re-submitting could double-file this invoice. Reconcile it first with '.$resolution,
             $upload,
         );
     }

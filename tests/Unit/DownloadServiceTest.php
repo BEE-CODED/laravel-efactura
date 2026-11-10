@@ -26,6 +26,8 @@ beforeEach(function () {
     ]);
 
     $this->tokenService = Mockery::mock(TokenService::class);
+    // No grant is in its refresh cooldown unless a test says so.
+    $this->tokenService->shouldReceive('refreshCooldownSeconds')->andReturn(0)->byDefault();
     $this->uploadService = Mockery::mock(UploadService::class);
     $this->downloadService = new DownloadService($this->tokenService, $this->uploadService);
 });
@@ -101,11 +103,10 @@ describe('DownloadService', function () {
                     'id_descarcare' => 'DOWNLOAD456',
                 ]));
 
-            $this->uploadService->shouldReceive('markUploadAsCompleted')
-                ->once()
-                ->with($upload, 'DOWNLOAD456');
-
             $this->downloadService->checkStatus($upload);
+
+            expect($upload->fresh()->status)->toBe(UploadStatus::Completed)
+                ->and($upload->fresh()->download_id)->toBe('DOWNLOAD456');
         });
 
         it('marks upload as failed when processing failed', function () {
@@ -128,14 +129,15 @@ describe('DownloadService', function () {
                     'Errors' => ['Processing error'],
                 ]));
 
+            $this->downloadService->checkStatus($upload);
+
             // ANAF processed the document and rejected it: a terminal validation
             // verdict, which must be recorded as such so the retry job never
             // re-submits it.
-            $this->uploadService->shouldReceive('markUploadAsFailed')
-                ->once()
-                ->with($upload, ['Processing error'], 'ERROR_DL_123', FailureReason::Validation);
-
-            $this->downloadService->checkStatus($upload);
+            expect($upload->fresh()->status)->toBe(UploadStatus::Failed)
+                ->and($upload->fresh()->failure_reason)->toBe(FailureReason::Validation)
+                ->and($upload->fresh()->errors)->toBe(['Processing error'])
+                ->and($upload->fresh()->download_id)->toBe('ERROR_DL_123');
 
             Event::assertDispatched(InvoiceFailed::class);
         });
@@ -190,11 +192,10 @@ describe('DownloadService', function () {
                 ->once()
                 ->andReturn(StatusResponseData::fromAnafResponse(['eroare' => 'Nu exista niciun upload']));
 
-            $this->uploadService->shouldReceive('markUploadAsFailed')
-                ->once()
-                ->withArgs(fn ($u, $errors, $downloadId, $reason) => $u->is($upload) && $reason === FailureReason::Indeterminate);
-
             $this->downloadService->checkStatus($upload);
+
+            expect($upload->fresh()->status)->toBe(UploadStatus::Failed)
+                ->and($upload->fresh()->failure_reason)->toBe(FailureReason::Indeterminate);
 
             Event::assertDispatched(InvoiceFailed::class);
         });

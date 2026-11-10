@@ -11,9 +11,11 @@
 
 use BeeCoded\EFactura\Enums\FailureReason;
 use BeeCoded\EFactura\Enums\UploadStatus;
+use BeeCoded\EFactura\Exceptions\DuplicateUploadException;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\UploadService;
+use BeeCoded\EFactura\Tests\Fixtures\TestInvoice;
 use Illuminate\Support\Facades\Artisan;
 
 /**
@@ -120,6 +122,29 @@ describe('resolving an indeterminate upload as NOT FILED', function () {
     });
 });
 
+it('clears the parked outcome\'s response and attempt counters on either resolution', function (Closure $resolve) {
+    $upload = makeIndeterminateUpload();
+    $upload->update([
+        'download_id' => '3001234567',
+        'response_path' => 'efactura/responses/old.zip',
+        'response_attempts' => 3,
+        'response_failed_at' => now(),
+        'status_failures' => 2,
+    ]);
+
+    expect($resolve($this->uploadService, $upload))->toBeTrue();
+
+    $upload->refresh();
+    expect($upload->download_id)->toBeNull()
+        ->and($upload->response_path)->toBeNull()
+        ->and($upload->response_attempts)->toBe(0)
+        ->and($upload->response_failed_at)->toBeNull()
+        ->and($upload->status_failures)->toBe(0);
+})->with([
+    'filed' => [fn (UploadService $service, EfacturaUpload $upload) => $service->resolveIndeterminateAsFiled($upload, '5001130255')],
+    'not filed' => [fn (UploadService $service, EfacturaUpload $upload) => $service->resolveIndeterminateAsNotFiled($upload)],
+]);
+
 describe('the efactura:reconcile command', function () {
     it('lists uploads awaiting reconciliation', function () {
         $upload = makeIndeterminateUpload();
@@ -180,6 +205,7 @@ describe('the efactura:reconcile command', function () {
         $this->artisan('efactura:reconcile', ['--not-filed' => (string) $upload->id])
             ->expectsOutputToContain('cannot be resolved as not filed')
             ->expectsOutputToContain("--filed={$upload->id} --index=5001130255")
+            ->expectsOutputToContain("--not-filed={$upload->id} --despite-index")
             ->assertExitCode(1);
 
         expect($upload->fresh()->status)->toBe(UploadStatus::Failed)
@@ -192,6 +218,89 @@ describe('the efactura:reconcile command', function () {
 
         $this->artisan('efactura:reconcile', ['--not-filed' => (string) $upload->id])
             ->assertExitCode(1);
+    });
+});
+
+/**
+ * An indexed row ANAF keeps answering with an error had no exit: --not-filed was refused
+ * and --filed parked it again on the next status check. The operator who checked SPV
+ * under the index and did not find the invoice can now say so, explicitly.
+ */
+describe('resolving an indexed upload as not filed despite its index', function () {
+    $question = fn (EfacturaUpload $upload) => "Upload {$upload->id} has ANAF upload index 5001130255. "
+        .'Did you check SPV under that index and find the invoice is NOT there? If it is filed, it will be filed twice.';
+
+    it('re-queues it once the operator confirms, keeping the index in its errors', function () use ($question) {
+        $upload = makeIndeterminateUpload();
+        $upload->update(['upload_index' => '5001130255', 'uploaded_at' => now()]);
+
+        $this->artisan('efactura:reconcile', ['--not-filed' => (string) $upload->id, '--despite-index' => true])
+            ->expectsConfirmation($question($upload), 'yes')
+            ->assertExitCode(0);
+
+        $upload->refresh();
+        expect($upload->status)->toBe(UploadStatus::Pending)
+            ->and($upload->failure_reason)->toBeNull()
+            ->and($upload->upload_index)->toBeNull()
+            ->and($upload->uploaded_at)->toBeNull()
+            ->and(implode(' ', $upload->errors))->toContain('5001130255');
+    });
+
+    it('changes nothing when the operator declines', function () use ($question) {
+        $upload = makeIndeterminateUpload();
+        $upload->update(['upload_index' => '5001130255']);
+
+        $this->artisan('efactura:reconcile', ['--not-filed' => (string) $upload->id, '--despite-index' => true])
+            ->expectsConfirmation($question($upload), 'no')
+            ->assertExitCode(1);
+
+        expect($upload->fresh()->failure_reason)->toBe(FailureReason::Indeterminate)
+            ->and($upload->fresh()->upload_index)->toBe('5001130255');
+    });
+
+    it('changes nothing without an interactive confirmation', function () {
+        $upload = makeIndeterminateUpload();
+        $upload->update(['upload_index' => '5001130255']);
+
+        $this->artisan('efactura:reconcile', [
+            '--not-filed' => (string) $upload->id,
+            '--despite-index' => true,
+            '--no-interaction' => true,
+        ])->assertExitCode(1);
+
+        expect($upload->fresh()->failure_reason)->toBe(FailureReason::Indeterminate);
+    });
+
+    it('changes nothing when the index changed after the operator\'s decision was read', function () {
+        $upload = makeIndeterminateUpload();
+        $upload->update(['upload_index' => '5001130255']);
+
+        // A concurrent writer records another index between the service's read and its write.
+        $raced = false;
+        EfacturaUpload::retrieved(function () use (&$raced, $upload) {
+            if (!$raced) {
+                $raced = true;
+                EfacturaUpload::whereKey($upload->id)->update(['upload_index' => '5001130299']);
+            }
+        });
+
+        expect($this->uploadService->resolveIndeterminateAsNotFiled($upload, despiteIndex: true))->toBeFalse()
+            ->and($raced)->toBeTrue()
+            ->and($upload->fresh()->failure_reason)->toBe(FailureReason::Indeterminate)
+            ->and($upload->fresh()->upload_index)->toBe('5001130299');
+    });
+
+    it('lets the invoice be queued again afterwards', function () {
+        $invoice = TestInvoice::create(['number' => 'INV-001', 'cui' => '12345678', 'total' => 100]);
+        $upload = makeIndeterminateUpload();
+        $upload->update(['uploadable_type' => TestInvoice::class, 'uploadable_id' => $invoice->id, 'upload_index' => '5001130255']);
+
+        expect(fn () => $this->uploadService->queueUpload($invoice))
+            ->toThrow(DuplicateUploadException::class, "--not-filed={$upload->id} --despite-index");
+
+        expect($this->uploadService->resolveIndeterminateAsNotFiled($upload, despiteIndex: true))->toBeTrue()
+            ->and($this->uploadService->queueUpload($invoice)->is($upload))->toBeTrue()
+            ->and($upload->fresh()->status)->toBe(UploadStatus::Pending);
     });
 });
 

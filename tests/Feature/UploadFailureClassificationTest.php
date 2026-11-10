@@ -15,14 +15,22 @@ use BeeCoded\EFactura\Events\InvoiceFailed;
 use BeeCoded\EFactura\Events\InvoiceRateLimited;
 use BeeCoded\EFactura\Events\InvoiceUploaded;
 use BeeCoded\EFactura\Exceptions\DuplicateUploadException;
+use BeeCoded\EFactura\Jobs\ProcessPendingUploads;
+use BeeCoded\EFactura\Jobs\ProcessSingleUpload;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
+use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFactura\Tests\Fixtures\TestInvoice;
 use BeeCoded\EFacturaSdk\Facades\UblBuilder;
+use BeeCoded\EFacturaSdk\Services\RateLimiter;
+use Illuminate\Cache\Events\CacheMissed;
+use Illuminate\Contracts\Filesystem\Filesystem;
+use Illuminate\Contracts\Queue\Job;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 
@@ -316,6 +324,52 @@ describe('a token that predates the encryption migration', function () {
     });
 });
 
+describe('a deactivated token', function () {
+    /**
+     * Only the locked refresh path re-checked is_active, so a deactivated token that was
+     * not about to expire still filed invoices.
+     */
+    it('refuses a deactivated token before anything is sent', function () {
+        $upload = makePendingUpload();
+        $this->token->update(['is_active' => false]);
+
+        Http::fake([UPLOAD_URL => Http::response('should never be reached', 200)]);
+
+        $this->uploadService->processUpload($upload);
+
+        expect($upload->fresh()->status)->toBe(UploadStatus::Failed)
+            ->and($upload->fresh()->failure_reason)->toBe(FailureReason::Transient)
+            ->and($upload->fresh()->errors)->toBe(['Token for CUI 12345678 has been deactivated']);
+
+        Http::assertNothingSent();
+    });
+});
+
+describe('an XML file that cannot be stored', function () {
+    /**
+     * put() returning false was ignored, and a storage exception was recorded as a
+     * terminal validation failure of the invoice. Storage is ours to fix: retry it.
+     */
+    it('is a transient failure, announced to nobody, and nothing is sent', function () {
+        Event::fake([InvoiceFailed::class]);
+        $disk = Mockery::mock(Filesystem::class);
+        $disk->shouldReceive('put')->andReturn(false);
+        Storage::set('local', $disk);
+
+        Http::fake([UPLOAD_URL => Http::response('should never be reached', 200)]);
+
+        $upload = makePendingUpload();
+        $this->uploadService->processUpload($upload);
+
+        expect($upload->fresh()->status)->toBe(UploadStatus::Failed)
+            ->and($upload->fresh()->failure_reason)->toBe(FailureReason::Transient)
+            ->and($upload->fresh()->xml_path)->toBeNull();
+
+        Event::assertNotDispatched(InvoiceFailed::class);
+        Http::assertNothingSent();
+    });
+});
+
 describe('failure classification is carried in a dedicated column', function () {
     it('records rate_limited without encoding the class in the error text', function () {
         Http::fake([UPLOAD_URL => Http::response('prea multe apeluri', 429)]);
@@ -438,7 +492,7 @@ describe('an upload answer that does not say whether the document was taken in',
 });
 
 /**
- * ANAF assigns an upload index only to a document it took in. Dropping that index and
+ * ANAF assigns an upload index only to a document it received. Dropping that index and
  * recording a rejection lost the only handle on a filed invoice.
  */
 describe('an upload answer carrying a usable index', function () {
@@ -534,5 +588,252 @@ describe('a throwing listener after a recorded upload state', function () {
         $upload->refresh();
         expect($upload->status)->toBe(UploadStatus::Pending)
             ->and($upload->failure_reason)->toBe(FailureReason::RateLimited);
+    });
+});
+
+/**
+ * The refresh cooldown refuses an upload without asking ANAF. Counted as a transient
+ * failure, it abandoned every upload of the company within about 2.5 minutes.
+ */
+describe('an upload refused by the refresh cooldown', function () {
+    it('waits it out without spending transient attempts, then uploads', function () {
+        config([
+            'efactura.jobs.max_transient_attempts' => 5,
+            'efactura.jobs.transient_retry_delay_seconds' => 30,
+        ]);
+        Event::fake([InvoiceFailed::class]);
+        Http::fake([
+            'https://logincert.anaf.ro/anaf-oauth2/v1/token' => Http::sequence()
+                ->push(['error' => 'invalid_client'], 401)
+                ->push(['access_token' => 'NEW_ACCESS', 'refresh_token' => 'NEW_REFRESH', 'expires_in' => 3600]),
+            UPLOAD_URL => Http::response(json_encode(['ExecutionStatus' => '0', 'index_incarcare' => '12345']), 200),
+        ]);
+        $this->token->update(['expires_at' => now()->addSeconds(60)]);
+        $upload = makePendingUpload();
+
+        // One queued job: each release re-runs it with the row read afresh, under the same uuid.
+        $queueJob = Mockery::mock(Job::class);
+        $queueJob->shouldReceive('uuid')->andReturn('job-uuid-cooldown');
+        $queueJob->shouldReceive('release');
+        $run = fn () => app()->call([(new ProcessSingleUpload($upload->fresh()))->setJob($queueJob), 'handle']);
+
+        // The first run asks ANAF and is refused; the next five fall in the cooldown.
+        foreach (range(1, 6) as $attempt) {
+            $run();
+            $this->travel(30)->seconds();
+        }
+
+        expect($upload->fresh()->status)->toBe(UploadStatus::Pending)
+            ->and($upload->fresh()->failure_reason)->toBeNull();
+        Event::assertNotDispatched(InvoiceFailed::class);
+        Http::assertSentCount(1);
+
+        $this->travel(15)->minutes();
+        $run();
+
+        expect($upload->fresh()->status)->toBe(UploadStatus::Processing)
+            ->and($upload->fresh()->upload_index)->toBe('12345');
+    });
+
+    // Released every 30 s, each run built and stored a new XML file for 24 hours.
+    it('sleeps the rest of the cooldown and builds no XML meanwhile', function () {
+        Http::fake([
+            'https://logincert.anaf.ro/anaf-oauth2/v1/token' => Http::response(['error' => 'invalid_grant'], 400),
+            UPLOAD_URL => Http::response('never reached', 500),
+        ]);
+        $this->token->update(['expires_at' => now()->addSeconds(60)]);
+        $upload = makePendingUpload();
+
+        $delays = [];
+        $queueJob = Mockery::mock(Job::class);
+        $queueJob->shouldReceive('uuid')->andReturn('job-uuid-cooldown-sleep');
+        $queueJob->shouldReceive('release')->andReturnUsing(function (int $delay) use (&$delays) {
+            $delays[] = $delay;
+        });
+        $run = fn () => app()->call([(new ProcessSingleUpload($upload->fresh()))->setJob($queueJob), 'handle']);
+
+        $run(); // refused by ANAF: the cooldown starts
+        $files = Storage::disk('local')->allFiles();
+        $this->travel(30)->seconds();
+        $run();
+
+        expect($delays[1])->toBeGreaterThanOrEqual(860)->toBeLessThanOrEqual(870)
+            ->and(Storage::disk('local')->allFiles())->toBe($files)
+            ->and($upload->fresh()->status)->toBe(UploadStatus::Pending);
+        Http::assertSentCount(1);
+    });
+});
+
+describe('a freshly queued row whose own job waits on the quota pre-check', function () {
+    it('gets no second job from the scheduler', function () {
+        Queue::fake();
+        $upload = $this->uploadService->queueUpload($this->invoice);
+
+        // A month-start backlog: its job starts minutes later and meets an exhausted quota.
+        $this->travel(5)->minutes();
+        $rateLimiter = Mockery::mock(RateLimiter::class);
+        $rateLimiter->shouldReceive('isEnabled')->andReturn(true);
+        $rateLimiter->shouldReceive('getRemainingQuota')->with('global')->andReturn(['remaining' => 0, 'resetsIn' => 40]);
+        $queueJob = Mockery::mock(Job::class);
+        $queueJob->shouldReceive('release')->once()->with(40);
+        (new ProcessSingleUpload($upload->fresh()))->setJob($queueJob)->handle($this->uploadService, $rateLimiter);
+
+        app()->call([new ProcessPendingUploads, 'handle']);
+
+        Queue::assertNothingPushed();
+    });
+});
+
+describe('a model read before the row was reset for a retry', function () {
+    // Claimed in memory without syncing originals, the failure write skipped status and
+    // reason (equal to the stale ones), leaving a never-sent row in Uploading.
+    it('records the failure of its own run', function () {
+        $upload = makePendingUpload();
+        $upload->update(['status' => UploadStatus::Failed, 'failure_reason' => FailureReason::Transient, 'errors' => ['earlier']]);
+        $stale = EfacturaUpload::find($upload->id);
+
+        // Another job resets the row for a retry; this run still holds the Failed copy.
+        EfacturaUpload::whereKey($upload->id)->update(['status' => UploadStatus::Pending, 'failure_reason' => null]);
+        $this->token->update(['is_active' => false]);
+        Http::fake([UPLOAD_URL => Http::response('should never be reached', 200)]);
+
+        $this->uploadService->processUpload($stale);
+
+        expect($upload->fresh()->status)->toBe(UploadStatus::Failed)
+            ->and($upload->fresh()->failure_reason)->toBe(FailureReason::Transient);
+        Http::assertNothingSent();
+    });
+});
+
+describe('a rate limit answered after the row was parked', function () {
+    it('announces no rate limit for a row it did not hand back', function () {
+        Event::fake([InvoiceRateLimited::class]);
+        $upload = makePendingUpload();
+        Http::fake([UPLOAD_URL => function () use ($upload) {
+            // The stale sweep parks the row while the request is in flight.
+            EfacturaUpload::whereKey($upload->id)->update([
+                'status' => UploadStatus::Failed,
+                'failure_reason' => FailureReason::Indeterminate,
+            ]);
+
+            return Http::response(['eroare' => 'Limita depasita'], 429);
+        }]);
+
+        $this->uploadService->processUpload($upload);
+
+        Event::assertNotDispatched(InvoiceRateLimited::class);
+        expect($upload->fresh()->failure_reason)->toBe(FailureReason::Indeterminate);
+    });
+});
+
+/**
+ * The cooldown is stored as its expiry. Redis hands a stored int back as a numeric string,
+ * which an is_int() read took for no cooldown at all: every job asked ANAF again.
+ */
+describe('a refresh cooldown read back as a numeric string', function () {
+    beforeEach(function () {
+        Http::fake();
+        $this->delays = [];
+        $this->runJob = function (EfacturaUpload $upload): void {
+            $queueJob = Mockery::mock(Job::class);
+            $queueJob->shouldReceive('uuid')->andReturn('job-uuid-numeric-cooldown');
+            $queueJob->shouldReceive('release')->andReturnUsing(function (int $delay) {
+                $this->delays[] = $delay;
+            });
+            app()->call([(new ProcessSingleUpload($upload->fresh()))->setJob($queueJob), 'handle']);
+        };
+    });
+
+    it('is seen, and the job sleeps it out without asking ANAF', function () {
+        $upload = makePendingUpload();
+        coolDownGrant($this->token, 600);
+
+        expect(app(TokenService::class)->refreshCooldownSeconds($this->token))->toBeGreaterThan(590);
+
+        ($this->runJob)($upload);
+
+        expect($this->delays)->toHaveCount(1)
+            ->and($this->delays[0])->toBeGreaterThan(590)->toBeLessThanOrEqual(600)
+            ->and($upload->fresh()->status)->toBe(UploadStatus::Pending);
+        Http::assertNothingSent();
+    });
+
+    it('releases a rate-limited row for the rest of the cooldown, not the usual minute', function () {
+        $upload = makePendingUpload();
+        $upload->update(['failure_reason' => FailureReason::RateLimited]);
+        coolDownGrant($this->token, 600);
+
+        ($this->runJob)($upload);
+
+        expect($this->delays)->toHaveCount(1)
+            ->and($this->delays[0])->toBeGreaterThan(590)->toBeLessThanOrEqual(600)
+            ->and($upload->fresh()->failure_reason)->toBe(FailureReason::RateLimited);
+        Http::assertNothingSent();
+    });
+});
+
+describe('the dispatchers during a refresh cooldown', function () {
+    beforeEach(function () {
+        Queue::fake();
+
+        $this->otherToken = EfacturaToken::create([
+            'cui' => '87654321',
+            'access_token' => 'OTHER_ACCESS',
+            'refresh_token' => 'OTHER_REFRESH',
+            'expires_at' => now()->addHour(),
+            'is_active' => true,
+        ]);
+        $this->cooling = makePendingUpload();
+        $this->other = EfacturaUpload::create([
+            'efactura_token_id' => $this->otherToken->id,
+            'uploadable_type' => TestInvoice::class,
+            'uploadable_id' => TestInvoice::create(['number' => 'INV-002', 'cui' => '87654321', 'total' => 100])->id,
+            'status' => UploadStatus::Pending,
+            'standard' => 'UBL',
+        ]);
+        $this->travel(91)->seconds();
+        coolDownGrant($this->token, 600);
+    });
+
+    it('leave a cooling grant\'s rows out of the scheduled dispatch', function () {
+        app()->call([new ProcessPendingUploads, 'handle']);
+
+        Queue::assertPushed(ProcessSingleUpload::class, 1);
+        Queue::assertPushed(ProcessSingleUpload::class, fn (ProcessSingleUpload $job) => $job->upload->is($this->other));
+    });
+
+    it('leave a cooling grant\'s rows out of dispatchPendingUploads()', function () {
+        expect($this->uploadService->dispatchPendingUploads())->toBe(1);
+
+        Queue::assertPushed(ProcessSingleUpload::class, 1);
+        Queue::assertPushed(ProcessSingleUpload::class, fn (ProcessSingleUpload $job) => $job->upload->is($this->other));
+    });
+});
+
+// Only reachable when another worker is refused between this upload's checks and its call.
+describe('a cooldown that starts after the row was claimed', function () {
+    it('hands the claim back to Pending without spending an attempt or sending anything', function () {
+        Http::fake();
+        // Expiring, so the call takes the refresh path that re-checks the cooldown.
+        $this->token->update(['expires_at' => now()->addSeconds(60)]);
+        $upload = makePendingUpload();
+
+        // processUpload()'s own check finds no cooldown; another worker is refused right after.
+        $refused = false;
+        Event::listen(CacheMissed::class, function (CacheMissed $event) use (&$refused) {
+            if (!$refused && str_starts_with($event->key, 'efactura:token_refresh_refused:')) {
+                $refused = true;
+                coolDownGrant(EfacturaToken::find($this->token->id), 900);
+            }
+        });
+
+        $this->uploadService->processUpload($upload);
+
+        $upload->refresh();
+        expect($refused)->toBeTrue()
+            ->and($upload->status)->toBe(UploadStatus::Pending)
+            ->and($upload->failure_reason)->toBeNull()
+            ->and($upload->errors[0])->toContain('ANAF refused to refresh the token');
+        Http::assertNothingSent();
     });
 });

@@ -38,7 +38,7 @@ use Illuminate\Support\Facades\Log;
  *
  * Resets qualifying uploads back to "pending" and dispatches ProcessSingleUpload for
  * each, ensuring they go through the rate-limit-aware upload path. Only retries
- * uploads within the configured max age window.
+ * Failed uploads within the configured max age window.
  */
 class RetryRateLimitedUploads implements ShouldBeUniqueUntilProcessing, ShouldQueue
 {
@@ -65,8 +65,9 @@ class RetryRateLimitedUploads implements ShouldBeUniqueUntilProcessing, ShouldQu
 
         $batchSize = config('efactura.rate_limit.retry_batch_size', 250);
         $maxAgeDays = config('efactura.rate_limit.retry_max_age_days', 7);
+        $staleBefore = now()->subHours((int) config('efactura.rate_limit.retry_window_hours', 24));
 
-        $uploads = $this->retryableQuery($maxAgeDays)
+        $uploads = $this->retryableQuery($maxAgeDays, $staleBefore)
             ->oldest()
             ->limit($batchSize)
             ->get();
@@ -92,12 +93,22 @@ class RetryRateLimitedUploads implements ShouldBeUniqueUntilProcessing, ShouldQu
         // lost a race are harmless: processUpload's claim (WHERE status = pending)
         // matches nothing and the job returns without touching ANAF.
         foreach ($uploads as $upload) {
+            // A stale released row is claimed by touching it, so a later or overlapping
+            // run skips it while this job waits in a backlog longer than the schedule.
+            if ($upload->status === UploadStatus::Pending && EfacturaUpload::whereKey($upload->getKey())
+                ->where('status', UploadStatus::Pending)
+                ->where('failure_reason', FailureReason::RateLimited)
+                ->where('updated_at', '<', $staleBefore)
+                ->update(['updated_at' => now()]) === 0) {
+                continue;
+            }
+
             ProcessSingleUpload::dispatch($upload);
         }
 
         Log::info('EFactura: Reset retryable uploads to pending', [
             'reset_count' => $resetCount,
-            'remaining' => $this->retryableQuery($maxAgeDays)->count(),
+            'remaining' => $this->retryableQuery($maxAgeDays, $staleBefore)->count(),
         ]);
     }
 
@@ -111,11 +122,16 @@ class RetryRateLimitedUploads implements ShouldBeUniqueUntilProcessing, ShouldQu
      *  - `Failed` + a retryable reason: the worker died between marking the
      *    failure and releasing itself. Also the shape the v2->v3 migration
      *    backfills onto legacy rows.
-     *  - `Pending` + `rate_limited`: as of v3.0.0 markAsRateLimited releases the
-     *    claim back to Pending, so this is a live rate-limited row. It is
-     *    deliberately invisible to dispatchPendingUploads (which would stack a
-     *    duplicate job on top of the released one every tick), which means if
-     *    that released job dies, this job is the ONLY thing that recovers it.
+     *  - `Pending` + `rate_limited`, untouched for longer than
+     *    `rate_limit.retry_window_hours`: markAsRateLimited releases the claim
+     *    back to Pending, and the row's own job keeps re-driving it until its
+     *    retry window ends. Such a row is invisible to dispatchPendingUploads,
+     *    so if that job dies, this job is the only thing that recovers it. A row
+     *    touched within the window may still have its job, and a second one would
+     *    send the document twice as often against ANAF's quota. Re-dispatching
+     *    touches the row, so it waits another window before it qualifies again.
+     *    No age limit: a re-queued failure keeps its first created_at, and the
+     *    re-dispatched job's own retryUntil() and failed() bound the row.
      *
      * Selecting on the indexed `failure_reason` column replaces the previous
      * `where('errors', 'like', ...)`. That predicate was fatal on Postgres (no
@@ -126,17 +142,18 @@ class RetryRateLimitedUploads implements ShouldBeUniqueUntilProcessing, ShouldQu
      *
      * @return Builder<EfacturaUpload>
      */
-    private function retryableQuery(int $maxAgeDays): Builder
+    private function retryableQuery(int $maxAgeDays, \DateTimeInterface $staleBefore): Builder
     {
-        return EfacturaUpload::where(function (Builder $query) {
-            $query->where(function (Builder $failed) {
+        return EfacturaUpload::where(function (Builder $query) use ($maxAgeDays, $staleBefore) {
+            $query->where(function (Builder $failed) use ($maxAgeDays) {
                 $failed->where('status', UploadStatus::Failed)
-                    ->whereIn('failure_reason', FailureReason::retryable());
-            })->orWhere(function (Builder $released) {
+                    ->whereIn('failure_reason', FailureReason::retryable())
+                    ->where('created_at', '>=', now()->subDays($maxAgeDays));
+            })->orWhere(function (Builder $released) use ($staleBefore) {
                 $released->where('status', UploadStatus::Pending)
-                    ->where('failure_reason', FailureReason::RateLimited);
+                    ->where('failure_reason', FailureReason::RateLimited)
+                    ->where('updated_at', '<', $staleBefore);
             });
-        })
-            ->where('created_at', '>=', now()->subDays($maxAgeDays));
+        });
     }
 }

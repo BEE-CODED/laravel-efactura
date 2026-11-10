@@ -111,6 +111,8 @@ describe('syncMessages', function () {
                 $message([]),
                 $message(['id' => '  ']),
                 $message(['id' => ['3001130059']]),
+                // Not an ANAF id: the SDK's download refuses it, so it could never be fetched.
+                $message(['id' => 'ABC-3001130061']),
                 $message(['id' => '3001130060']),
             ])),
         ]);
@@ -124,7 +126,7 @@ describe('syncMessages', function () {
         expect(EfacturaMessage::pluck('message_id')->all())->toBe(['3001130060']);
         Log::shouldHaveReceived('warning')
             ->with('EFactura: ANAF listed a message without a usable id, skipping it', Mockery::type('array'))
-            ->times(3);
+            ->times(4);
     });
 });
 

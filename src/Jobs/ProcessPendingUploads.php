@@ -61,7 +61,8 @@ class ProcessPendingUploads implements ShouldBeUniqueUntilProcessing, ShouldQueu
             return;
         }
 
-        $query = EfacturaUpload::pending();
+        // Leaves out rows a job still owns; see UploadService::dispatchPendingUploads().
+        $query = EfacturaUpload::awaitingDispatch();
 
         if ($this->cui) {
             $token = $tokenService->getToken($this->cui);
@@ -73,6 +74,13 @@ class ProcessPendingUploads implements ShouldBeUniqueUntilProcessing, ShouldQueu
             $query->forToken($token);
         }
 
-        $query->each(fn (EfacturaUpload $upload) => ProcessSingleUpload::dispatch($upload));
+        $query->with('token')->each(function (EfacturaUpload $upload) use ($tokenService) {
+            // Its job, if any, sleeps the cooldown out; a new one would only stack on it.
+            if ($upload->token && $tokenService->refreshCooldownSeconds($upload->token) > 0) {
+                return;
+            }
+
+            ProcessSingleUpload::dispatch($upload);
+        });
     }
 }

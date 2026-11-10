@@ -24,6 +24,7 @@ use BeeCoded\EFactura\Services\DownloadService;
 use BeeCoded\EFacturaSdk\Exceptions\ApiException;
 use BeeCoded\EFacturaSdk\Exceptions\RateLimitExceededException;
 use BeeCoded\EFacturaSdk\Services\RateLimiter;
+use Illuminate\Contracts\Filesystem\Filesystem;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
@@ -228,6 +229,50 @@ describe('downloadResponse', function () {
 
         expect($upload->fresh()->response_path)->not->toBeNull();
     });
+
+    /**
+     * put() returning false was ignored, so response_path pointed at a file that was
+     * never written. A storage problem is ours, not ANAF's: it must not use up the
+     * download attempts either.
+     */
+    it('records neither a path nor an attempt when the file cannot be stored', function () {
+        $disk = Mockery::mock(Filesystem::class);
+        $disk->shouldReceive('put')->andReturn(false);
+        Storage::set('local', $disk);
+
+        Http::fake([DOWNLOAD_URL => Http::response("PK\x03\x04FAKEZIPBODY", 200, ['Content-Type' => 'application/zip'])]);
+
+        $upload = makeCompletedUpload($this->token);
+
+        $this->downloadService->downloadResponse($upload);
+
+        expect($upload->fresh()->response_path)->toBeNull()
+            ->and($upload->fresh()->response_attempts)->toBe(0);
+    });
+
+    it('neither marks a received invoice downloaded nor counts an attempt when it cannot be stored', function () {
+        Event::fake([InvoiceReceived::class]);
+        $disk = Mockery::mock(Filesystem::class);
+        $disk->shouldReceive('put')->andReturn(false);
+        Storage::set('local', $disk);
+        Http::fake([DOWNLOAD_URL => Http::response('PKFAKEZIPBODY', 200, ['Content-Type' => 'application/zip'])]);
+
+        $message = EfacturaMessage::create([
+            'efactura_token_id' => $this->token->id,
+            'message_id' => '4001130001',
+            'type' => 'received',
+            'download_id' => '4001130001',
+            'is_downloaded' => false,
+        ]);
+
+        $this->downloadService->downloadMessage($message);
+
+        $message->refresh();
+        expect($message->is_downloaded)->toBeFalse()
+            ->and($message->xml_path)->toBeNull()
+            ->and($message->download_attempts)->toBe(0);
+        Event::assertNotDispatched(InvoiceReceived::class);
+    });
 });
 
 describe('a poisoned response must not be re-downloaded forever', function () {
@@ -297,6 +342,157 @@ describe('a poisoned response must not be re-downloaded forever', function () {
     });
 });
 
+describe('overlapping runs on one upload', function () {
+    /**
+     * Two runs that loaded the same Processing row each recorded ANAF's verdict and each
+     * announced it, and the event carried no errors.
+     */
+    it('announces a rejection once, with ANAF\'s errors', function () {
+        Event::fake([InvoiceFailed::class]);
+        Http::fake([STATUS_URL => Http::response(['stare' => 'nok', 'id_descarcare' => '3001130059'], 200)]);
+
+        $first = makeProcessingUpload($this->token);
+        $second = EfacturaUpload::find($first->id);
+
+        $this->downloadService->checkStatus($first);
+        $this->downloadService->checkStatus($second);
+
+        expect($first->fresh()->failure_reason)->toBe(FailureReason::Validation);
+        Event::assertDispatchedTimes(InvoiceFailed::class, 1);
+        Event::assertDispatched(InvoiceFailed::class, fn (InvoiceFailed $e) => $e->errors !== []);
+    });
+
+    it('keeps the first stored response and announces it once', function () {
+        Event::fake([InvoiceProcessed::class]);
+        Storage::fake('local');
+        Http::fake([DOWNLOAD_URL => Http::response('PKFAKEZIPBODY', 200, ['Content-Type' => 'application/zip'])]);
+
+        $first = makeCompletedUpload($this->token);
+        $second = EfacturaUpload::find($first->id);
+
+        $this->downloadService->downloadResponse($first);
+        $path = $first->fresh()->response_path;
+        // A later second, so the overlapping run would write a different file name.
+        $this->travel(2)->seconds();
+        $this->downloadService->downloadResponse($second);
+
+        expect($path)->not->toBeNull()
+            ->and($first->fresh()->response_path)->toBe($path);
+        Event::assertDispatchedTimes(InvoiceProcessed::class, 1);
+    });
+
+    // In the same second both runs write one file name: the loser must not delete it.
+    it('leaves only the stored response file on disk', function (int $secondsApart) {
+        Storage::fake('local');
+        Http::fake([DOWNLOAD_URL => Http::response('PKFAKEZIPBODY', 200, ['Content-Type' => 'application/zip'])]);
+
+        $first = makeCompletedUpload($this->token);
+        $second = EfacturaUpload::find($first->id);
+
+        $this->downloadService->downloadResponse($first);
+        $this->travel($secondsApart)->seconds();
+        $this->downloadService->downloadResponse($second);
+
+        expect(Storage::disk('local')->allFiles())->toBe([$first->fresh()->response_path]);
+    })->with(['seconds apart' => [2], 'same second' => [0]]);
+
+    it('announces a received invoice once and leaves only its stored file on disk', function (int $secondsApart) {
+        Event::fake([InvoiceReceived::class]);
+        Storage::fake('local');
+        Http::fake([DOWNLOAD_URL => Http::response('PKFAKEZIPBODY', 200, ['Content-Type' => 'application/zip'])]);
+
+        $first = EfacturaMessage::create([
+            'efactura_token_id' => $this->token->id,
+            'message_id' => '4001130001',
+            'type' => 'received',
+            'download_id' => '4001130001',
+            'is_downloaded' => false,
+        ]);
+        $second = EfacturaMessage::find($first->id);
+
+        $this->downloadService->downloadMessage($first);
+        $path = $first->fresh()->xml_path;
+        $this->travel($secondsApart)->seconds();
+        $this->downloadService->downloadMessage($second);
+
+        Event::assertDispatchedTimes(InvoiceReceived::class, 1);
+        expect($path)->not->toBeNull()
+            ->and($first->fresh()->xml_path)->toBe($path)
+            ->and(Storage::disk('local')->allFiles())->toBe([$path]);
+    })->with(['seconds apart' => [2], 'same second' => [0]]);
+
+    it('does not park an upload another run already completed', function () {
+        Event::fake([InvoiceFailed::class]);
+        Http::fake([STATUS_URL => Http::sequence()
+            ->push(['stare' => 'ok', 'id_descarcare' => '3001130059'], 200)
+            ->push(['eroare' => 'Nu exista niciun upload cu indexul=5001130255'], 200)]);
+
+        $first = makeProcessingUpload($this->token);
+        $second = EfacturaUpload::find($first->id);
+
+        $this->downloadService->checkStatus($first);
+        $this->downloadService->checkStatus($second);
+
+        $upload = $first->fresh();
+        expect($upload->status)->toBe(UploadStatus::Completed)
+            ->and($upload->failure_reason)->toBeNull()
+            ->and($upload->download_id)->toBe('3001130059');
+        Event::assertNotDispatched(InvoiceFailed::class);
+    });
+
+    // A re-queue clears download_id and response_path, so the old report could land on the new attempt.
+    it('does not attach an old error report to a row re-queued while it downloaded', function () {
+        Event::fake([InvoiceProcessed::class]);
+        Storage::fake('local');
+
+        $upload = makeCompletedUpload($this->token);
+        $upload->update(['status' => UploadStatus::Failed, 'failure_reason' => FailureReason::Validation]);
+
+        Http::fake([DOWNLOAD_URL => function () use ($upload) {
+            // Meanwhile: re-queued, re-sent, and completed under a new download id.
+            EfacturaUpload::whereKey($upload->id)->update([
+                'status' => UploadStatus::Completed,
+                'failure_reason' => null,
+                'download_id' => '3001130060',
+                'response_path' => null,
+            ]);
+
+            return Http::response('PKOLDREPORT', 200, ['Content-Type' => 'application/zip']);
+        }]);
+
+        $this->downloadService->downloadResponse($upload);
+
+        expect($upload->fresh()->response_path)->toBeNull()
+            ->and(EfacturaUpload::needsResponseDownload()->pluck('id')->all())->toContain($upload->id)
+            ->and(Storage::disk('local')->allFiles())->toBe([]);
+        Event::assertNotDispatched(InvoiceProcessed::class);
+    });
+
+    it('does not count an old permanent download failure against a row re-queued meanwhile', function () {
+        $upload = makeCompletedUpload($this->token);
+        $upload->update(['status' => UploadStatus::Failed, 'failure_reason' => FailureReason::Validation]);
+
+        Http::fake([DOWNLOAD_URL => function () use ($upload) {
+            EfacturaUpload::whereKey($upload->id)->update([
+                'status' => UploadStatus::Pending,
+                'failure_reason' => null,
+                'errors' => null,
+                'download_id' => null,
+                'response_attempts' => 0,
+            ]);
+
+            return Http::response(['eroare' => 'Forbidden'], 403);
+        }]);
+
+        $this->downloadService->downloadResponse($upload);
+
+        $upload->refresh();
+        expect($upload->response_attempts)->toBe(0)
+            ->and($upload->errors)->toBeNull()
+            ->and($upload->response_failed_at)->toBeNull();
+    });
+});
+
 /**
  * Topic L5: no status poll can loop forever, and none records a false verdict.
  */
@@ -323,7 +519,7 @@ describe('status answers without a download id', function () {
         expect($upload->fresh()->response_path)->toBeNull();
     });
 
-    it('parks a nok without a download id as indeterminate, keeping the index', function (string|array $body) {
+    it('parks an error answer without a download id as indeterminate, keeping the index and ANAF\'s errors', function (string|array $body, string $anafError) {
         Event::fake([InvoiceFailed::class]);
         Http::fake([STATUS_URL => Http::response($body, 200)]);
 
@@ -335,12 +531,14 @@ describe('status answers without a download id', function () {
         expect($upload->status)->toBe(UploadStatus::Failed)
             ->and($upload->failure_reason)->toBe(FailureReason::Indeterminate)
             ->and($upload->upload_index)->toBe('5001130255')
-            ->and($upload->errors[0])->toBe(__('efactura::messages.status_nok_without_download_id', ['index' => '5001130255']));
+            ->and($upload->errors[0])->toBe(__('efactura::messages.status_nok_without_download_id', ['index' => '5001130255']))
+            ->and($upload->errors)->toContain($anafError);
         Event::assertDispatched(InvoiceFailed::class);
     })->with([
-        // XmlParser maps a bare <Errors/> header to nok.
-        'XML Errors header' => '<?xml version="1.0" encoding="UTF-8"?><header xmlns="mfp:anaf:dgti:efactura:stareMesajFactura:v1"><Errors errorMessage="Nu aveti dreptul de inteorgare pentru id_incarcare= 5001130255"/></header>',
-        'JSON nok' => [['stare' => 'nok', 'Errors' => ['Nu aveti dreptul de inteorgare']]],
+        // SDK 4.0 reads an <Errors/>-only header as no stare with ANAF's errors (hasAnafError()).
+        'XML Errors header' => ['<?xml version="1.0" encoding="UTF-8"?><header xmlns="mfp:anaf:dgti:efactura:stareMesajFactura:v1"><Errors errorMessage="Nu aveti dreptul de inteorgare pentru id_incarcare= 5001130255"/></header>', 'Nu aveti dreptul de inteorgare pentru id_incarcare= 5001130255'],
+        'JSON eroare' => [['eroare' => 'Nu exista niciun upload cu indexul=5001130255'], 'Nu exista niciun upload cu indexul=5001130255'],
+        'JSON nok' => [['stare' => 'nok', 'Errors' => ['Nu aveti dreptul de inteorgare']], 'Nu aveti dreptul de inteorgare'],
     ]);
 });
 
@@ -539,7 +737,13 @@ describe('SDK rate limits in a batch', function () {
     });
 
     it('makes efactura:status --upload report a skipped upload instead of "Done."', function () {
-        Http::fake([STATUS_URL => Http::response(['stare' => 'ok', 'id_descarcare' => '3001130059'], 200)]);
+        // descarcare is faked too, so a limiter regression that lets the status call through
+        // fails the assertions below instead of following up with an unfaked download.
+        Storage::fake('local');
+        Http::fake([
+            STATUS_URL => Http::response(['stare' => 'ok', 'id_descarcare' => '3001130059'], 200),
+            DOWNLOAD_URL => Http::response("PK\x03\x04FAKEZIPBODY", 200, ['Content-Type' => 'application/zip']),
+        ]);
         $upload = makeProcessingUpload($this->token);
 
         exhaustRateLimit(['status_per_day_message' => 1], fn (RateLimiter $limiter) => $limiter->checkStatusQuery('5001130255'));

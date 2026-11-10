@@ -6,6 +6,8 @@ use BeeCoded\EFactura\EfacturaServiceProvider;
 use BeeCoded\EFactura\Facades\EFactura;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Str;
 use Orchestra\Testbench\TestCase as Orchestra;
 use Spatie\LaravelData\LaravelDataServiceProvider;
 
@@ -16,6 +18,10 @@ abstract class TestCase extends Orchestra
     protected function setUp(): void
     {
         parent::setUp();
+
+        // No test may reach ANAF: an unfaked request (or one a partial Http::fake() pattern
+        // misses) throws instead. Testbench rebuilds the app per test, so set it every time.
+        Http::preventStrayRequests();
 
         $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
 
@@ -59,8 +65,9 @@ abstract class TestCase extends Orchestra
         // only Postgres exhibits is actually exercised. sqlite :memory: cannot: it
         // never poisons, and a second connection to it is a separate empty
         // database, so the create/constraint race tests skip there.
-        $connection = env('DB_CONNECTION') === 'pgsql'
-            ? [
+        // DB_CONNECTION=mariadb or mysql runs it against that engine the same way.
+        $connection = match (env('DB_CONNECTION')) {
+            'pgsql' => [
                 'driver' => 'pgsql',
                 'host' => env('DB_HOST', '127.0.0.1'),
                 'port' => env('DB_PORT', '5432'),
@@ -68,8 +75,19 @@ abstract class TestCase extends Orchestra
                 'username' => env('DB_USERNAME', 'postgres'),
                 'password' => env('DB_PASSWORD', 'postgres'),
                 'prefix' => '',
-            ]
-            : [
+            ],
+            'mariadb', 'mysql' => [
+                'driver' => env('DB_CONNECTION'),
+                'host' => env('DB_HOST', '127.0.0.1'),
+                'port' => env('DB_PORT', '3306'),
+                'database' => env('DB_DATABASE', 'efactura_test'),
+                'username' => env('DB_USERNAME', 'root'),
+                'password' => env('DB_PASSWORD', ''),
+                'charset' => 'utf8mb4',
+                'collation' => 'utf8mb4_unicode_ci',
+                'prefix' => '',
+            ],
+            default => [
                 'driver' => 'sqlite',
                 'database' => ':memory:',
                 'prefix' => '',
@@ -78,7 +96,23 @@ abstract class TestCase extends Orchestra
                 // that does not exist — fails here rather than only on Postgres, where
                 // the constraint is always enforced.
                 'foreign_key_constraints' => true,
-            ];
+            ],
+        };
+
+        // A shared cache store (CACHE_STORE=redis, with REDIS_DB/REDIS_CACHE_DB on a dedicated
+        // index) keeps its keys between tests: a per-test prefix isolates them without flushing it.
+        if (env('CACHE_STORE', 'array') !== 'array') {
+            $app['config']->set('cache.prefix', env('CACHE_PREFIX', 'efactura_test_').Str::random(10).':');
+        }
+
+        // Pinned over env: a developer's EFACTURA_SANDBOX=false or real OAuth client must never
+        // point the suite at production ANAF or hand a real client secret to a test request.
+        $app['config']->set('efactura-sdk.sandbox', true);
+        $app['config']->set('efactura-sdk.oauth', [
+            'client_id' => 'test-client-id',
+            'client_secret' => 'test-client-secret',
+            'redirect_uri' => 'https://app.test/efactura/callback',
+        ]);
 
         $app['config']->set('database.default', 'testing');
         $app['config']->set('database.connections.testing', $connection);
@@ -97,13 +131,18 @@ abstract class TestCase extends Orchestra
         $app['config']->set('efactura.routes.error_redirect', '/error');
     }
 
-    protected function createTestInvoicesTable(): void
+    /**
+     * Create the TestInvoice table once per fresh schema, before RefreshDatabase opens its
+     * transaction: MySQL/MariaDB commit that transaction on any DDL, so a table created in
+     * a test left the test outside it (and its savepoints failing).
+     */
+    protected function defineDatabaseMigrationsAfterDatabaseRefreshed(): void
     {
         $this->app['db']->connection()->getSchemaBuilder()->create('test_invoices', function ($table) {
             $table->id();
             $table->string('number');
             $table->string('cui');
-            $table->decimal('total', 10, 2)->default(100);
+            $table->decimal('total', 10, 2)->nullable();
         });
     }
 }

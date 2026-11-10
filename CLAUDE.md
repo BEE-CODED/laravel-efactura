@@ -41,13 +41,13 @@ tests/
 composer install
 
 # Run tests
-./vendor/bin/phpunit
+./vendor/bin/pest
 
 # Run single test
-./vendor/bin/phpunit --filter TestMethodName
+./vendor/bin/pest --filter "test name"
 
 # Run tests with coverage
-./vendor/bin/phpunit --coverage-html coverage
+./vendor/bin/pest --coverage-html coverage
 
 # Code style (if using Laravel Pint)
 ./vendor/bin/pint

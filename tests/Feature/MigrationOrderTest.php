@@ -161,3 +161,46 @@ describe('failure_reason migration re-entrancy', function () {
             ->toBe('rate_limited');
     });
 });
+
+describe('v4 reclassification of 3.x rejections that kept an index', function () {
+    /**
+     * 3.x recorded an upload ANAF had given an index (and a nok answer without a download
+     * id) as a validation rejection. queueUpload() recycles validation rows, so re-queueing
+     * one after upgrading filed the invoice a second time.
+     */
+    it('parks an indexed validation failure without a download id for reconciliation', function () {
+        $tokenId = DB::table('efactura_tokens')->insertGetId([
+            'cui' => '12345678',
+            'access_token' => 'irrelevant',
+            'refresh_token' => 'irrelevant',
+            'expires_at' => now()->addHour(),
+            'is_active' => true,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $row = fn (int $id, ?string $index, ?string $downloadId) => [
+            'efactura_token_id' => $tokenId,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => $id,
+            'status' => 'failed',
+            'failure_reason' => 'validation',
+            'upload_index' => $index,
+            'download_id' => $downloadId,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ];
+        DB::table('efactura_uploads')->insert([
+            $row(1, '5001130255', null),
+            // ANAF's own rejection, with its error report: stays a rejection.
+            $row(2, '5001130256', '3001130059'),
+            // Never taken in: stays a rejection.
+            $row(3, null, null),
+        ]);
+
+        loadMigrationMatching('add_failure_counters')->up();
+
+        expect(DB::table('efactura_uploads')->orderBy('uploadable_id')->pluck('failure_reason')->all())
+            ->toBe(['indeterminate', 'validation', 'validation']);
+    });
+});

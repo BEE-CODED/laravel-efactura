@@ -172,13 +172,15 @@ trait HasEfacturaUpload
     }
 
     /**
-     * Scope: Models awaiting response download (completed but no response file yet).
+     * Scope: Models awaiting response download (completed, no response file yet, and still
+     * under EfacturaUpload::MAX_RESPONSE_ATTEMPTS, so DownloadResponses will fetch it).
      */
     public function scopeEfacturaAwaitingResponse(Builder $query): Builder
     {
         return $query->whereHas('efacturaUpload', fn ($q) => $q
             ->where('status', UploadStatus::Completed)
             ->whereNotNull('download_id')
-            ->whereNull('response_path'));
+            ->whereNull('response_path')
+            ->where('response_attempts', '<', EfacturaUpload::MAX_RESPONSE_ATTEMPTS));
     }
 }

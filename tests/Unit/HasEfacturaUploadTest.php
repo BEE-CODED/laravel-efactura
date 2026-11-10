@@ -346,5 +346,11 @@ describe('HasEfacturaUpload Trait', function () {
             expect($invoices)->toHaveCount(1);
             expect($invoices->first()->id)->toBe($this->awaitingInvoice->id);
         });
+
+        it('efacturaAwaitingResponse leaves out a response that is no longer downloaded', function () {
+            $this->awaitingInvoice->efacturaUpload->update(['response_attempts' => EfacturaUpload::MAX_RESPONSE_ATTEMPTS]);
+
+            expect(TestInvoice::efacturaAwaitingResponse()->get())->toHaveCount(0);
+        });
     });
 });

@@ -41,6 +41,8 @@ beforeEach(function () {
     ]);
 
     $this->tokenService = Mockery::mock(TokenService::class);
+    // No grant is in its refresh cooldown unless a test says so.
+    $this->tokenService->shouldReceive('refreshCooldownSeconds')->andReturn(0)->byDefault();
     $this->uploadService = new UploadService($this->tokenService);
 });
 
@@ -397,12 +399,6 @@ describe('UploadService', function () {
             ]);
         });
 
-        it('marks upload as uploading', function () {
-            $this->uploadService->markUploadAsUploading($this->upload);
-
-            expect($this->upload->fresh()->status)->toBe(UploadStatus::Uploading);
-        });
-
         it('marks upload as processing', function () {
             $this->uploadService->markUploadAsProcessing($this->upload, 'INDEX456');
 
@@ -555,6 +551,7 @@ describe('UploadService', function () {
                 'standard' => 'UBL',
             ]);
 
+            // Fresh rows go out at once: no job owns a row on the synchronous path.
             $this->uploadService->processPendingUploads();
 
             expect($upload1->fresh()->status)->toBe(UploadStatus::Processing);

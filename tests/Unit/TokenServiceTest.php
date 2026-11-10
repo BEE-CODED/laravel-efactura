@@ -12,6 +12,7 @@ use Illuminate\Support\DateFactory;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Http;
 
 beforeEach(function () {
     $this->tokenService = new TokenService;
@@ -483,6 +484,8 @@ describe('TokenService', function () {
 
             expect(fn () => $this->tokenService->executeWithClient($this->token, fn () => 'test'))
                 ->toThrow(RuntimeException::class, 'Token for CUI 12345678 has been deactivated');
+            // A deactivated token must not be refreshed with ANAF.
+            Http::assertNothingSent();
         });
 
         it('refreshes an expiring token before executing, and does not hold the lock across the operation', function () {

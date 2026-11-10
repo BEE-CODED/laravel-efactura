@@ -38,12 +38,13 @@ public function __construct(public EfacturaToken $token)
 
 **Trigger:** Fired after a token is refreshed during an API call. This is transparent to the caller.
 
-\`TokenService\` fires it from **three** places (**changed in v4.0**):
+\`TokenService\` fires it from **four** places (**changed in v4.0**):
 - \`refreshToken()\` — the token was expiring, so \`executeWithRefreshLock()\` refreshed it **explicitly, under the lock, before running the operation**. This is the normal path
-- after the operation (\`executeWithoutLock()\`) — the token looked fresh so the operation ran unlocked, but the SDK refreshed anyway (also when the operation then threw). The grant is saved by a conditional write, without a lock
+- \`persistClientRefresh()\` — the SDK refreshed during a call on a client from \`createClient()\` and saves the grant through its \`tokenPersister\`, while it still holds its refresh lock. The usual path when the token looked fresh but the SDK refreshed anyway
+- after the operation (\`executeWithoutLock()\`) — the same conditional write is retried (also when the operation threw); it stores, and fires, only if the save under the lock failed
 - \`handleClientTokenRefresh()\` — a **public** helper for callers driving an \`EFacturaClient\` by hand. \`executeWithClient()\` does **not** call it
 
-On the first two paths it fires only when the conditional write actually stored the grant: a grant older than (or as old as) the stored one, or one for a deactivated token, is not stored and fires nothing. \`persistTokenRefreshWithLock()\` no longer exists.
+On every path it fires only when the conditional write actually stored the grant: a grant older than (or as old as) the stored one, or one for a deactivated token, is not stored and fires nothing. \`persistTokenRefreshWithLock()\` no longer exists.
 
 > **Changed in v3.0.0.** Pre-v3, the expiring-token path held the refresh lock across the operation
 > and persisted via \`handleClientTokenRefresh()\`. That deadlocked: the SDK acquires the *same* cache
@@ -111,14 +112,14 @@ public function __construct(public EfacturaUpload $upload)
 public function __construct(public EfacturaUpload $upload, public array $errors = [])
 \`\`\`
 
-**Trigger:** Fired when an upload reaches a **terminal** \`Failed\` state. The \`errors\` array contains error details from ANAF or the upload process. It fires from these places:
+**Trigger:** Fired when an upload reaches a **terminal** \`Failed\` state. The \`errors\` array contains error details from ANAF or the upload process (for a \`nok\` status answer, ANAF's errors — v4.0; it could be \`[]\`). A status-check verdict is recorded only on a row still \`Processing\`, so when two runs poll one upload only the run that recorded it fires this event (v4.0). A \`transient\` failure, including an XML file that could not be stored, never fires it. It fires from these places:
 
 | Source | Situation | \`failure_reason\` |
 |--------|-----------|------------------|
 | \`UploadService::failBeforeTransmission()\` | Before anything was sent: XML/model invalid, no token, model no longer uploadable | \`validation\`, \`configuration\` |
 | \`UploadService::failTerminally()\` | ANAF rejected the document (4xx, or \`ExecutionStatus=1\` without an upload index), or the SDK refused it (\`ValidationException\` / \`XmlParsingException\`); or delivery UNKNOWN: an ambiguous 5xx/transport loss, an unreadable 2xx upload answer, or an answer without a usable index and status (a non-numeric index, success without an index, no recognised status), or any other error after the request was handed to the SDK | \`validation\`, \`indeterminate\` |
 | \`DownloadService::checkStatus()\` (i.e. \`CheckUploadStatuses\`) | ANAF answered \`nok\` with a download id: it processed the document and rejected it on its merits; or ANAF gave a final rejection without a response archive ("XML cu erori nepreluat de sistem") — no download, never resubmitted automatically | \`validation\` |
-| \`DownloadService::checkStatus()\` (via \`parkAsIndeterminate()\`) | No verdict on the document, delivery UNKNOWN: \`nok\` without a download id (an unknown index, "Nu aveti dreptul"; the upload index is kept), no recognisable status (\`parkUnrecognisableStatus()\`), or \`polling.max_status_failures\` permanent status-check failures | \`indeterminate\` |
+| \`DownloadService::checkStatus()\` (via \`parkAsIndeterminate()\`) | No verdict on the document, delivery UNKNOWN: \`nok\` without a download id, or an error-only answer (an unknown index, "Nu aveti dreptul"; the upload index and ANAF's errors are kept), no recognisable status (\`parkUnrecognisableStatus()\`), or \`polling.max_status_failures\` permanent status-check failures | \`indeterminate\` |
 | \`ProcessSingleUpload::failed()\` / \`SweepStaleUploads\` (via \`parkStrandedUploadAsIndeterminate()\`) | The worker died around the POST — delivery UNKNOWN | \`indeterminate\` |
 | \`ProcessSingleUpload::failed()\` (via \`abandonUnsentUpload()\`) | The \`retryUntil\` deadline expired while the row was still waiting to be sent — it never reached ANAF | \`abandoned\` |
 | \`ProcessSingleUpload\` transient cap exhausted (via \`abandonFailure()\`) | A \`transient\` failure did not clear within \`jobs.max_transient_attempts\` | \`abandoned\` |
@@ -185,7 +186,7 @@ limiter (\`RateLimitExceededException\`) or a genuine HTTP 429 (\`ApiException\`
 | Path | Who re-submits it |
 |------|-------------------|
 | \`ProcessSingleUpload\` (the normal queued path) | The job itself — \`release(60)\`, then it picks the \`Pending\` row straight back up |
-| \`efactura:upload --sync\` (inline) | **Nobody, immediately.** There is no job to release, so \`processPendingUploads()\` stops the batch and the row waits at \`Pending\` / \`rate_limited\` for the scheduled \`ProcessPendingUploads\` or \`RetryRateLimitedUploads\` |
+| \`efactura:upload --sync\` (inline) | **The next \`--sync\` run.** There is no job to release, so \`processPendingUploads()\` stops the batch and the row waits at \`Pending\` / \`rate_limited\`; the next \`--sync\` run takes it again (v4.0). The queue dispatchers leave it alone (it has a \`failure_reason\`); \`RetryRateLimitedUploads\` takes it only once it has not changed for \`rate_limit.retry_window_hours\` |
 
 **Non-terminal — do NOT treat this as a failure.** Either way the upload is still going to be
 re-submitted; it is not a verdict on the document. For a terminal signal, listen to
@@ -226,7 +227,7 @@ ANAF's response carries no such hint. Do not assume it is set; the wrapper's own
 public function __construct(public EfacturaMessage $message)
 \`\`\`
 
-**Trigger:** Fired after a received invoice has been downloaded from ANAF (triggered by \`DownloadReceivedInvoices\` job or \`efactura:sync --download\`).
+**Trigger:** Fired after a received invoice has been downloaded from ANAF (triggered by \`DownloadReceivedInvoices\` job or \`efactura:sync --download\`). Only the run that marks the message downloaded fires it (v4.0), so overlapping runs announce it once.
 
 **Use Cases:**
 - Process incoming invoices from suppliers

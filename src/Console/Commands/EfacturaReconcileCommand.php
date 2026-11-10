@@ -25,8 +25,9 @@ use Illuminate\Console\Command;
  * double-files the invoice, writing it off leaves a legally-required filing undone.
  *
  * A row parked by a status check keeps the index_incarcare ANAF issued, and ANAF
- * issues one only for a document it took in: such a row can be resolved as filed,
- * never as not filed. A row parked before ANAF answered has no index, and ANAF's
+ * decides an upload's outcome under its index: such a row is resolved as filed (its
+ * status is then checked again), or as not filed only with --despite-index and an
+ * interactive confirmation that SPV was checked under that index. A row parked before ANAF answered has no index, and ANAF's
  * message listing exposes no invoice number to match on — only id / cif /
  * data_creare / tip / detalii / id_solicitare.
  *
@@ -38,13 +39,15 @@ use Illuminate\Console\Command;
  *   php artisan efactura:reconcile                       # list what needs checking
  *   php artisan efactura:reconcile --filed=12 --index=5001130255
  *   php artisan efactura:reconcile --not-filed=12
+ *   php artisan efactura:reconcile --not-filed=12 --despite-index   # asks for confirmation
  */
 class EfacturaReconcileCommand extends Command
 {
     protected $signature = 'efactura:reconcile
                             {--filed= : Upload ID confirmed as FILED at ANAF (requires --index)}
                             {--index= : The index_incarcare ANAF assigned to the filed document}
-                            {--not-filed= : Upload ID confirmed as NOT filed at ANAF (re-queues it; refused when it has an upload index)}';
+                            {--not-filed= : Upload ID confirmed as NOT filed at ANAF (re-queues it; refused when it has an upload index)}
+                            {--despite-index : With --not-filed: you checked SPV under its upload index and the invoice is not there (asks to confirm)}';
 
     protected $description = 'List and resolve e-Factura uploads whose delivery to ANAF is indeterminate';
 
@@ -90,12 +93,14 @@ class EfacturaReconcileCommand extends Command
 
         $this->newLine();
         $this->line('An upload WITH an upload index was taken in by ANAF under that index: look it up');
-        $this->line('in SPV, then resolve it as filed with that index. It cannot be resolved as not filed.');
+        $this->line('in SPV, then resolve it as filed with that index. Only if it is not there under that');
+        $this->line('index, resolve it as not filed with --despite-index (you are asked to confirm).');
         $this->line('For an upload WITHOUT one, check ANAF (SPV / listaMesajeFactura) around the parked');
         $this->line('time for a "FACTURA TRIMISA" message matching the invoice, then resolve it:');
         $this->newLine();
         $this->line('  Already filed:  php artisan efactura:reconcile --filed=<id> --index=<index_incarcare>');
-        $this->line('  Not filed:      php artisan efactura:reconcile --not-filed=<id>   (only without an upload index)');
+        $this->line('  Not filed:      php artisan efactura:reconcile --not-filed=<id>   (without an upload index)');
+        $this->line('  Not in SPV under its index: php artisan efactura:reconcile --not-filed=<id> --despite-index');
         $this->newLine();
         $this->comment('These uploads are never re-submitted automatically. Resolving as');
         $this->comment('"not filed" without checking risks DOUBLE-FILING a legal invoice.');
@@ -149,14 +154,28 @@ class EfacturaReconcileCommand extends Command
             return self::FAILURE;
         }
 
+        $despiteIndex = (bool) $this->option('despite-index');
+
+        // No --force: an indexed row is never re-sent unattended (--no-interaction refuses).
+        if ($despiteIndex && $upload->upload_index !== null && (!$this->input->isInteractive() || !$this->confirm(
+            "Upload {$upload->id} has ANAF upload index {$upload->upload_index}. "
+                .'Did you check SPV under that index and find the invoice is NOT there? If it is filed, it will be filed twice.'
+        ))) {
+            $this->error("Upload {$upload->id} was left as it is.");
+
+            return self::FAILURE;
+        }
+
         try {
-            $resolved = $uploadService->resolveIndeterminateAsNotFiled($upload);
+            $resolved = $uploadService->resolveIndeterminateAsNotFiled($upload, $despiteIndex);
         } catch (\InvalidArgumentException $e) {
             $this->error($e->getMessage());
             // Resolving as filed returns it to Processing, which is also how its status is checked again.
             $this->line('Resolve it as filed with that index, which also has its ANAF status checked again:');
             $this->line("  php artisan efactura:reconcile --filed={$upload->id} --index={$upload->upload_index}");
             $this->line("  php artisan efactura:status --upload={$upload->id}");
+            $this->line('If you checked SPV under that index and the invoice is not there, re-queue it with:');
+            $this->line("  php artisan efactura:reconcile --not-filed={$upload->id} --despite-index");
 
             return self::FAILURE;
         }

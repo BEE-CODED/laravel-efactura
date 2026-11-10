@@ -89,7 +89,7 @@ class EfacturaServiceProvider extends ServiceProvider
 
         $this->app['router']
             ->prefix(config('efactura.routes.prefix', 'efactura'))
-            ->middleware(config('efactura.routes.middleware', ['web']))
+            ->middleware(config('efactura.routes.middleware', ['web', 'auth']))
             ->group(__DIR__.'/../routes/efactura.php');
     }
 }
