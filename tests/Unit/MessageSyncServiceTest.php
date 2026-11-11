@@ -4,13 +4,13 @@ use BeeCoded\EFactura\Models\EfacturaMessage;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Services\MessageSyncService;
 use BeeCoded\EFactura\Services\TokenService;
-use BeeCoded\EFacturaSdk\Data\Response\ListMessagesResponseData;
+use BeeCoded\EFacturaSdk\Data\Response\PaginatedMessagesResponseData;
 use BeeCoded\EFacturaSdk\Enums\MessageFilter;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Facades\Log;
 
 /**
- * These tests build REAL SDK DTOs via ListMessagesResponseData::fromAnafResponse()
+ * These tests build REAL SDK DTOs via PaginatedMessagesResponseData::fromAnafResponse()
  * with realistic ANAF payloads.
  *
  * The previous version of this file hand-built anonymous classes exposing a
@@ -39,14 +39,14 @@ afterEach(function () {
 });
 
 /**
- * A realistic ANAF /listaMesajeFactura response envelope.
+ * A realistic one-page ANAF /listaMesajePaginatieFactura response envelope.
  *
  * @param  array<int, array<string, string>>  $mesaje
  * @return array<string, mixed>
  */
-function anafListResponse(array $mesaje): ListMessagesResponseData
+function anafListResponse(array $mesaje): PaginatedMessagesResponseData
 {
-    return ListMessagesResponseData::fromAnafResponse([
+    return PaginatedMessagesResponseData::fromAnafResponse([
         'mesaje' => $mesaje,
         'serial' => '1234AA456',
         'cui' => '12345678',

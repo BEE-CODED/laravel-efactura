@@ -24,6 +24,16 @@ it('is stale once it has waited longer than the configured max', function () {
     expect($job->isStale())->toBeTrue();
 });
 
+it('never discards a queue retry as stale', function () {
+    config(['efactura.jobs.max_staleness_seconds' => 120]);
+
+    $job = (new CheckUploadStatuses)->withFakeQueueInteractions();
+    $job->enqueuedAt = now()->subSeconds(200)->getTimestamp();
+    $job->job->attempts = 2;
+
+    expect($job->isStale())->toBeFalse();
+});
+
 it('is never stale when the staleness guard is disabled (<= 0)', function () {
     config(['efactura.jobs.max_staleness_seconds' => 0]);
 

@@ -16,7 +16,7 @@ use Illuminate\Support\Facades\Facade;
 
 /**
  * @method static \BeeCoded\EFactura\Models\EfacturaToken|null getToken(string $cui)
- * @method static string getAuthorizationUrl(string $cui)
+ * @method static string getAuthorizationUrl(string $cui, ?string $sessionNonce = null, int|string|null $userId = null)
  * @method static \BeeCoded\EFacturaSdk\Services\ApiClients\EFacturaClient client(string $cui)
  * @method static \BeeCoded\EFactura\Models\EfacturaUpload queueUpload(\BeeCoded\EFactura\Contracts\EFacturaUploadableInterface $model, ?array $options = null)
  * @method static \BeeCoded\EFactura\Models\EfacturaUpload queueB2CUpload(\BeeCoded\EFactura\Contracts\EFacturaUploadableInterface $model, ?array $options = null)

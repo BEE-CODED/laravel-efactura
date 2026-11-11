@@ -13,6 +13,7 @@ declare(strict_types=1);
 
 namespace BeeCoded\EFactura\Jobs;
 
+use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Jobs\Concerns\DiscardsWhenStale;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\TokenService;
@@ -53,6 +54,8 @@ class ProcessPendingUploads implements ShouldBeUniqueUntilProcessing, ShouldQueu
 
     public function handle(TokenService $tokenService): void
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         if ($this->isStale()) {
             return;
         }
@@ -74,13 +77,14 @@ class ProcessPendingUploads implements ShouldBeUniqueUntilProcessing, ShouldQueu
             $query->forToken($token);
         }
 
-        $query->with('token')->each(function (EfacturaUpload $upload) use ($tokenService) {
+        // lazyById, not each(): rows a worker takes leave the scope; see dispatchPendingUploads().
+        foreach ($query->with('token')->lazyById() as $upload) {
             // Its job, if any, sleeps the cooldown out; a new one would only stack on it.
             if ($upload->token && $tokenService->refreshCooldownSeconds($upload->token) > 0) {
-                return;
+                continue;
             }
 
             ProcessSingleUpload::dispatch($upload);
-        });
+        }
     }
 }

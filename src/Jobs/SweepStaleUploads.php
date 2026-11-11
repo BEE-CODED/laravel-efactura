@@ -13,6 +13,7 @@ declare(strict_types=1);
 
 namespace BeeCoded\EFactura\Jobs;
 
+use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Services\UploadService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUniqueUntilProcessing;
@@ -65,6 +66,8 @@ class SweepStaleUploads implements ShouldBeUniqueUntilProcessing, ShouldQueue
 
     public function handle(UploadService $uploadService): void
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         if (!config('efactura.enabled') || !config('efactura.features.upload_invoices')) {
             return;
         }

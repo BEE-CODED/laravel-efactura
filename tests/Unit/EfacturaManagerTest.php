@@ -59,7 +59,7 @@ describe('EfacturaManager', function () {
 
         it('delegates getAuthorizationUrl to TokenService', function () {
             $this->tokenService->shouldReceive('getAuthorizationUrl')
-                ->with('12345678')
+                ->with('12345678', null, null)
                 ->once()
                 ->andReturn('https://auth.example.com');
 

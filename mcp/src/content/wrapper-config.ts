@@ -11,7 +11,8 @@ php artisan vendor:publish --tag=efactura-config
 
 | Config Key | Env Var | Type | Default | Description |
 |-----------|---------|------|---------|-------------|
-| \`enabled\` | \`EFACTURA_ENABLED\` | bool | \`true\` | Master switch — when \`false\`, all jobs exit immediately without processing |
+| \`enabled\` | \`EFACTURA_ENABLED\` | bool | \`true\` | Master switch — when \`false\`, all jobs exit immediately without processing, and every command refuses to run |
+| \`pipeline_tables\` | \`EFACTURA_PIPELINE_TABLES\` | bool | \`true\` | **New in v4.0.** \`false\` = tokens, OAuth and the raw client only: the provider loads and publishes only the token migrations (\`000001\`, \`000004\`, \`000009\`), and \`queueUpload()\`, \`queueB2CUpload()\`, \`processUpload()\`, \`DownloadService\`, \`MessageSyncService\` (also when resolved from the container), the manager's \`uploadService()\` / \`downloadService()\` / \`messageSyncService()\`, the upload/status/download/message jobs and \`efactura:upload\` / \`efactura:status\` / \`efactura:sync\` / \`efactura:reconcile\` throw \`PipelineTablesDisabledException\`. \`getToken()\`, \`getAuthorizationUrl()\`, \`client()\` and \`tokenService()\` keep working. |
 
 ---
 
@@ -58,7 +59,7 @@ Configuration for handling ANAF rate limits and retry behavior.
 |-----------|---------|------|---------|-------------|
 | \`rate_limit.retry_window_hours\` | \`EFACTURA_RATE_LIMIT_RETRY_HOURS\` | int | \`24\` | How long (in hours) a single \`ProcessSingleUpload\` job keeps retrying via \`retryUntil()\` before the **job** stops being retried and is handed to the failed-job handler. Also how long \`RetryRateLimitedUploads\` leaves a \`pending\` / \`rate_limited\` row alone (v4.0), and how long the transient-failure count is kept. |
 | \`rate_limit.retry_batch_size\` | \`EFACTURA_RATE_LIMIT_RETRY_BATCH\` | int | \`250\` | Maximum number of rate-limited failed uploads to reset to Pending per \`RetryRateLimitedUploads\` job run. Prevents overwhelming the queue on large backlogs. |
-| \`rate_limit.retry_max_age_days\` | \`EFACTURA_RATE_LIMIT_RETRY_MAX_DAYS\` | int | \`7\` | \`RetryRateLimitedUploads\` ignores failed uploads older than this many days. Prevents retrying very stale uploads indefinitely. |
+| \`rate_limit.retry_max_age_days\` | \`EFACTURA_RATE_LIMIT_RETRY_MAX_DAYS\` | int | \`7\` | \`RetryRateLimitedUploads\` ignores failed uploads that failed (\`processed_at\`) more than this many days ago. Prevents retrying very stale uploads indefinitely. |
 
 > **Expiry of \`retry_window_hours\` governs the queue job, not the database row.** When
 > \`retryUntil()\` passes, Laravel stops retrying and calls \`ProcessSingleUpload::failed()\`.
@@ -79,11 +80,11 @@ Configuration for handling ANAF rate limits and retry behavior.
 
 ## anaf_lookup
 
-Synchronous retry policy for the public ANAF **company-lookup** endpoint (capped at 1 request/second). The wrapper decorates the SDK's \`AnafDetailsClientInterface\` with \`RetryingAnafDetailsClient\`, which retries on \`RateLimitExceededException\`.
+Synchronous retry policy for the public ANAF **company-lookup** endpoint (capped at 1 request/second). The wrapper decorates the SDK's \`AnafDetailsClientInterface\` with \`RetryingAnafDetailsClient\`, which retries the SDK's own limiter refusal (\`RateLimitExceededException\` without \`fromProvider\`).
 
 | Config Key | Env Var | Type | Default | Description |
 |-----------|---------|------|---------|-------------|
-| \`anaf_lookup.retry_attempts\` | \`EFACTURA_ANAF_LOOKUP_RETRY_ATTEMPTS\` | int | \`5\` | Total attempts (1 initial + N−1 retries) before re-throwing \`RateLimitExceededException\`. Between attempts the decorator sleeps the exception's \`retryAfterSeconds\` (≥ 1s) — synchronous/blocking, so a fully rate-limited lookup blocks up to ~\`(attempts − 1)\` seconds. Only the rate-limit exception is retried; \`failure()\` results pass straight through. |
+| \`anaf_lookup.retry_attempts\` | \`EFACTURA_ANAF_LOOKUP_RETRY_ATTEMPTS\` | int | \`5\` | Total attempts (1 initial + N−1 retries) before re-throwing \`RateLimitExceededException\`. Between attempts the decorator sleeps the exception's \`retryAfterSeconds\` (≥ 1s) — synchronous/blocking, so a fully rate-limited lookup blocks up to ~\`(attempts − 1)\` seconds. Only the SDK's own limiter refusal is retried; ANAF's own 429 (\`fromProvider\`) is re-thrown at once, and \`failure()\` results pass straight through. |
 
 ---
 
@@ -93,8 +94,8 @@ Hardening for the periodic batch jobs so a backlog that accumulates while the qu
 
 | Config Key | Env Var | Type | Default | Description |
 |-----------|---------|------|---------|-------------|
-| \`jobs.max_staleness_seconds\` | \`EFACTURA_JOB_MAX_STALENESS\` | int | \`120\` | A periodic batch job (\`ProcessPendingUploads\`, \`CheckUploadStatuses\`, \`DownloadResponses\`) that has waited in the queue longer than this self-discards instead of running — the next scheduled run re-scans. Safe because these jobs are idempotent all-rows scanners. Set to \`0\` to disable. The default is shorter than every recommended interval (Job Reference, "Recommended Scheduling"), so a delayed run never overlaps the next. |
-| \`jobs.unique_for_seconds\` | \`EFACTURA_JOB_UNIQUE_FOR\` | int | \`3600\` | Lock TTL (seconds) for \`ShouldBeUniqueUntilProcessing\` on those three batch jobs and on \`SweepStaleUploads\` — the ceiling after which a job stuck unprocessed in the queue stops blocking a fresh dispatch. (\`RetryRateLimitedUploads\` hardcodes its own \`uniqueFor = 600\` and ignores this key.) |
+| \`jobs.max_staleness_seconds\` | \`EFACTURA_JOB_MAX_STALENESS\` | int | \`120\` | A periodic batch job (\`ProcessPendingUploads\`, \`CheckUploadStatuses\`, \`DownloadResponses\`, \`SyncMessages\`) that has waited in the queue longer than this self-discards instead of running — the next scheduled run re-scans. The per-CUI jobs a run without a CUI dispatches are never discarded: they wait behind each other and are unique per CUI. Safe because these jobs are idempotent all-rows scanners. Set to \`0\` to disable. The default is shorter than every recommended interval (Job Reference, "Recommended Scheduling"), so a delayed run never overlaps the next. |
+| \`jobs.unique_for_seconds\` | \`EFACTURA_JOB_UNIQUE_FOR\` | int | \`3600\` | Lock TTL (seconds) of the unique locks on the four batch jobs (\`ProcessPendingUploads\`, \`CheckUploadStatuses\`, \`DownloadResponses\` until processing starts; \`SyncMessages\` until it finishes) and on \`SweepStaleUploads\` — the ceiling after which a job stuck unprocessed in the queue stops blocking a fresh dispatch. (\`RetryRateLimitedUploads\` hardcodes its own \`uniqueFor = 600\` and ignores this key.) |
 | \`jobs.transient_retry_delay_seconds\` | \`EFACTURA_JOB_TRANSIENT_RETRY_DELAY\` | int | \`30\` | How long \`ProcessSingleUpload\` waits before re-driving an upload that failed transiently (auth / pre-flight blip). Rate-limited retries use a fixed 60s instead. **New in v3.0.0.** |
 | \`jobs.max_transient_attempts\` | \`EFACTURA_JOB_MAX_TRANSIENT_ATTEMPTS\` | int | \`5\` | How many \`transient\` failures a single queued upload job may have before it is declared terminal (\`abandoned\`) and \`InvoiceFailed\` fires. Counted in the cache per job (v4.0); rate-limit releases do not count. Stops a durable fault (e.g. a revoked token answering 401) from hammering ANAF for the whole retry window. Set to \`0\` to disable the cap. **New in v3.0.0.** |
 | \`jobs.stale_uploading_minutes\` | \`EFACTURA_JOB_STALE_UPLOADING_MINUTES\` | int | \`30\` | An upload left in \`uploading\` longer than this had its worker die mid-flight. \`SweepStaleUploads\` parks it as \`Failed\` / \`indeterminate\` for human reconciliation — it is **never** re-submitted, because it may already be filed. \`<= 0\` makes the sweep a no-op. **New in v3.0.0.** |
@@ -143,6 +144,8 @@ OAuth callback routes configuration.
 \`\`\`env
 # Master switch
 EFACTURA_ENABLED=true
+# false = tokens/OAuth/raw client only (no upload/message tables)
+EFACTURA_PIPELINE_TABLES=true
 
 # Feature flags
 EFACTURA_UPLOAD_ENABLED=true

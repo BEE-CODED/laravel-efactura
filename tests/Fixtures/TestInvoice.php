@@ -39,6 +39,8 @@ class TestInvoice extends Model implements EFacturaUploadableInterface
                     // noticed because they all swapped the UblBuilder facade out.
                     county: 'Bucuresti',
                     countryCode: 'RO',
+                    // SDK 4.0 refuses a Bucharest address without a sector it can resolve.
+                    bucharestSector: 1,
                 ),
                 isVatPayer: true,
             ),

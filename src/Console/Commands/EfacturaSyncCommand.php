@@ -12,6 +12,7 @@
 namespace BeeCoded\EFactura\Console\Commands;
 
 use BeeCoded\EFactura\Exceptions\MessageSyncFailedException;
+use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Services\DownloadService;
 use BeeCoded\EFactura\Services\MessageSyncService;
 use BeeCoded\EFactura\Services\TokenService;
@@ -31,6 +32,8 @@ class EfacturaSyncCommand extends Command
         DownloadService $downloadService,
         TokenService $tokenService,
     ): int {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         if (!config('efactura.enabled') || !config('efactura.features.sync_messages')) {
             $this->error('e-Factura sync feature is disabled.');
 

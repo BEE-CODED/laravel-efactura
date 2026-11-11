@@ -16,6 +16,7 @@ namespace BeeCoded\EFactura\Jobs;
 use BeeCoded\EFactura\Enums\FailureReason;
 use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Events\InvoiceFailed;
+use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
@@ -63,6 +64,8 @@ class ProcessSingleUpload implements ShouldQueue
 
     public function handle(UploadService $uploadService, RateLimiter $rateLimiter): void
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         if (!config('efactura.enabled') || !config('efactura.features.upload_invoices')) {
             // This job ends without a release, so a row it was waiting out a rate limit for is
             // handed to ProcessPendingUploads, which skips a row that still has a reason.

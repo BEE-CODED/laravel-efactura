@@ -5,6 +5,7 @@ declare(strict_types=1);
 use BeeCoded\EFactura\Services\RetryingAnafDetailsClient;
 use BeeCoded\EFacturaSdk\Contracts\AnafDetailsClientInterface;
 use BeeCoded\EFacturaSdk\Data\Company\CompanyLookupResultData;
+use BeeCoded\EFacturaSdk\Enums\RateLimitScope;
 use BeeCoded\EFacturaSdk\Exceptions\RateLimitExceededException;
 use Illuminate\Support\Sleep;
 use Mockery as m;
@@ -96,4 +97,17 @@ it('delegates isValidVatCode without retry or network', function () {
     $inner->shouldReceive('isValidVatCode')->once()->with('RO123')->andReturn(true);
 
     expect((new RetryingAnafDetailsClient($inner, 5))->isValidVatCode('RO123'))->toBeTrue();
+});
+
+// ANAF's own 429 already came after the SDK's retries; asking again within seconds only
+// spends more of its 1 request/second, so only the local limiter's refusal is waited out.
+it('does not retry a rate limit ANAF itself answered', function () {
+    $inner = m::mock(AnafDetailsClientInterface::class);
+    $inner->shouldReceive('getCompanyData')->once()->andThrow(
+        new RateLimitExceededException('ANAF 429', remaining: 0, retryAfterSeconds: 2, scope: RateLimitScope::CompanyLookup, fromProvider: true),
+    );
+
+    expect(fn () => (new RetryingAnafDetailsClient($inner, 5))->getCompanyData('123'))
+        ->toThrow(RateLimitExceededException::class);
+    Sleep::assertSleptTimes(0);
 });

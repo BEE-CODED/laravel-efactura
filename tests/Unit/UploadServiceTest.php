@@ -9,6 +9,7 @@ use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFactura\Tests\Fixtures\TestInvoice;
+use BeeCoded\EFacturaSdk\Data\Response\UploadResponseData;
 use BeeCoded\EFacturaSdk\Exceptions\AuthenticationException;
 use BeeCoded\EFacturaSdk\Facades\UblBuilder;
 use Illuminate\Support\Facades\Event;
@@ -188,15 +189,7 @@ describe('UploadService', function () {
                 }
             });
 
-            $mockResponse = new class
-            {
-                public function isSuccessful(): bool
-                {
-                    return true;
-                }
-
-                public string $indexIncarcare = '5001234';
-            };
+            $mockResponse = UploadResponseData::fromAnafResponse(['ExecutionStatus' => '0', 'index_incarcare' => '5001234']);
 
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
@@ -225,22 +218,10 @@ describe('UploadService', function () {
                 }
             });
 
-            $mockResponse = new class
-            {
-                public function isSuccessful(): bool
-                {
-                    return false;
-                }
-
-                public function isFailed(): bool
-                {
-                    return true;
-                }
-
-                public ?string $indexIncarcare = null;
-
-                public array $errors = ['Validation error', 'Another error'];
-            };
+            $mockResponse = UploadResponseData::fromAnafResponse([
+                'ExecutionStatus' => '1',
+                'Errors' => ['Validation error', 'Another error'],
+            ]);
 
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
@@ -408,15 +389,6 @@ describe('UploadService', function () {
                 ->and($upload->uploaded_at)->not->toBeNull();
         });
 
-        it('marks upload as completed', function () {
-            $this->uploadService->markUploadAsCompleted($this->upload, 'DOWNLOAD789');
-
-            $upload = $this->upload->fresh();
-            expect($upload->status)->toBe(UploadStatus::Completed)
-                ->and($upload->download_id)->toBe('DOWNLOAD789')
-                ->and($upload->processed_at)->not->toBeNull();
-        });
-
         it('marks upload as failed', function () {
             $errors = ['Error 1', 'Error 2'];
             $this->uploadService->markUploadAsFailed($this->upload, $errors);
@@ -520,15 +492,7 @@ describe('UploadService', function () {
                 }
             });
 
-            $mockResponse = new class
-            {
-                public function isSuccessful(): bool
-                {
-                    return true;
-                }
-
-                public string $indexIncarcare = '5001235';
-            };
+            $mockResponse = UploadResponseData::fromAnafResponse(['ExecutionStatus' => '0', 'index_incarcare' => '5001235']);
 
             $this->tokenService->shouldReceive('getToken')->andReturn($this->token);
             $this->tokenService->shouldReceive('executeWithClient')->andReturn($mockResponse);

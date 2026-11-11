@@ -19,6 +19,21 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
   `efactura/auth/{cui}` route yourself (for example a `can:` middleware) or disable the routes. The
   callback also needs the logged-in browser, including after `efactura:auth`. A published config
   keeps its value.
+- An authorization started through the `efactura/auth/{cui}` route is bound to that browser session
+  and user: the callback refuses it ("Invalid or expired state parameter") in another session or for
+  another user. `TokenService::getAuthorizationUrl()` / `EFactura::getAuthorizationUrl()` take an
+  optional session nonce and user id, and `validateOAuthState()` the same pair; your own controller
+  passes them to bind its flows. The `efactura:auth` command passes neither, so its URL still
+  completes in any logged-in browser. `OAuthCallbackController::redirect()` now takes the `Request`
+  first (`redirect(Request $request, string $cui)`).
+- Removed `UploadService::markUploadAsCompleted()` (unguarded status write; nothing called it) and
+  `TokenService::updateTokenFromOAuth()` (wrote a grant without checking that the token is active or
+  that the grant is newer). Store a new grant with `TokenService::storeToken()`; status answers go
+  through `DownloadService::checkStatus()`.
+- `MessageSyncService::reportsNoMessages()` (protected) takes a `PaginatedMessagesResponseData`
+  instead of a `ListMessagesResponseData`, and `SyncMessages::failBatch()` (protected) is removed.
+- `UploadService::classifyApiException()` (protected) is removed: the upload call's answer and
+  exceptions are classified by the SDK's `UploadOutcome` (`fromResponse()` / `fromThrowable()`).
 
 ### Added
 
@@ -51,6 +66,34 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
   `TokenService::persistClientRefresh()` and `TokenService::saveRefreshedTokens()`.
 - `CHANGELOG.md`, and one recommended cadence per scheduled job in the README and the MCP job
   reference. The package still schedules nothing itself.
+- `BeeCoded\EFactura\Services\CachedAnafLookup`: a cached, fail-closed company check. Construct it
+  with the lookup client (normally `new AnafDetailsClient(strict: true, ...)`); `resolve($cui)`
+  returns an `AnafLookupResult` (`status`, `cui`, `queryDate`, `active`) with `AnafLookupStatus`
+  `Found`, `NotFound`, `Unavailable` or `Busy`, and `cachedRead($cui)` returns today's cached
+  verdict without calling ANAF. Found is cached for the rest of the day and NotFound 15 minutes in
+  the default cache store, as plain arrays, keyed by policy version, lookup URL, ANAF date and CUI; Unavailable
+  and Busy are not cached. Found needs exactly one company with that CUI and NotFound exactly that
+  CUI in `notFound`; an answer that arrives after midnight (Bucharest) is Unavailable. A cache that
+  cannot store the verdict does not change the answer.
+- Config key `pipeline_tables` (`EFACTURA_PIPELINE_TABLES`, default `true`). Set it to `false` when
+  you use only tokens, OAuth and the raw client: the package then loads and publishes only the token
+  migrations (`000001`, `000004`, `000009`), and the upload/message pipeline (`queueUpload()`,
+  `queueB2CUpload()`, `processUpload()`, `DownloadService`, `MessageSyncService`, the manager's
+  `uploadService()` / `downloadService()` / `messageSyncService()`, the upload, status, download and
+  message jobs and the `efactura:upload`, `efactura:status`, `efactura:sync` and `efactura:reconcile`
+  commands) throws `BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException`, also when a
+  service is resolved straight from the container. `getToken()`, `getAuthorizationUrl()`,
+  `client()` and `tokenService()` keep working. Migrations you already published stay published.
+- Migration `2024_01_01_000009_make_efactura_token_expiry_an_instant` (PostgreSQL only, not gated):
+  `efactura_tokens.expires_at` becomes `timestamp with time zone`. The naive values were written as
+  app-timezone wall time, so they are converted `AT TIME ZONE` `app.timezone`; run it with the same
+  `APP_TIMEZONE` that wrote them. It is a no-op when the column is already `timestamptz` and on
+  every other database.
+- Migration `2024_01_01_000010_add_response_verification_and_next_poll_to_efactura_uploads_table`
+  (not loaded when `pipeline_tables` is false): `efactura_uploads.response_verification`
+  (`BeeCoded\EFactura\Enums\ResponseVerification`: `verified`, `limits_only`, `mismatch`; null for
+  a response stored before 4.0) and `efactura_uploads.next_poll_at` with an index on
+  `(status, next_poll_at)`.
 
 ### Changed
 
@@ -60,6 +103,22 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
   answer that does not say whether ANAF took the document in (an unreadable 2xx body, a non-digit
   index, success without an index, no recognised status) is `Failed` / `indeterminate` (it was
   `validation`). Only `ExecutionStatus=1` without an index stays `validation`.
+- Upload exceptions are classified by the SDK's `UploadOutcome::fromThrowable()`; the refresh
+  cooldown hand-back and "thrown before the document reached the client = `transient`" are decided
+  first, as before. Two outcomes change: a `RequestNotSentException` (the SDK proved the request
+  never left: DNS, connect, TLS or a connect-phase timeout) is `transient` and retried (it was an
+  `indeterminate` 500), and an HTTP 408 is `indeterminate` (it was `validation`): a timeout says
+  nothing about whether ANAF filed the document. An ApiException with a status outside 2xx/4xx/5xx
+  is `indeterminate` too (it was `validation`); an `XmlParsingException` cannot escape the upload call
+  in SDK 4.0 and is no longer caught separately. On status checks and downloads an HTTP 408 is
+  transient like a 5xx and no longer counts toward parking or giving up.
+- A queue retry of a stale-guarded job (`jobs.max_staleness_seconds`) is never discarded as stale,
+  so a failing per-CUI job reaches `failed_jobs`. Nor is a per-CUI job that a run without a CUI
+  dispatched: it waits behind the other CUIs' jobs, so a stale guard would drop the later CUIs on
+  every run. A per-CUI job your scheduler dispatches directly keeps the guard.
+- Status answers are read through the SDK's `StatusResponseData::verdict()`. A download id that is
+  not ANAF's digits (1 to 64) cannot be downloaded and counts as none: `ok` with one is `Completed`
+  with `download_id = null`, `nok` with one is `Failed` / `indeterminate` (both stored the id before).
 - Status answers: `ok` without a download id is `Completed` with `download_id = null` and a note in
   `errors`; no response is downloaded, so `InvoiceProcessed` does not fire for it.
 - Status answers: `nok` without a download id is `Failed` / `indeterminate`, keeping the upload
@@ -165,8 +224,8 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
   store a path only when none is stored and the row still has the download id they fetched, so
   overlapping runs fire `InvoiceFailed` / `InvoiceProcessed` once and a row re-queued meanwhile
   gets no old file. The `InvoiceFailed` of a `nok` with a download id carries ANAF's errors.
-  `recordPoisonedResponse()` counts with a query-builder `increment()` guarded on that download id. `markUploadAsCompleted()` /
-  `markUploadAsFailed()` are unchanged and no longer called by `checkStatus()`.
+  `recordPoisonedResponse()` counts with a query-builder `increment()` guarded on that download id.
+  `markUploadAsFailed()` is unchanged and no longer called by `checkStatus()`.
 - An error-only status answer (SDK 4.0 `hasAnafError()`: an XML `<Errors/>` header, a JSON
   `eroare`) is parked `indeterminate` with ANAF's errors on the row, after the translated note.
 - `efacturaAwaitingResponse()` leaves out uploads at `EfacturaUpload::MAX_RESPONSE_ATTEMPTS`, and
@@ -181,9 +240,62 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
   `response_path` write of a response download, deletes the file it stored (unless the winner
   stored the same file name).
 - Signatures for subclasses: `DownloadService::markMessageAsDownloaded()` returns `bool` (whether it
-  marked the message) instead of `void`; `UploadService::markUploadAsCompleted()` accepts a `?string` download
-  id, `DownloadService::recordPoisonedResponse()` (protected) takes any `\Throwable`, and
-  `DownloadService::checkStatus()` returns `StatusCheckOutcome` instead of `void`.
+  marked the message) instead of `void`; `DownloadService::recordPoisonedResponse()` (protected) takes
+  any `\Throwable`, and `DownloadService::checkStatus()` returns `StatusCheckOutcome` instead of `void`.
+- Message sync always uses ANAF's paginated list (`/listaMesajePaginatieFactura`): one window per run,
+  from 60 days minus 70 minutes ago to a minute ago, counted in UTC (in an `app.timezone` with summer
+  time, wall-clock days made the window longer than the SDK's 60-day limit for about two months a
+  year, and every sync failed), paged until the last page. Each page is one call
+  against the SDK's `paginated_list_per_day_cui` quota (default 50,000) instead of one
+  `simple_list_per_day_cui` call per run.
+- A `SyncMessages`, `CheckUploadStatuses`, `DownloadResponses` or `DownloadReceivedInvoices` job
+  without a CUI only dispatches one job of its kind per active CUI (for the three upload/download
+  jobs, per active CUI with work due) and does no work itself, so each CUI gets its own timeout and
+  retries and one slow CUI no longer holds up the rest. `SyncMessages` is now unique per CUI
+  (`ShouldBeUnique`, `jobs.unique_for_seconds`) and discards itself when stale
+  (`jobs.max_staleness_seconds`); its batch no longer dead-letters a `MessageSyncFailedException`
+  (each CUI's job fails on its own; `efactura:sync` still reports the batch).
+  `DownloadReceivedInvoices` gained `uniqueId()` (`$cui ?? 'all'`).
+- `CheckUploadStatuses`, `DownloadResponses` and `DownloadReceivedInvoices` run behind
+  `WithoutOverlapping($cui ?? 'all')` (not released, lock expires after the timeout + 30 s): a run
+  that outlasts a short schedule interval is no longer overlapped by the next one on another worker,
+  which spent the same rows' daily quota twice.
+- `RetryRateLimitedUploads` measures `rate_limit.retry_max_age_days` for a `failed` row from when it
+  failed (`processed_at`), not from `created_at`; a failed row without `processed_at` (older than any
+  3.x release) is no longer retried.
+- While an upload waits after a rate limit, a refresh cooldown or a transient failure after its claim,
+  `xml_path` is null and that attempt's XML file is deleted (nothing was sent; the next attempt stores
+  a new file). A run that loses the claim deletes the file it stored, unless the row names that file.
+- New uploads store `uploadable_type` as the model's `getMorphClass()` (the morph map alias, if your
+  app has one; otherwise the class name, as before). `queueUpload()` finds an existing row under
+  either form.
+- On PostgreSQL `EfacturaToken` writes dates with their offset (`getDateFormat()` is
+  `Y-m-d H:i:sP`), so `expires_at` is the same instant whatever the session time zone; naive columns
+  ignore the offset. A query-builder binding of a Carbon value against `expires_at` (for example
+  `EfacturaToken::where(...)->update(['expires_at' => now()])`) has no offset and is read in the
+  session time zone: write through a model instead.
+- `efactura:auth` and `efactura:reconcile` refuse to run while `enabled` is false, like the other
+  commands.
+- Response archives are checked with the SDK's `ArchiveInspector` before they are stored: against the
+  uploaded XML when ANAF accepted the upload and its XML is still stored (`verified`), otherwise only
+  its limits (`limits_only`; a removed XML file counts as not stored also on a disk with
+  `throw => true`). An archive that does not hold the uploaded invoice is stored as
+  received, marked `mismatch` and logged as an error; `InvoiceProcessed` still fires. An archive
+  outside the limits (not a ZIP, empty, encrypted, too large, too many members) is counted against
+  `EfacturaUpload::MAX_RESPONSE_ATTEMPTS` like any permanent download failure; a local failure
+  (temporary file, reading the stored XML) is retried by the next run without counting.
+  `DownloadService` takes an optional `ArchiveInspector` as its third constructor argument. The SDK
+  needs `ext-zip` and `ext-dom`.
+- Status polling follows the SDK's `PollSchedule`: after each "still in progress" answer the upload's
+  `next_poll_at` is set 1, 5, 15 or 60 minutes ahead, less a one-minute margin (never under 60
+  seconds, so the 1-minute step stays 1 minute) so the read is due on the scheduled run it aims at (by the time since `uploaded_at`: under 10 minutes, an hour, three
+  hours, older; an upload without `uploaded_at` counts as older).
+  `EfacturaUpload::needsStatusCheck()` takes only due rows (`next_poll_at` null or past), so
+  `CheckUploadStatuses` (and `efactura:status` without `--upload`) reads only those and fans out
+  only to CUIs that have one; `efactura:status --upload=<id>` still checks at once. Every transition
+  that resets `status_failures` (`queueUpload()` recycling a row, `markUploadAsProcessing()`,
+  `resolveIndeterminateAsFiled()`, `resolveIndeterminateAsNotFiled()`) clears `next_poll_at`, and
+  those that clear `response_path` also clear `response_verification`.
 
 ### Changed (4.0): guarded writes fire no Eloquent model events
 
@@ -209,6 +321,21 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
   `DuplicateUploadException` ("kept changing") instead of returning the row. Call `queueUpload()`
   after your transaction commits. CI now runs the suite on MariaDB as well as PostgreSQL.
 
+### Known limitation: message sync capacity
+
+- A `SyncMessages` run lists one CUI's 60-day window from page 1 within the job's 120-second
+  timeout: at roughly 2–3 seconds a page about 40 pages, some 20,000 messages. A CUI with more times
+  out every run and its later pages are not synced. The timeout stays 120 seconds because raising it
+  also needs the queue connection's `retry_after` raised above it. Before 4.0 such a CUI failed on
+  the simple list's 500-message limit, so this is a ceiling, not a regression.
+
+### Known limitation: a re-queued failed upload keeps its old XML file
+
+- Queueing a failed upload again keeps `xml_path` naming the failed attempt's file until the next
+  claim stores a new one; the old file then stays on the disk, named by no row. The row does not
+  record whether ANAF received that file (an ANAF refusal) or the SDK refused it before sending, so
+  the package does not delete it. Unchanged since 3.x.
+
 ### Known limitation: `QUEUE_CONNECTION=sync`
 
 - A sync job's `release()` does not put the job back, so an upload that hits a rate limit (or the
@@ -217,6 +344,10 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
   `rate_limit.retry_window_hours`; a cooling-down row waits for the next `ProcessPendingUploads`.
   Use a real queue connection for uploads, or, without a worker, schedule
   `efactura:upload --sync`, whose next run retries a row it left rate-limited.
+- A batch job without a CUI (`SyncMessages`, `CheckUploadStatuses`, `DownloadResponses`,
+  `DownloadReceivedInvoices`) dispatches its per-CUI jobs, and the sync connection runs them inline
+  inside the parent: a child's exception propagates through the parent job and stops the remaining
+  CUIs of that run.
 
 ### Removed
 
@@ -224,6 +355,9 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
   (protected), replaced by the conditional save.
 - `DownloadService::isPoisonedBody()` (protected): every permanent download failure is now counted.
 - `UploadService::markUploadAsUploading()`: unused; only the atomic claim sets `uploading`.
+- `UploadService::markUploadAsCompleted()` and `TokenService::updateTokenFromOAuth()`: unused,
+  unguarded writes (see Breaking).
+- `SyncMessages::failBatch()` (protected): the job no longer syncs a batch.
 
 ### Fixed
 
@@ -235,3 +369,21 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
   model's original attributes, so the failure write always records `status` and `failure_reason`.
 - A status check, response download or received-invoice download that fails permanently is no
   longer retried on every run forever.
+- `RetryRateLimitedUploads` threw a `TypeError` on every run when `EFACTURA_RATE_LIMIT_RETRY_MAX_DAYS`
+  was set (`env()` returns a string); both retry limits are now cast to int.
+- Message sync failed on every run for a CUI with more than 500 messages in 60 days (ANAF's simple
+  list refuses those).
+- The status, response, received-invoice, stale-upload and pending-upload loops no longer skip rows:
+  they paged by offset, so rows that left the scope during a page pushed others past the next one
+  (with over 1,000 matching rows, a run visited about 1,000).
+- A failed row that was recycled long after it was first queued and then failed transiently was
+  never retried by `RetryRateLimitedUploads` (its age counted from its first attempt).
+- Every re-drive of a rate-limited upload left another XML file behind (about one a minute).
+- In an app with a morph map the trait helpers and scopes (`isUploadedToEfactura()`,
+  `notUploadedToEfactura()`, …) never saw the upload, because the row stored the class name.
+- An authorization started on the web could be completed by another browser: whoever got a user to
+  open the ANAF link stored that user's grant under a CUI of their choosing.
+- `RetryingAnafDetailsClient` retries only the SDK's own limiter refusal. ANAF's own 429 (SDK 4.0
+  `RateLimitExceededException` with `fromProvider`) is re-thrown at once instead of being asked
+  again up to `anaf_lookup.retry_attempts` times. The refresh cooldown still starts only on ANAF's
+  400/401 refusals, never on a code-0 failure such as missing OAuth configuration.

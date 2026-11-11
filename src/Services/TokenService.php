@@ -96,8 +96,14 @@ class TokenService
      * NOTE: this requires a cache store shared across your web and console processes
      * (redis, memcached, database — anything but `array`). That was already true of
      * the session store this replaces, and is strictly less demanding.
+     *
+     * A web request passes its session nonce and user id: the state is then bound to
+     * them, and validateOAuthState() refuses a callback from another session or user.
+     * Otherwise whoever got a victim to open the ANAF link would store the victim's
+     * grant under a CUI they chose. The `efactura:auth` command passes neither, so its
+     * state stays valid in whichever browser opens the link.
      */
-    public function getAuthorizationUrl(string $cui): string
+    public function getAuthorizationUrl(string $cui, ?string $sessionNonce = null, int|string|null $userId = null): string
     {
         $cui = VatNumberValidator::stripPrefix($cui);
 
@@ -111,6 +117,8 @@ class TokenService
             [
                 'cui' => $cui,
                 'created_at' => now()->timestamp,
+                'nonce' => $sessionNonce === null ? null : hash('sha256', $sessionNonce),
+                'user' => $userId === null ? null : (string) $userId,
             ],
             self::OAUTH_STATE_TTL_SECONDS,
         );
@@ -129,9 +137,10 @@ class TokenService
      * Validate OAuth state token and return CUI if valid.
      *
      * Consumes the token: Cache::pull() makes the state strictly single-use, so a
-     * replayed callback is rejected even inside the TTL.
+     * replayed callback is rejected even inside the TTL. A state bound to a session
+     * nonce or user (see getAuthorizationUrl()) needs the same ones back.
      */
-    public function validateOAuthState(?string $state): ?string
+    public function validateOAuthState(?string $state, ?string $sessionNonce = null, int|string|null $userId = null): ?string
     {
         if (!$state) {
             return null;
@@ -163,6 +172,18 @@ class TokenService
             // The CUI is carried in the (attacker-visible) state parameter, so it must
             // match what we recorded server-side when the flow was started.
             if ($storedState['cui'] !== $decoded['cui']) {
+                return null;
+            }
+
+            $nonce = $storedState['nonce'] ?? null;
+
+            if ($nonce !== null && ($sessionNonce === null || !hash_equals($nonce, hash('sha256', $sessionNonce)))) {
+                return null;
+            }
+
+            $user = $storedState['user'] ?? null;
+
+            if ($user !== null && $user !== ($userId === null ? null : (string) $userId)) {
                 return null;
             }
 
@@ -558,7 +579,10 @@ class TokenService
      */
     protected function saveRefreshedTokens(EfacturaToken $token, OAuthTokensData $tokens): bool
     {
-        // Set through a model so the encrypted and datetime casts produce the stored form.
+        // Set through a model so the encrypted and datetime casts produce the stored form. On
+        // PostgreSQL that form carries the offset (EfacturaToken::getDateFormat()), which the
+        // expires_at comparison below needs: never bind a Carbon there, the query grammar
+        // formats it without an offset and the session time zone would decide the instant.
         $attributes = (new EfacturaToken)->forceFill([
             'access_token' => $tokens->accessToken,
             'refresh_token' => $tokens->refreshToken,
@@ -597,18 +621,6 @@ class TokenService
         }
 
         $token->update(['last_used_at' => now()]);
-    }
-
-    /**
-     * Update token with OAuth tokens data.
-     */
-    public function updateTokenFromOAuth(EfacturaToken $token, OAuthTokensData $tokens): void
-    {
-        $token->update([
-            'access_token' => $tokens->accessToken,
-            'refresh_token' => $tokens->refreshToken,
-            'expires_at' => $tokens->expiresAt,
-        ]);
     }
 
     /**

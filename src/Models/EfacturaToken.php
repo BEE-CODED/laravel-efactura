@@ -88,6 +88,16 @@ class EfacturaToken extends Model
         return $this->hasMany(EfacturaMessage::class);
     }
 
+    /**
+     * On PostgreSQL every date is written with its offset: expires_at is `timestamp with time
+     * zone` there (2024_01_01_000009), and a value without an offset would be read in the
+     * session time zone. Naive columns ignore the offset, so their values do not change.
+     */
+    public function getDateFormat(): string
+    {
+        return $this->getConnection()->getDriverName() === 'pgsql' ? 'Y-m-d H:i:sP' : parent::getDateFormat();
+    }
+
     public function getVatNumber(): string
     {
         return VatNumberValidator::stripPrefix($this->cui);

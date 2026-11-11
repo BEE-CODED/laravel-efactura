@@ -11,6 +11,7 @@
 
 namespace BeeCoded\EFactura\Jobs;
 
+use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\DownloadService;
 use Illuminate\Bus\Queueable;
@@ -39,6 +40,8 @@ class CheckSingleUploadStatus implements ShouldQueue
 
     public function handle(DownloadService $downloadService): void
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         if (!config('efactura.enabled') || !config('efactura.features.upload_invoices')) {
             return;
         }

@@ -24,6 +24,9 @@ use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFactura\Tests\Fixtures\TestInvoice;
 use BeeCoded\EFacturaSdk\Facades\UblBuilder;
 use BeeCoded\EFacturaSdk\Services\RateLimiter;
+use GuzzleHttp\Exception\ConnectException;
+use GuzzleHttp\Promise\Create;
+use GuzzleHttp\Psr7\Request as Psr7Request;
 use Illuminate\Cache\Events\CacheMissed;
 use Illuminate\Contracts\Filesystem\Filesystem;
 use Illuminate\Contracts\Queue\Job;
@@ -200,6 +203,42 @@ describe('transport ambiguity', function () {
         expect($upload->status)->toBe(UploadStatus::Failed)
             ->and($upload->failure_reason)->toBe(FailureReason::Indeterminate)
             ->and($upload->failure_reason->isRetryable())->toBeFalse();
+    });
+
+    // A 408 is a timeout, not a verdict: ANAF may have filed the document. It was validation.
+    it('parks a 408 as indeterminate rather than recording a rejection', function () {
+        Event::fake([InvoiceFailed::class]);
+        Http::fake([UPLOAD_URL => Http::response('Request Timeout', 408)]);
+
+        $upload = makePendingUpload();
+        $this->uploadService->processUpload($upload);
+
+        expect($upload->fresh()->failure_reason)->toBe(FailureReason::Indeterminate);
+        Event::assertDispatched(InvoiceFailed::class);
+    });
+
+    // cURL failed to connect, so the request never left: the SDK raises RequestNotSentException,
+    // which was an indeterminate 500 and is now retried.
+    it('retries an upload the SDK proves was never sent', function () {
+        Event::fake([InvoiceFailed::class]);
+        Http::fake([UPLOAD_URL => function ($request) {
+            $message = 'cURL error 7: Failed to connect to api.anaf.ro port 443';
+
+            return Create::rejectionFor(new ConnectException(
+                $message,
+                new Psr7Request($request->method(), $request->url()),
+                null,
+                ['errno' => 7, 'error' => 'Failed to connect to api.anaf.ro port 443'],
+            ));
+        }]);
+
+        $upload = makePendingUpload();
+        $this->uploadService->processUpload($upload);
+
+        expect($upload->fresh()->status)->toBe(UploadStatus::Failed)
+            ->and($upload->fresh()->failure_reason)->toBe(FailureReason::Transient)
+            ->and($upload->fresh()->xml_path)->toBeNull();
+        Event::assertNotDispatched(InvoiceFailed::class);
     });
 });
 
@@ -833,7 +872,73 @@ describe('a cooldown that starts after the row was claimed', function () {
         expect($refused)->toBeTrue()
             ->and($upload->status)->toBe(UploadStatus::Pending)
             ->and($upload->failure_reason)->toBeNull()
-            ->and($upload->errors[0])->toContain('ANAF refused to refresh the token');
+            ->and($upload->errors[0])->toContain('ANAF refused to refresh the token')
+            // Nothing was sent: no file is kept for this attempt.
+            ->and($upload->xml_path)->toBeNull()
+            ->and(Storage::disk('local')->allFiles())->toBe([]);
         Http::assertNothingSent();
+    });
+});
+
+/**
+ * The XML is stored before the claim, and every re-drive after a hand-back stored another
+ * file while the row named only the last one: about one file a minute per rate-limited row.
+ */
+describe('the XML file of an attempt that was not sent', function () {
+    it('is deleted when ANAF answers 429, so retries leave no files behind', function () {
+        Http::fake([UPLOAD_URL => Http::response('prea multe apeluri', 429)]);
+        $upload = makePendingUpload();
+
+        foreach (range(1, 3) as $attempt) {
+            $this->travel(1)->seconds(); // a new file name each attempt
+            $this->uploadService->processUpload($upload->fresh());
+        }
+
+        expect($upload->fresh()->failure_reason)->toBe(FailureReason::RateLimited)
+            ->and($upload->fresh()->xml_path)->toBeNull()
+            ->and(Storage::disk('local')->allFiles())->toBe([]);
+        Http::assertSentCount(3);
+    });
+
+    it('is deleted when the attempt fails transiently before anything is sent', function () {
+        $upload = makePendingUpload();
+        $this->token->update(['is_active' => false]);
+
+        $this->uploadService->processUpload($upload);
+
+        expect($upload->fresh()->failure_reason)->toBe(FailureReason::Transient)
+            ->and($upload->fresh()->xml_path)->toBeNull()
+            ->and(Storage::disk('local')->allFiles())->toBe([]);
+    });
+
+    it('is deleted when another worker wins the claim, unless the row names it', function (bool $sameName) {
+        $this->freezeSecond();
+        $upload = makePendingUpload();
+        $path = 'efactura-test/uploads/12345678/'.$upload->id.'_'.now()->format('Ymd_His').'.xml';
+
+        makeUblSpy(function () use ($upload, $path, $sameName) {
+            EfacturaUpload::where('id', $upload->id)->update([
+                'status' => UploadStatus::Uploading,
+                'xml_path' => $sameName ? $path : 'efactura-test/uploads/12345678/other.xml',
+            ]);
+        });
+        Http::fake([UPLOAD_URL => Http::response('ok', 200)]);
+
+        $this->uploadService->processUpload($upload);
+
+        Http::assertNothingSent();
+        expect(Storage::disk('local')->exists($path))->toBe($sameName);
+    })->with(['another name' => false, 'the same name' => true]);
+
+    it('is kept for an attempt that was sent', function () {
+        Http::fake([UPLOAD_URL => Http::response(
+            '<?xml version="1.0"?><header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" ExecutionStatus="0" index_incarcare="5001130255"/>'
+        )]);
+        $upload = makePendingUpload();
+
+        $this->uploadService->processUpload($upload);
+
+        expect($upload->fresh()->status)->toBe(UploadStatus::Processing)
+            ->and(Storage::disk('local')->exists($upload->fresh()->xml_path))->toBeTrue();
     });
 });

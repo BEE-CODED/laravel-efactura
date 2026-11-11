@@ -15,9 +15,12 @@ use Illuminate\Support\Sleep;
  * (mechanism); this layer owns the retry policy (up to N total attempts, backoff
  * = retryAfterSeconds), then re-throws so the consuming app can present it.
  *
- * Only the rate-limit exception triggers a retry — a failure() result
- * (invalid CUI, malformed response) passes straight through, and the SDK
- * already retries transient 5xx/connection errors internally.
+ * Only the SDK's own limiter refusal triggers a retry. ANAF's 429 (a
+ * RateLimitExceededException with fromProvider) is re-thrown at once: it came
+ * after the SDK's own retries, and asking again within seconds only spends more
+ * of the 1 request/second. A failure() result (invalid CUI, malformed response)
+ * passes straight through, and the SDK already retries transient 5xx/connection
+ * errors internally.
  */
 final class RetryingAnafDetailsClient implements AnafDetailsClientInterface
 {
@@ -55,7 +58,7 @@ final class RetryingAnafDetailsClient implements AnafDetailsClientInterface
             try {
                 return $operation();
             } catch (RateLimitExceededException $e) {
-                if ($attempt >= $attempts) {
+                if ($e->fromProvider || $attempt >= $attempts) {
                     throw $e;
                 }
 

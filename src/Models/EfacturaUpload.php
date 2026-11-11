@@ -12,6 +12,7 @@
 namespace BeeCoded\EFactura\Models;
 
 use BeeCoded\EFactura\Enums\FailureReason;
+use BeeCoded\EFactura\Enums\ResponseVerification;
 use BeeCoded\EFactura\Enums\UploadStatus;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
@@ -40,6 +41,8 @@ use Illuminate\Support\Carbon;
  * @property int $response_attempts
  * @property Carbon|null $response_failed_at
  * @property int $status_failures
+ * @property ResponseVerification|null $response_verification
+ * @property Carbon|null $next_poll_at
  * @property Carbon $created_at
  * @property Carbon $updated_at
  * @property-read EfacturaToken|null $token
@@ -80,6 +83,8 @@ class EfacturaUpload extends Model
         'response_attempts',
         'response_failed_at',
         'status_failures',
+        'response_verification',
+        'next_poll_at',
     ];
 
     protected $casts = [
@@ -94,6 +99,8 @@ class EfacturaUpload extends Model
         'response_attempts' => 'integer',
         'response_failed_at' => 'datetime',
         'status_failures' => 'integer',
+        'response_verification' => ResponseVerification::class,
+        'next_poll_at' => 'datetime',
     ];
 
     public function token(): BelongsTo
@@ -161,10 +168,14 @@ class EfacturaUpload extends Model
         return $query->whereIn('status', [UploadStatus::Uploading, UploadStatus::Processing]);
     }
 
+    /**
+     * Processing uploads with an index whose next status read is due (next_poll_at null or past).
+     */
     public function scopeNeedsStatusCheck(Builder $query): Builder
     {
         return $query->where('status', UploadStatus::Processing)
-            ->whereNotNull('upload_index');
+            ->whereNotNull('upload_index')
+            ->where(fn (Builder $due) => $due->whereNull('next_poll_at')->orWhere('next_poll_at', '<=', now()));
     }
 
     /**

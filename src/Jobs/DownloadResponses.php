@@ -11,13 +11,17 @@
 
 namespace BeeCoded\EFactura\Jobs;
 
+use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Jobs\Concerns\DiscardsWhenStale;
+use BeeCoded\EFactura\Models\EfacturaToken;
+use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\DownloadService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUniqueUntilProcessing;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\Middleware\WithoutOverlapping;
 use Illuminate\Queue\SerializesModels;
 
 class DownloadResponses implements ShouldBeUniqueUntilProcessing, ShouldQueue
@@ -47,13 +51,36 @@ class DownloadResponses implements ShouldBeUniqueUntilProcessing, ShouldQueue
         return $this->cui ?? 'all';
     }
 
+    /**
+     * A run longer than the schedule interval must not overlap the next one on another
+     * worker: both would spend the same rows' daily ANAF quota.
+     *
+     * @return list<object>
+     */
+    public function middleware(): array
+    {
+        return [(new WithoutOverlapping($this->uniqueId()))->dontRelease()->expireAfter($this->timeout + 30)];
+    }
+
     public function handle(DownloadService $downloadService): void
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         if ($this->isStale()) {
             return;
         }
 
         if (!config('efactura.enabled') || !config('efactura.features.upload_invoices')) {
+            return;
+        }
+
+        // One job per CUI with due work, each with its own timeout and retries.
+        if ($this->cui === null) {
+            EfacturaToken::active()
+                ->whereIn('id', EfacturaUpload::needsResponseDownload()->select('efactura_token_id'))
+                ->pluck('cui')
+                ->each(fn (string $cui) => dispatch((new self($cui))->asFanOutChild()));
+
             return;
         }
 

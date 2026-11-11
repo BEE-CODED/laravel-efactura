@@ -12,26 +12,38 @@
 namespace BeeCoded\EFactura\Services;
 
 use BeeCoded\EFactura\Enums\FailureReason;
+use BeeCoded\EFactura\Enums\ResponseVerification;
 use BeeCoded\EFactura\Enums\StatusCheckOutcome;
 use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Events\InvoiceFailed;
 use BeeCoded\EFactura\Events\InvoiceProcessed;
 use BeeCoded\EFactura\Events\InvoiceReceived;
+use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Models\EfacturaMessage;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFacturaSdk\Data\Response\StatusResponseData;
+use BeeCoded\EFacturaSdk\Enums\ArchiveLimitReason;
 use BeeCoded\EFacturaSdk\Enums\RateLimitScope;
+use BeeCoded\EFacturaSdk\Enums\StatusVerdict;
 use BeeCoded\EFacturaSdk\Exceptions\ApiException;
+use BeeCoded\EFacturaSdk\Exceptions\ArchiveLimitException;
+use BeeCoded\EFacturaSdk\Exceptions\ArchiveMismatchException;
 use BeeCoded\EFacturaSdk\Exceptions\AuthenticationException;
 use BeeCoded\EFacturaSdk\Exceptions\RateLimitExceededException;
+use BeeCoded\EFacturaSdk\Support\ArchiveInspector;
+use BeeCoded\EFacturaSdk\Support\PollSchedule;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 
 class DownloadService
 {
+    /** Taken off each PollSchedule interval so a read stays due on the scheduler tick it aims at. */
+    private const POLL_MARGIN_SECONDS = 60;
+
     public function __construct(
         protected TokenService $tokenService,
         protected UploadService $uploadService,
+        protected ArchiveInspector $archiveInspector = new ArchiveInspector,
     ) {}
 
     /**
@@ -49,6 +61,8 @@ class DownloadService
      */
     public function checkStatus(EfacturaUpload $upload): StatusCheckOutcome
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         if (!$upload->upload_index || $upload->isTerminal()) {
             return StatusCheckOutcome::NotPollable;
         }
@@ -79,36 +93,45 @@ class DownloadService
                 $upload->update(['status_failures' => 0]);
             }
 
-            if ($response->isReady()) {
-                if ($response->idDescarcare === null) {
+            // The SDK's reading of the answer: Ready and Rejected need a download id of ANAF's
+            // digits; any other id cannot be downloaded, so it counts as none.
+            $verdict = $response->verdict();
+
+            if ($verdict === StatusVerdict::Ready || $verdict === StatusVerdict::ReadyWithoutDownloadId) {
+                $downloadId = $verdict === StatusVerdict::Ready ? $response->idDescarcare : null;
+
+                if ($downloadId === null) {
                     Log::warning('EFactura: ANAF reported an upload as ok without a download id', [
                         'upload_id' => $upload->id,
                         'upload_index' => $upload->upload_index,
+                        'id_descarcare' => $response->idDescarcare,
                     ]);
                 }
 
-                // As UploadService::markUploadAsCompleted(), guarded; see recordVerdict().
+                // ANAF can answer `ok` without a download id. The invoice is still filed, so it
+                // is completed (demoting it would be the worse lie), with a note that no
+                // response can be downloaded. Guarded; see recordVerdict().
                 $this->recordVerdict($upload, [
                     'status' => UploadStatus::Completed,
-                    'download_id' => $response->idDescarcare,
+                    'download_id' => $downloadId,
                     'processed_at' => now(),
-                    ...($response->idDescarcare === null ? ['errors' => [__('efactura::messages.completed_without_download_id')]] : []),
+                    ...($downloadId === null ? ['errors' => [__('efactura::messages.completed_without_download_id')]] : []),
                 ]);
 
                 return StatusCheckOutcome::Checked;
             }
 
-            if ($response->isFailed()) {
-                // A nok without a download id is no verdict on the document either.
-                if ($response->idDescarcare === null) {
-                    $this->parkAsIndeterminate($upload, [
-                        __('efactura::messages.status_nok_without_download_id', ['index' => $upload->upload_index]),
-                        ...array_values($response->errors ?? []),
-                    ]);
+            // A nok without a download id is no verdict on the document either.
+            if ($verdict === StatusVerdict::RejectedWithoutDownloadId) {
+                $this->parkAsIndeterminate($upload, [
+                    __('efactura::messages.status_nok_without_download_id', ['index' => $upload->upload_index]),
+                    ...array_values($response->errors ?? []),
+                ]);
 
-                    return StatusCheckOutcome::Checked;
-                }
+                return StatusCheckOutcome::Checked;
+            }
 
+            if ($verdict === StatusVerdict::Rejected) {
                 $errors = $response->errors ?? [__('efactura::messages.processing_failed_at_anaf')];
                 // ANAF processed the document and rejected it on its merits: terminal.
                 if ($this->recordFailure($upload, $errors, $response->idDescarcare, FailureReason::Validation)) {
@@ -119,7 +142,7 @@ class DownloadService
             }
 
             // NotProcessed: ANAF did not take the file in — final, no download id.
-            if ($response->isNotProcessed()) {
+            if ($verdict === StatusVerdict::NotProcessed) {
                 $errors = $response->errors ?: [__('efactura::messages.not_processed_at_anaf')];
                 // Validation is not retryable: the document is never re-submitted automatically.
                 if ($this->recordFailure($upload, $errors, null, FailureReason::Validation)) {
@@ -129,15 +152,22 @@ class DownloadService
                 return StatusCheckOutcome::Checked;
             }
 
-            if ($response->isInProgress()) {
-                // The ONLY legitimate no-op: ANAF said, in so many words, "not yet".
+            if ($verdict === StatusVerdict::InProgress) {
+                // ANAF said, in so many words, "not yet": read it again on the SDK's schedule.
+                // An upload without uploaded_at is treated as old (the slowest cadence). A minute's
+                // margin keeps a read due on the scheduled run it aims at, not the one after.
+                $age = $upload->uploaded_at ? (int) $upload->uploaded_at->diffInSeconds(now(), true) : 10800;
+                EfacturaUpload::whereKey($upload->id)
+                    ->where('status', UploadStatus::Processing)
+                    ->update(['next_poll_at' => now()->addSeconds(max(PollSchedule::status($age) - self::POLL_MARGIN_SECONDS, self::POLL_MARGIN_SECONDS))]);
+
                 return StatusCheckOutcome::Checked;
             }
 
             // An error-only answer (an XML <Errors/> header or a JSON "eroare": an unknown
             // index, "Nu aveti dreptul") is no verdict on the document. Park it, keeping
             // ANAF's words on the row for whoever reconciles it.
-            if ($response->hasAnafError()) {
+            if ($verdict === StatusVerdict::AnafError) {
                 $this->parkAsIndeterminate($upload, [
                     __('efactura::messages.status_nok_without_download_id', ['index' => $upload->upload_index]),
                     ...array_values($response->errors ?? []),
@@ -196,7 +226,7 @@ class DownloadService
     {
         return !$requested
             || $e instanceof AuthenticationException
-            || ($e instanceof ApiException && $e->statusCode >= 500);
+            || ($e instanceof ApiException && ($e->statusCode >= 500 || $e->statusCode === 408));
     }
 
     /**
@@ -364,6 +394,8 @@ class DownloadService
      */
     public function downloadResponse(EfacturaUpload $upload): void
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         if (!$upload->download_id || $upload->response_path) {
             return;
         }
@@ -415,6 +447,12 @@ class DownloadService
             return;
         }
 
+        $verification = $this->verifyResponse($upload, $response->content);
+
+        if ($verification === null) {
+            return;
+        }
+
         // ANAF delivered: a failure to keep the file is ours, so it is retried by the next
         // run without counting against the download attempts.
         try {
@@ -425,7 +463,7 @@ class DownloadService
             $stored = EfacturaUpload::where('id', $upload->id)
                 ->where('download_id', $upload->download_id)
                 ->whereNull('response_path')
-                ->update(['response_path' => $path]) > 0;
+                ->update(['response_path' => $path, 'response_verification' => $verification]) > 0;
         } catch (\Throwable $e) {
             Log::error('EFactura: downloaded response could not be stored', [
                 'upload_id' => $upload->id,
@@ -447,6 +485,60 @@ class DownloadService
         // Only fire InvoiceProcessed for successful uploads, not error report downloads
         if ($upload->status === UploadStatus::Completed) {
             rescue(fn () => event(new InvoiceProcessed($upload)));
+        }
+    }
+
+    /**
+     * Check a downloaded response archive with the SDK's ArchiveInspector: against the
+     * uploaded XML when ANAF accepted the upload and that XML is stored, otherwise its
+     * limits only.
+     *
+     * A mismatch keeps the archive as ANAF sent it, marked and logged. An archive outside
+     * the limits (not a ZIP, empty, encrypted, too large, too many members) counts as a
+     * poisoned response. A local failure (temporary file, reading the uploaded XML) is
+     * ours: the next run retries it without counting.
+     *
+     * @return ResponseVerification|null Null when the archive is not to be stored.
+     */
+    protected function verifyResponse(EfacturaUpload $upload, string $archive): ?ResponseVerification
+    {
+        try {
+            $disk = Storage::disk(config('efactura.storage.disk', 'local'));
+            // exists() first: a disk with `throw => true` throws on a missing file instead of
+            // returning null, and a file no longer stored means limits only.
+            $uploadedXml = $upload->status === UploadStatus::Completed && $upload->xml_path && $disk->exists($upload->xml_path)
+                ? $disk->get($upload->xml_path)
+                : null;
+            // A stored file a non-throwing disk could not read is a local failure, not "limits only".
+            if ($uploadedXml === null && $upload->status === UploadStatus::Completed && $upload->xml_path && $disk->exists($upload->xml_path)) {
+                throw new \RuntimeException('The stored upload XML could not be read.');
+            }
+
+            $this->archiveInspector->verify($archive, $uploadedXml);
+
+            return $uploadedXml === null ? ResponseVerification::LimitsOnly : ResponseVerification::Verified;
+        } catch (ArchiveMismatchException $e) {
+            Log::error('EFactura: response archive does not hold the uploaded invoice; kept as received', [
+                'upload_id' => $upload->id,
+                'download_id' => $upload->download_id,
+                'error' => $e->getMessage(),
+            ]);
+
+            return ResponseVerification::Mismatch;
+        } catch (\Throwable $e) {
+            if ($e instanceof ArchiveLimitException && $e->reason !== ArchiveLimitReason::Io) {
+                $this->recordPoisonedResponse($upload, $e);
+
+                return null;
+            }
+
+            Log::error('EFactura: response archive could not be checked', [
+                'upload_id' => $upload->id,
+                'exception' => $e::class,
+                'error' => $e->getMessage(),
+            ]);
+
+            return null;
         }
     }
 
@@ -500,6 +592,8 @@ class DownloadService
      */
     public function downloadMessage(EfacturaMessage $message): void
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         if ($message->is_downloaded || !$message->download_id) {
             return;
         }
@@ -607,6 +701,8 @@ class DownloadService
      */
     public function markMessageAsDownloaded(EfacturaMessage $message, ?string $xmlPath = null): bool
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         $marked = EfacturaMessage::whereKey($message->id)
             ->where('is_downloaded', false)
             ->update(['is_downloaded' => true, 'xml_path' => $xmlPath]) > 0;
@@ -637,6 +733,8 @@ class DownloadService
      */
     public function checkAllStatuses(?string $cui = null): void
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         $query = EfacturaUpload::needsStatusCheck()->with('token');
 
         if ($cui) {
@@ -652,7 +750,9 @@ class DownloadService
         // A grant in its refresh cooldown would refuse every row: say so once per token.
         $coolingDown = [];
 
-        $query->each(function (EfacturaUpload $upload) use (&$coolingDown) {
+        // lazyById, not each(): each() pages by OFFSET, so rows that leave the scope while
+        // a page is processed shift the rest below the next offset and are skipped.
+        foreach ($query->lazyById() as $upload) {
             if ($upload->token && ($seconds = $this->tokenService->refreshCooldownSeconds($upload->token)) > 0) {
                 if (!isset($coolingDown[$upload->token->id])) {
                     $coolingDown[$upload->token->id] = true;
@@ -662,11 +762,11 @@ class DownloadService
                     ]);
                 }
 
-                return;
+                continue;
             }
 
             $this->checkStatus($upload);
-        });
+        }
     }
 
     /**
@@ -674,6 +774,8 @@ class DownloadService
      */
     public function downloadAllResponses(?string $cui = null): void
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         $query = EfacturaUpload::needsResponseDownload()->with('token');
 
         if ($cui) {
@@ -686,7 +788,9 @@ class DownloadService
             $query->forToken($token);
         }
 
-        $query->each(fn (EfacturaUpload $upload) => $this->downloadResponse($upload));
+        foreach ($query->lazyById() as $upload) {
+            $this->downloadResponse($upload);
+        }
     }
 
     /**
@@ -694,6 +798,8 @@ class DownloadService
      */
     public function downloadAllReceivedInvoices(?string $cui = null): void
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         $query = EfacturaMessage::notDownloaded()->received()
             ->where('download_attempts', '<', EfacturaMessage::MAX_DOWNLOAD_ATTEMPTS)
             ->with('token');
@@ -708,7 +814,9 @@ class DownloadService
             $query->forToken($token);
         }
 
-        $query->each(fn (EfacturaMessage $message) => $this->downloadMessage($message));
+        foreach ($query->lazyById() as $message) {
+            $this->downloadMessage($message);
+        }
     }
 
     /**

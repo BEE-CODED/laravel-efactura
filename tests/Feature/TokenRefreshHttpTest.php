@@ -16,6 +16,7 @@ use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\DownloadService;
 use BeeCoded\EFactura\Services\TokenService;
+use BeeCoded\EFacturaSdk\Contracts\AnafAuthenticatorInterface;
 use BeeCoded\EFacturaSdk\Data\Invoice\ListMessagesParamsData;
 use BeeCoded\EFacturaSdk\Data\Response\ListMessagesResponseData;
 use BeeCoded\EFacturaSdk\Exceptions\ApiException;
@@ -750,6 +751,29 @@ describe('a grant ANAF refuses to refresh', function () {
         expect($other)->toBeFalse();
         Http::assertSentCount(1);
     });
+
+    // Code 0 is no answer from ANAF (here: missing OAuth configuration): the grant was not
+    // refused, so it must not be shut out for 15 minutes.
+    it('starts no cooldown for a refresh failure ANAF did not answer', function (Closure $breakIt) {
+        Http::fake();
+        $token = makeExpiringToken();
+        $breakIt($token);
+
+        try {
+            $this->tokenService->executeWithClient($token, fn () => null);
+            $this->fail('Expected AuthenticationException');
+        } catch (AuthenticationException $e) {
+            expect($e->getCode())->toBe(0);
+        }
+
+        expect($this->tokenService->refreshCooldownSeconds($token->fresh()))->toBe(0);
+        Http::assertNothingSent();
+    })->with([
+        'missing OAuth configuration' => [function () {
+            config(['efactura-sdk.oauth.client_id' => '']);
+            app()->forgetInstance(AnafAuthenticatorInterface::class);
+        }],
+    ]);
 
     it('logs the cooldown once per grant in a status run, not once per row', function () {
         Http::fake([OAUTH_TOKEN_URL => Http::response(['error' => 'invalid_grant'], 400)]);

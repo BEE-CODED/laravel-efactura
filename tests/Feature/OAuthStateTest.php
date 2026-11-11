@@ -13,6 +13,7 @@ use BeeCoded\EFactura\EfacturaServiceProvider;
 use BeeCoded\EFactura\Events\TokenStored;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Services\TokenService;
+use Illuminate\Auth\GenericUser;
 use Illuminate\Routing\RouteCollection;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
@@ -110,6 +111,57 @@ describe('the web authorization flow', function () {
         $redirect->assertRedirect();
 
         $state = stateFromUrl($redirect->headers->get('Location'));
+
+        $this->get('/efactura/callback?code=AUTH_CODE&state='.urlencode($state))
+            ->assertSessionHas('efactura_success', true);
+
+        expect(EfacturaToken::where('cui', '18547290')->first()->access_token)->toBe('WEB_ACCESS');
+    });
+});
+
+/**
+ * A state started from the web was valid in any browser: whoever got a victim to open the
+ * ANAF link stored the victim's grant under a CUI the attacker had chosen. It is now bound
+ * to the starting session and user.
+ */
+describe('a web-started authorization', function () {
+    beforeEach(function () {
+        Http::fake([
+            ANAF_TOKEN_URL => Http::response([
+                'access_token' => 'WEB_ACCESS',
+                'refresh_token' => 'WEB_REFRESH',
+                'expires_in' => 3600,
+            ]),
+        ]);
+    });
+
+    it('completes only in the session that started it', function () {
+        $state = stateFromUrl($this->get('/efactura/auth/18547290')->headers->get('Location'));
+
+        $this->flushSession(); // another browser
+
+        $this->get('/efactura/callback?code=AUTH_CODE&state='.urlencode($state))
+            ->assertSessionHas('efactura_error', true);
+
+        expect(EfacturaToken::count())->toBe(0);
+        Http::assertNothingSent();
+    });
+
+    it('completes only for the user who started it', function () {
+        $this->actingAs(new GenericUser(['id' => 1]));
+        $state = stateFromUrl($this->get('/efactura/auth/18547290')->headers->get('Location'));
+
+        $this->actingAs(new GenericUser(['id' => 2]));
+
+        $this->get('/efactura/callback?code=AUTH_CODE&state='.urlencode($state))
+            ->assertSessionHas('efactura_error', true);
+
+        expect(EfacturaToken::count())->toBe(0);
+    });
+
+    it('completes for the same user in the same session', function () {
+        $this->actingAs(new GenericUser(['id' => 1]));
+        $state = stateFromUrl($this->get('/efactura/auth/18547290')->headers->get('Location'));
 
         $this->get('/efactura/callback?code=AUTH_CODE&state='.urlencode($state))
             ->assertSessionHas('efactura_success', true);

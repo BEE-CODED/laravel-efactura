@@ -319,22 +319,6 @@ describe('TokenService', function () {
         });
     });
 
-    describe('updateTokenFromOAuth', function () {
-        it('updates token with new OAuth data', function () {
-            $newTokens = new OAuthTokensData(
-                accessToken: 'new_access',
-                refreshToken: 'new_refresh',
-                expiresAt: now()->addHours(2),
-            );
-
-            $this->tokenService->updateTokenFromOAuth($this->token, $newTokens);
-
-            $this->token->refresh();
-            expect($this->token->access_token)->toBe('new_access')
-                ->and($this->token->refresh_token)->toBe('new_refresh');
-        });
-    });
-
     describe('handleClientTokenRefresh', function () {
         it('updates token and fires event when client was refreshed', function () {
             Event::fake([TokenRefreshed::class]);
@@ -534,8 +518,10 @@ describe('TokenService', function () {
             // Looks expiring to us...
             $this->token->update(['expires_at' => now()->addSeconds(60)]);
 
-            // ...but another process refreshed it before we took the lock.
-            EfacturaToken::where('id', $this->token->id)->update(['expires_at' => now()->addHours(2)]);
+            // ...but another process refreshed it before we took the lock. Through a model, as
+            // TokenService writes: on PostgreSQL its date format carries the offset that the
+            // timestamptz column needs, while a bare query-builder Carbon would not.
+            EfacturaToken::find($this->token->id)->update(['expires_at' => now()->addHours(2)]);
 
             // Any refresh attempt would explode here: ANAF rotates refresh tokens, so a
             // second refresh would invalidate the good one.

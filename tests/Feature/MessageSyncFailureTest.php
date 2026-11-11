@@ -15,10 +15,12 @@ use BeeCoded\EFactura\Models\EfacturaMessage;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Services\MessageSyncService;
 use BeeCoded\EFacturaSdk\Exceptions\ApiException;
-use Illuminate\Queue\Events\JobFailed;
-use Illuminate\Support\Facades\Event;
+use Illuminate\Http\Client\Request;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Queue;
 
 /**
  * syncMessages() caught \Throwable, logged one line, and carried on. That is WHY the
@@ -30,7 +32,7 @@ use Illuminate\Support\Facades\Log;
  * — one company's broken token should not stop the others — but the BATCH must not
  * report success when part of it failed.
  */
-const MESSAGES_URL = 'https://api.anaf.ro/test/FCTEL/rest/listaMesajeFactura*';
+const MESSAGES_URL = 'https://api.anaf.ro/test/FCTEL/rest/listaMesajePaginatieFactura*';
 
 beforeEach(function () {
     config([
@@ -54,6 +56,18 @@ function makeSyncToken(string $cui): EfacturaToken
         'expires_at' => now()->addHour(),
         'is_active' => true,
     ]);
+}
+
+/**
+ * The query of every listing request sent so far.
+ */
+function syncQueries(): Collection
+{
+    return Http::recorded()->map(function (array $pair) {
+        parse_str((string) parse_url($pair[0]->url(), PHP_URL_QUERY), $query);
+
+        return $query;
+    })->values();
 }
 
 function anafMessagesBody(string $cui, array $mesaje = []): array
@@ -130,6 +144,114 @@ describe('syncMessages', function () {
     });
 });
 
+/**
+ * The simple list answers "more than 500 messages, use the paginated endpoint" once a CUI
+ * has over 500 messages in 60 days, so the sync always pages through one fixed window.
+ */
+describe('paginated listing', function () {
+    it('pages through one fixed window until the last page', function () {
+        $this->travelTo(Carbon::parse('2026-11-10 12:00:00', 'UTC'));
+        $message = fn (string $id) => [
+            'data_creare' => '202407171230',
+            'cif' => '12345678',
+            'id_solicitare' => '5001130255',
+            'detalii' => 'Factura cu id_incarcare=5001130255 emisa de cif_emitent=12345678 pentru cif_beneficiar=87654321',
+            'tip' => 'FACTURA TRIMISA',
+            'id' => $id,
+        ];
+
+        $start = (string) now()->subDays(60)->addMinutes(70)->getTimestampMs();
+        $end = (string) now()->subMinute()->getTimestampMs();
+
+        Http::fake([MESSAGES_URL => function (Request $request) use ($message) {
+            parse_str((string) parse_url($request->url(), PHP_URL_QUERY), $query);
+            $page = (int) $query['pagina'];
+            // Each page takes time, so a window computed per page would move.
+            $this->travel(61)->seconds();
+
+            return Http::response([
+                ...anafMessagesBody('12345678', [$message('300113005'.$page)]),
+                'numar_total_pagini' => 2,
+                'index_pagina_curenta' => $page,
+            ]);
+        }]);
+
+        expect($this->messageSyncService->syncMessages(makeSyncToken('12345678')))->toBe(2);
+
+        $queries = syncQueries();
+
+        expect($queries->pluck('pagina')->all())->toBe(['1', '2'])
+            ->and($queries->pluck('startTime')->unique()->values()->all())->toBe([$start])
+            ->and($queries->pluck('endTime')->unique()->values()->all())->toBe([$end]);
+        expect(EfacturaMessage::pluck('message_id')->sort()->values()->all())->toBe(['3001130051', '3001130052']);
+    });
+
+    it('stops at its own page count when ANAF keeps answering with the same page index', function () {
+        Http::fake([MESSAGES_URL => function () {
+            // A runaway loop fails here instead of hanging the suite.
+            if (Http::recorded()->count() > 3) {
+                return Http::response('runaway', 500);
+            }
+
+            return Http::response([...anafMessagesBody('12345678'), 'numar_total_pagini' => 2, 'index_pagina_curenta' => 1]);
+        }]);
+
+        $this->messageSyncService->syncMessages(makeSyncToken('12345678'));
+
+        expect(syncQueries()->pluck('pagina')->all())->toBe(['1', '2']);
+    });
+
+    it('stops when ANAF does not say which page it answered', function () {
+        Http::fake([MESSAGES_URL => Http::response([...anafMessagesBody('12345678'), 'numar_total_pagini' => 2])]);
+
+        $this->messageSyncService->syncMessages(makeSyncToken('12345678'));
+
+        expect(syncQueries()->pluck('pagina')->all())->toBe(['1']);
+    });
+
+    /**
+     * Sixty wall-clock days back from November cross the end of summer time, an hour more than
+     * the SDK's 60-day limit, which refused every sync until late December.
+     */
+    it('keeps the window within 60 days in an app time zone with summer time', function () {
+        $zone = date_default_timezone_get();
+        config(['app.timezone' => 'Europe/Bucharest']);
+        date_default_timezone_set('Europe/Bucharest');
+
+        try {
+            $this->travelTo(Carbon::parse('2026-11-10 12:00:00', 'Europe/Bucharest'));
+            Http::fake([MESSAGES_URL => Http::response(anafMessagesBody('12345678'))]);
+
+            expect($this->messageSyncService->syncMessages(makeSyncToken('12345678')))->toBe(0);
+
+            $query = syncQueries()->sole();
+            expect((int) $query['endTime'] - (int) $query['startTime'])->toBe((60 * 86400 - 71 * 60) * 1000)
+                ->and((int) $query['endTime'])->toBe(now()->subMinute()->getTimestampMs());
+        } finally {
+            date_default_timezone_set($zone);
+        }
+    });
+
+    it('is not stopped by the simple list\'s 500-message limit', function () {
+        Http::fake([
+            'https://api.anaf.ro/test/FCTEL/rest/listaMesajeFactura*' => Http::response([
+                'eroare' => 'Lista de mesaje este mai mare decat numarul de 500 elemente permise in pagina. Folositi endpoint-ul cu paginatie.',
+                'titlu' => 'Lista Mesaje',
+            ]),
+            MESSAGES_URL => Http::response(anafMessagesBody('12345678', [[
+                'data_creare' => '202407171230',
+                'cif' => '12345678',
+                'id_solicitare' => '5001130255',
+                'detalii' => 'Factura cu id_incarcare=5001130255 emisa de cif_emitent=12345678 pentru cif_beneficiar=87654321',
+                'tip' => 'FACTURA TRIMISA',
+                'id' => '3001130059',
+            ]])),
+        ]);
+
+        expect($this->messageSyncService->syncMessages(makeSyncToken('12345678')))->toBe(1);
+    });
+});
+
 describe('ANAF error channel', function () {
     it('throws when ANAF reports a real error at HTTP 200', function () {
         // ANAF reports listaMesaje failures as HTTP 200 + {"eroare": ...}. The SDK's
@@ -145,16 +267,6 @@ describe('ANAF error channel', function () {
             ->toThrow(ApiException::class, 'Nu exista niciun CIF pentru care sa aveti drept de interogare');
 
         expect(EfacturaMessage::count())->toBe(0);
-    });
-
-    it('reports the eroare_descarcare channel too', function () {
-        Http::fake([MESSAGES_URL => Http::response([
-            'eroare_descarcare' => 'Serviciul de descarcare este indisponibil',
-            'titlu' => 'Lista Mesaje',
-        ])]);
-
-        expect(fn () => $this->messageSyncService->syncMessages(makeSyncToken('12345678')))
-            ->toThrow(ApiException::class, 'Serviciul de descarcare este indisponibil');
     });
 
     it('syncs zero quietly when ANAF says there are simply no messages', function () {
@@ -187,7 +299,7 @@ describe('syncAllMessages', function () {
         $bad = makeSyncToken('87654321');
 
         Http::fake([
-            'https://api.anaf.ro/test/FCTEL/rest/listaMesajeFactura?cif=12345678*' => Http::response(
+            'https://api.anaf.ro/test/FCTEL/rest/listaMesajePaginatieFactura?cif=12345678*' => Http::response(
                 anafMessagesBody('12345678', [[
                     'data_creare' => '202407171230',
                     'cif' => '12345678',
@@ -197,7 +309,7 @@ describe('syncAllMessages', function () {
                     'id' => '3001130059',
                 ]])
             ),
-            'https://api.anaf.ro/test/FCTEL/rest/listaMesajeFactura?cif=87654321*' => Http::response('Eroare', 500),
+            'https://api.anaf.ro/test/FCTEL/rest/listaMesajePaginatieFactura?cif=87654321*' => Http::response('Eroare', 500),
         ]);
 
         expect(fn () => $this->messageSyncService->syncAllMessages())
@@ -268,40 +380,42 @@ describe('efactura:sync command', function () {
 });
 
 /**
- * Isolating per-token failures and then throwing is right for the SERVICE, but the
- * JOB must not answer that throw by re-running the whole batch. syncAllMessages()
- * starts from scratch on every attempt, so tries=3 re-hits /listaMesajeFactura for
- * every HEALTHY CUI three times an hour — against ANAF's 750/day/CUI budget — purely
- * because one company's refresh token is permanently revoked. Retrying cannot fix a
- * revoked token; it only burns the healthy companies' quota.
+ * A null-CUI SyncMessages used to sync every token inside one 120 s job, so one slow CUI
+ * used up the budget of all the others. It now only fans out one job per active CUI; each
+ * fails and retries on its own, without re-listing the healthy ones.
  */
 describe('SyncMessages job', function () {
-    it('fails a broken batch loudly but does not re-run it for every healthy CUI', function () {
-        // Listen on the REAL dispatcher: Event::fake() does not intercept JobFailed,
-        // because the queue resolves its own dispatcher instance — a faked assertion
-        // silently records nothing here.
-        $failures = [];
-        Event::listen(JobFailed::class, function (JobFailed $event) use (&$failures) {
-            $failures[] = $event->exception;
-        });
+    it('fans out one job per active CUI, and a broken CUI fails alone', function () {
+        Queue::fake();
 
         makeSyncToken('12345678');
         makeSyncToken('87654321');
+        makeSyncToken('11111111')->update(['is_active' => false]);
 
         Http::fake([
-            'https://api.anaf.ro/test/FCTEL/rest/listaMesajeFactura?cif=12345678*' => Http::response(
-                anafMessagesBody('12345678')
+            'https://api.anaf.ro/test/FCTEL/rest/listaMesajePaginatieFactura?cif=12345678*' => Http::response(
+                anafMessagesBody('12345678', [[
+                    'data_creare' => '202407171230',
+                    'cif' => '12345678',
+                    'id_solicitare' => '5001130255',
+                    'detalii' => 'Factura cu id_incarcare=5001130255 emisa de cif_emitent=12345678 pentru cif_beneficiar=87654321',
+                    'tip' => 'FACTURA TRIMISA',
+                    'id' => '3001130059',
+                ]])
             ),
-            'https://api.anaf.ro/test/FCTEL/rest/listaMesajeFactura?cif=87654321*' => Http::response('Eroare', 500),
+            'https://api.anaf.ro/test/FCTEL/rest/listaMesajePaginatieFactura?cif=87654321*' => Http::response('Eroare', 500),
         ]);
 
-        // Must NOT bubble out of handle(): a bubbling exception is exactly what tells
-        // the queue worker to release the job for another attempt.
-        SyncMessages::dispatch();
+        app()->call([new SyncMessages, 'handle']);
 
-        // Still loud — it dead-letters, it just does not retry first.
-        expect($failures)->toHaveCount(1);
-        expect($failures[0])->toBeInstanceOf(MessageSyncFailedException::class);
+        Http::assertNothingSent();
+        $jobs = Queue::pushed(SyncMessages::class);
+        expect($jobs->pluck('cui')->sort()->values()->all())->toBe(['12345678', '87654321']);
+
+        app()->call([$jobs->firstWhere('cui', '12345678'), 'handle']);
+        expect(fn () => app()->call([$jobs->firstWhere('cui', '87654321'), 'handle']))->toThrow(ApiException::class);
+
+        expect(EfacturaMessage::pluck('message_id')->all())->toBe(['3001130059']);
     });
 
     it('still lets a single-CUI sync retry, since that failure may be transient', function () {

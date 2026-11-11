@@ -12,11 +12,12 @@
 namespace BeeCoded\EFactura\Services;
 
 use BeeCoded\EFactura\Exceptions\MessageSyncFailedException;
+use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Models\EfacturaMessage;
 use BeeCoded\EFactura\Models\EfacturaToken;
-use BeeCoded\EFacturaSdk\Data\Invoice\ListMessagesParamsData;
-use BeeCoded\EFacturaSdk\Data\Response\ListMessagesResponseData;
+use BeeCoded\EFacturaSdk\Data\Invoice\PaginatedMessagesParamsData;
 use BeeCoded\EFacturaSdk\Data\Response\MessageDetailsData;
+use BeeCoded\EFacturaSdk\Data\Response\PaginatedMessagesResponseData;
 use BeeCoded\EFacturaSdk\Enums\MessageFilter;
 use BeeCoded\EFacturaSdk\Exceptions\ApiException;
 use BeeCoded\EFacturaSdk\Support\DateHelper;
@@ -30,7 +31,7 @@ class MessageSyncService
      * ANAF wordings that report "nothing to sync" through the SAME `eroare` channel
      * it uses for real failures.
      *
-     * /listaMesajeFactura has no structured way to say "no messages": a quiet day and
+     * /listaMesajePaginatieFactura has no structured way to say "no messages": a quiet day and
      * a revoked CUI both arrive as HTTP 200 + {"eroare": "..."}. The SDK's hasError()
      * is a bare null check and cannot tell them apart (verified: the SDK carries no
      * constant, regex, helper or doc for this), so the discrimination has to live
@@ -45,8 +46,8 @@ class MessageSyncService
      * silent-success behaviour, so a future ANAF rewording surfaces as a dead-lettered
      * job instead of another year of invisibly syncing nothing.
      *
-     * Known wordings: "Nu exista mesaje in ultimele 60 zile" (simple listing) and
-     * "Nu exista mesaje in intervalul selectat" (paginated listing).
+     * Known wordings: "Nu exista mesaje in intervalul selectat" (the paginated listing
+     * this service uses) and "Nu exista mesaje in ultimele 60 zile" (the simple listing).
      *
      * @var list<string>
      */
@@ -60,6 +61,14 @@ class MessageSyncService
 
     /**
      * Sync messages for a token with optional filter.
+     *
+     * Always through the paginated listing: the simple one refuses a CUI with more than
+     * 500 messages in 60 days ("Folositi endpoint-ul cu paginatie"). One window is fixed
+     * per run, so the page count cannot shift while it pages: it starts 70 minutes inside
+     * ANAF's 60-day limit (counted in UTC, an hour beyond any summer-time offset) and ends a minute ago (never in the future, even
+     * with clock skew). Hourly runs overlap, so the margins lose nothing. Each page is one
+     * paginated-list call (SDK `paginated_list_per_day_cui`). A run restarts at page 1 and must
+     * reach the last page within the job's timeout (README, "Known limitations").
      *
      * Errors PROPAGATE. This method used to catch \Throwable, log one line and return
      * normally — which is precisely why the message-sync bug (reading a property the
@@ -78,48 +87,54 @@ class MessageSyncService
      */
     public function syncMessages(EfacturaToken $token, ?MessageFilter $filter = null): int
     {
-        $params = new ListMessagesParamsData(
-            cif: $token->cui,
-            days: 60,
-            filter: $filter,
-        );
+        PipelineTablesDisabledException::throwIfDisabled();
 
-        $response = $this->tokenService->executeWithClient(
-            $token,
-            fn ($client) => $client->getMessages($params)
-        );
-
-        if ($this->reportsNoMessages($response, $token)) {
-            return 0;
-        }
-
+        // In UTC: wall-clock days in a zone with summer time can add up to more than 60 days.
+        $start = now('UTC')->subDays(60)->addMinutes(70);
+        $end = now('UTC')->subMinute();
         $synced = 0;
 
-        foreach ($response->mesaje ?? [] as $message) {
-            // Without an id a message can be neither downloaded nor told apart from
-            // another: upserting it would merge every such message into one row. ANAF ids
-            // are digits; the SDK refuses to download anything else.
-            if ($message->id === null || !ctype_digit($message->id)) {
-                Log::warning('EFactura: ANAF listed a message without a usable id, skipping it', [
-                    'cui' => $token->cui,
-                    'tip' => $message->tip,
-                    'id_solicitare' => $message->idSolicitare,
-                ]);
+        for ($page = 1; ; $page++) {
+            $params = PaginatedMessagesParamsData::fromDateRange($token->cui, $start, $end, $page, $filter);
 
-                continue;
+            $response = $this->tokenService->executeWithClient(
+                $token,
+                fn ($client) => $client->getMessagesPaginated($params)
+            );
+
+            if ($this->reportsNoMessages($response, $token)) {
+                return $synced;
             }
 
-            $this->upsertMessage($token, $message, $filter);
-            $synced++;
-        }
+            foreach ($response->mesaje ?? [] as $message) {
+                // Without an id a message can be neither downloaded nor told apart from
+                // another: upserting it would merge every such message into one row. ANAF ids
+                // are digits; the SDK refuses to download anything else.
+                if ($message->id === null || !ctype_digit($message->id)) {
+                    Log::warning('EFactura: ANAF listed a message without a usable id, skipping it', [
+                        'cui' => $token->cui,
+                        'tip' => $message->tip,
+                        'id_solicitare' => $message->idSolicitare,
+                    ]);
 
-        return $synced;
+                    continue;
+                }
+
+                $this->upsertMessage($token, $message, $filter);
+                $synced++;
+            }
+
+            // Our own page count bounds the loop even if ANAF kept echoing an old page index.
+            if (!$response->hasNextPage() || $page >= $response->totalPages) {
+                return $synced;
+            }
+        }
     }
 
     /**
      * Resolve ANAF's error channel, which the SDK cannot raise for us.
      *
-     * /listaMesajeFactura reports its failures as HTTP 200 + {"eroare": "..."}, and
+     * The message list reports its failures as HTTP 200 + {"eroare": "..."}, and
      * the SDK's BaseApiClient::call() only throws when ! $response->successful(). So
      * a broken sync arrives here looking exactly like an empty one: `mesaje` is null,
      * foreach([]) runs zero times, 0 is returned, nothing throws, and the job, the
@@ -131,13 +146,13 @@ class MessageSyncService
      *
      * @throws ApiException When ANAF reported an actual failure.
      */
-    protected function reportsNoMessages(ListMessagesResponseData $response, EfacturaToken $token): bool
+    protected function reportsNoMessages(PaginatedMessagesResponseData $response, EfacturaToken $token): bool
     {
         if (!$response->hasError()) {
             return false;
         }
 
-        $error = $response->error ?? $response->downloadError ?? '';
+        $error = $response->error ?? '';
 
         if ($this->isNoMessagesNotice($error)) {
             return true;
@@ -175,6 +190,8 @@ class MessageSyncService
      */
     public function syncSentMessages(EfacturaToken $token): int
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         return $this->syncMessages($token, MessageFilter::InvoiceSent);
     }
 
@@ -185,6 +202,8 @@ class MessageSyncService
      */
     public function syncReceivedMessages(EfacturaToken $token): int
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         return $this->syncMessages($token, MessageFilter::InvoiceReceived);
     }
 
@@ -202,6 +221,8 @@ class MessageSyncService
      */
     public function syncAllMessages(?MessageFilter $filter = null): int
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         $tokens = $this->tokenService->getActiveTokens();
 
         $synced = 0;

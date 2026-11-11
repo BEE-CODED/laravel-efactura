@@ -32,11 +32,24 @@ trait DiscardsWhenStale
         $this->enqueuedAt = now()->getTimestamp();
     }
 
+    /**
+     * Clear the stamp of a per-CUI job a fan-out dispatches. It queues behind its siblings,
+     * so the stamp would drop the later CUIs on every run, and its unique lock already keeps
+     * one per CUI in the queue. A per-CUI job dispatched directly keeps the guard.
+     */
+    public function asFanOutChild(): static
+    {
+        $this->enqueuedAt = 0;
+
+        return $this;
+    }
+
     public function isStale(): bool
     {
         $maxAge = (int) config('efactura.jobs.max_staleness_seconds', 120);
 
-        if ($maxAge <= 0 || $this->enqueuedAt <= 0) {
+        // A queue retry is due by the job's own backoff, so it is never stale.
+        if ($maxAge <= 0 || $this->enqueuedAt <= 0 || $this->attempts() > 1) {
             return false;
         }
 

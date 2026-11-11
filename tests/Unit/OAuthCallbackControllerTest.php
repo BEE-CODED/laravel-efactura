@@ -19,22 +19,22 @@ describe('OAuthCallbackController', function () {
         // Use a valid Romanian CUI (18547290 has valid checksum)
         it('redirects to authorization URL for valid CUI with RO prefix', function () {
             $this->tokenService->shouldReceive('getAuthorizationUrl')
-                ->with('RO18547290')
+                ->with('RO18547290', null, null)
                 ->once()
                 ->andReturn('https://auth.example.com/oauth?state=xyz');
 
-            $response = $this->controller->redirect('RO18547290');
+            $response = $this->controller->redirect(Request::create('/efactura/auth/RO18547290'), 'RO18547290');
 
             expect($response->getTargetUrl())->toBe('https://auth.example.com/oauth?state=xyz');
         });
 
         it('redirects to authorization URL for valid CUI without prefix', function () {
             $this->tokenService->shouldReceive('getAuthorizationUrl')
-                ->with('18547290')
+                ->with('18547290', null, null)
                 ->once()
                 ->andReturn('https://auth.example.com/oauth?state=xyz');
 
-            $response = $this->controller->redirect('18547290');
+            $response = $this->controller->redirect(Request::create('/efactura/auth/18547290'), '18547290');
 
             expect($response->getTargetUrl())->toBe('https://auth.example.com/oauth?state=xyz');
         });
@@ -42,7 +42,7 @@ describe('OAuthCallbackController', function () {
         it('redirects with error for invalid CUI format', function () {
             config(['efactura.routes.error_redirect' => '/error']);
 
-            $response = $this->controller->redirect('invalid');
+            $response = $this->controller->redirect(Request::create('/efactura/auth/invalid'), 'invalid');
 
             expect($response->getTargetUrl())->toContain('/error');
             expect(session('efactura_error'))->toBeTrue();
@@ -53,7 +53,7 @@ describe('OAuthCallbackController', function () {
             config(['efactura.routes.error_redirect' => '/error']);
 
             // 12345678 has invalid checksum
-            $response = $this->controller->redirect('12345678');
+            $response = $this->controller->redirect(Request::create('/efactura/auth/12345678'), '12345678');
 
             expect($response->getTargetUrl())->toContain('/error');
             expect(session('efactura_error'))->toBeTrue();
@@ -95,7 +95,7 @@ describe('OAuthCallbackController', function () {
             config(['efactura.routes.error_redirect' => '/error']);
 
             $this->tokenService->shouldReceive('validateOAuthState')
-                ->with('invalid_state')
+                ->with('invalid_state', null, null)
                 ->once()
                 ->andReturn(null);
 
@@ -120,7 +120,7 @@ describe('OAuthCallbackController', function () {
             ])]);
 
             $this->tokenService->shouldReceive('validateOAuthState')
-                ->with('valid_state')
+                ->with('valid_state', null, null)
                 ->once()
                 ->andReturn('12345678');
             $this->tokenService->shouldReceive('storeToken')
@@ -153,7 +153,7 @@ describe('OAuthCallbackController', function () {
             ], 400)]);
 
             $this->tokenService->shouldReceive('validateOAuthState')
-                ->with('valid_state')
+                ->with('valid_state', null, null)
                 ->once()
                 ->andReturn('12345678');
             $this->tokenService->shouldNotReceive('storeToken');

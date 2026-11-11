@@ -15,6 +15,7 @@ namespace BeeCoded\EFactura\Jobs;
 
 use BeeCoded\EFactura\Enums\FailureReason;
 use BeeCoded\EFactura\Enums\UploadStatus;
+use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUniqueUntilProcessing;
@@ -38,7 +39,7 @@ use Illuminate\Support\Facades\Log;
  *
  * Resets qualifying uploads back to "pending" and dispatches ProcessSingleUpload for
  * each, ensuring they go through the rate-limit-aware upload path. Only retries
- * Failed uploads within the configured max age window.
+ * Failed uploads that failed within the configured max age window.
  */
 class RetryRateLimitedUploads implements ShouldBeUniqueUntilProcessing, ShouldQueue
 {
@@ -59,12 +60,15 @@ class RetryRateLimitedUploads implements ShouldBeUniqueUntilProcessing, ShouldQu
 
     public function handle(): void
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         if (!config('efactura.enabled') || !config('efactura.features.upload_invoices')) {
             return;
         }
 
-        $batchSize = config('efactura.rate_limit.retry_batch_size', 250);
-        $maxAgeDays = config('efactura.rate_limit.retry_max_age_days', 7);
+        // Cast: env() hands a number from .env over as a string.
+        $batchSize = (int) config('efactura.rate_limit.retry_batch_size', 250);
+        $maxAgeDays = (int) config('efactura.rate_limit.retry_max_age_days', 7);
         $staleBefore = now()->subHours((int) config('efactura.rate_limit.retry_window_hours', 24));
 
         $uploads = $this->retryableQuery($maxAgeDays, $staleBefore)
@@ -119,9 +123,11 @@ class RetryRateLimitedUploads implements ShouldBeUniqueUntilProcessing, ShouldQu
      * Two shapes qualify, and both are safety nets rather than the normal path —
      * ProcessSingleUpload re-drives its own row by releasing itself:
      *
-     *  - `Failed` + a retryable reason: the worker died between marking the
-     *    failure and releasing itself. Also the shape the v2->v3 migration
-     *    backfills onto legacy rows.
+     *  - `Failed` + a retryable reason that failed (`processed_at`) within
+     *    `rate_limit.retry_max_age_days`: the worker died between marking the
+     *    failure and releasing itself, or the synchronous path failed it. Not
+     *    created_at, which a recycled row keeps from its first attempt, and not
+     *    updated_at, which the v2->v3 backfill touched on every legacy row.
      *  - `Pending` + `rate_limited`, untouched for longer than
      *    `rate_limit.retry_window_hours`: markAsRateLimited releases the claim
      *    back to Pending, and the row's own job keeps re-driving it until its
@@ -148,7 +154,7 @@ class RetryRateLimitedUploads implements ShouldBeUniqueUntilProcessing, ShouldQu
             $query->where(function (Builder $failed) use ($maxAgeDays) {
                 $failed->where('status', UploadStatus::Failed)
                     ->whereIn('failure_reason', FailureReason::retryable())
-                    ->where('created_at', '>=', now()->subDays($maxAgeDays));
+                    ->where('processed_at', '>=', now()->subDays($maxAgeDays));
             })->orWhere(function (Builder $released) use ($staleBefore) {
                 $released->where('status', UploadStatus::Pending)
                     ->where('failure_reason', FailureReason::RateLimited)

@@ -22,6 +22,19 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Pipeline Tables
+    |--------------------------------------------------------------------------
+    |
+    | Set to false when you use only tokens, OAuth and the raw client and run
+    | your own upload pipeline. The package then loads and publishes only the
+    | token migrations, and its upload/message services, jobs and commands
+    | throw PipelineTablesDisabledException.
+    |
+    */
+    'pipeline_tables' => env('EFACTURA_PIPELINE_TABLES', true),
+
+    /*
+    |--------------------------------------------------------------------------
     | Feature Toggles
     |--------------------------------------------------------------------------
     |
@@ -91,16 +104,19 @@ return [
     |--------------------------------------------------------------------------
     |
     | Protects the periodic batch jobs (CheckUploadStatuses, DownloadResponses,
-    | ProcessPendingUploads) from a backlog that accumulates while the queue
-    | worker is down and then drains all at once when it recovers.
+    | ProcessPendingUploads, SyncMessages) from a backlog that accumulates while
+    | the queue worker is down and then drains all at once when it recovers.
     |
-    | max_staleness_seconds: A batch job that has waited in the queue longer
-    |                        than this self-discards instead of running (the
-    |                        next scheduled run will re-scan). Set to 0 to
-    |                        disable. Default 120: shorter than every
-    |                        recommended interval (README, "Recommended
-    |                        schedule"), so a delayed run never overlaps the next.
-    | unique_for_seconds:    Lock TTL for ShouldBeUniqueUntilProcessing — the
+    | max_staleness_seconds: A scheduled batch job that has waited in the queue
+    |                        longer than this self-discards instead of running
+    |                        (the next scheduled run will re-scan). The per-CUI
+    |                        jobs a run without a CUI dispatches are never
+    |                        discarded: they wait behind each other, and each is
+    |                        unique per CUI. Set to 0 to disable. Default 120:
+    |                        shorter than every recommended interval (README,
+    |                        "Recommended schedule"), so a delayed run never
+    |                        overlaps the next.
+    | unique_for_seconds:    Lock TTL for ShouldBeUnique(UntilProcessing) — the
     |                        ceiling after which a job stuck unprocessed in the
     |                        queue stops blocking a fresh dispatch. Default 3600.
     |

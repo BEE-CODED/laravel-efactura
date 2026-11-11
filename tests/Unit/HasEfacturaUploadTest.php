@@ -1,10 +1,13 @@
 <?php
 
+use BeeCoded\EFactura\Enums\FailureReason;
 use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
+use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFactura\Tests\Fixtures\TestInvoice;
 use Illuminate\Database\Eloquent\Relations\MorphOne;
+use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Support\Facades\Schema;
 
 beforeEach(function () {
@@ -352,5 +355,43 @@ describe('HasEfacturaUpload Trait', function () {
 
             expect(TestInvoice::efacturaAwaitingResponse()->get())->toHaveCount(0);
         });
+    });
+});
+
+/**
+ * The upload row stored get_class() while morphOne() queries getMorphClass(): with a morph
+ * map every trait helper saw the invoice as never uploaded.
+ */
+describe('an app with a morph map', function () {
+    afterEach(function () {
+        Relation::morphMap([], false);
+    });
+
+    it('sees the upload it queued through the trait helpers', function () {
+        Relation::morphMap(['test-invoice' => TestInvoice::class]);
+
+        $upload = app(UploadService::class)->queueUpload($this->invoice);
+
+        expect($upload->uploadable_type)->toBe('test-invoice')
+            ->and($this->invoice->isUploadedToEfactura())->toBeTrue()
+            ->and($this->invoice->getEfacturaStatus())->toBe(UploadStatus::Pending)
+            ->and(TestInvoice::notUploadedToEfactura()->count())->toBe(0);
+    });
+
+    it('re-queues a row stored under the class name instead of filing a second one', function () {
+        $stored = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => TestInvoice::class,
+            'uploadable_id' => $this->invoice->id,
+            'status' => UploadStatus::Failed,
+            'failure_reason' => FailureReason::Validation,
+        ]);
+        Relation::morphMap(['test-invoice' => TestInvoice::class]);
+
+        $upload = app(UploadService::class)->queueUpload($this->invoice);
+
+        expect($upload->id)->toBe($stored->id)
+            ->and(EfacturaUpload::count())->toBe(1)
+            ->and($upload->fresh()->status)->toBe(UploadStatus::Pending);
     });
 });

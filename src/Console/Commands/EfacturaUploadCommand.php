@@ -11,6 +11,7 @@
 
 namespace BeeCoded\EFactura\Console\Commands;
 
+use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFacturaSdk\Support\Validators\VatNumberValidator;
 use Illuminate\Console\Command;
@@ -39,6 +40,8 @@ class EfacturaUploadCommand extends Command
 
     public function handle(UploadService $uploadService): int
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         if (!config('efactura.enabled') || !config('efactura.features.upload_invoices')) {
             $this->error('e-Factura upload feature is disabled.');
 

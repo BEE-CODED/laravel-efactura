@@ -24,6 +24,12 @@ class EfacturaAuthCommand extends Command
 
     public function handle(TokenService $tokenService): int
     {
+        if (!config('efactura.enabled')) {
+            $this->error('e-Factura is disabled.');
+
+            return self::FAILURE;
+        }
+
         $cui = VatNumberValidator::stripPrefix($this->argument('cui'));
 
         // Check if token already exists

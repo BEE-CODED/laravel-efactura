@@ -12,6 +12,7 @@
 namespace BeeCoded\EFactura;
 
 use BeeCoded\EFactura\Contracts\EFacturaUploadableInterface;
+use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\DownloadService;
@@ -36,27 +37,27 @@ class EfacturaManager
         return $this->tokenService->getToken($cui);
     }
 
-    public function getAuthorizationUrl(string $cui): string
+    /**
+     * From a web request, pass its session nonce and user id: see TokenService::getAuthorizationUrl().
+     */
+    public function getAuthorizationUrl(string $cui, ?string $sessionNonce = null, int|string|null $userId = null): string
     {
-        return $this->tokenService->getAuthorizationUrl($cui);
+        return $this->tokenService->getAuthorizationUrl($cui, $sessionNonce, $userId);
     }
 
     /**
      * A raw SDK client for this CUI — an escape hatch, not the happy path.
      *
-     * WARNING: nothing persists a refresh that happens on this client. ANAF
-     * rotates refresh tokens, so if the SDK refreshes mid-call the new grant
-     * lives only in the returned object: the stored token is now spent, and once
-     * you discard the client the company must re-authorise from scratch. No
-     * concurrency is involved — a token within the SDK's 120s expiry buffer is
-     * enough.
+     * The client stores a refresh it performs through TokenService's token
+     * persister. ANAF rotates refresh tokens, so if that save fails the new grant
+     * lives only in the returned object and the stored one is spent.
      *
-     * Prefer TokenService::executeWithClient(), which locks, refreshes and
-     * persists around your operation:
+     * Prefer TokenService::executeWithClient(), which also retries that save
+     * after your operation:
      *
      *     app(TokenService::class)->executeWithClient($token, fn ($client) => ...);
      *
-     * If you must use this, persist afterwards yourself:
+     * If you use this, retry the save afterwards yourself:
      *
      *     $client = EFactura::client($cui);
      *     $result = $client->getMessages(...);
@@ -93,16 +94,22 @@ class EfacturaManager
 
     public function uploadService(): UploadService
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         return $this->uploadService;
     }
 
     public function downloadService(): DownloadService
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         return $this->downloadService;
     }
 
     public function messageSyncService(): MessageSyncService
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         return $this->messageSyncService;
     }
 }

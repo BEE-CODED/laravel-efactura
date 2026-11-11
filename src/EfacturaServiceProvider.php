@@ -59,15 +59,18 @@ class EfacturaServiceProvider extends ServiceProvider
                 __DIR__.'/../config/efactura.php' => config_path('efactura.php'),
             ], 'efactura-config');
 
-            $this->publishes([
-                __DIR__.'/../database/migrations' => database_path('migrations'),
-            ], 'efactura-migrations');
+            $migrations = $this->migrations();
+
+            $this->publishes(
+                array_combine($migrations, array_map(fn (string $path) => database_path('migrations/'.basename($path)), $migrations)),
+                'efactura-migrations',
+            );
 
             $this->publishes([
                 __DIR__.'/../resources/lang' => $this->app->langPath('vendor/efactura'),
             ], 'efactura-translations');
 
-            $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
+            $this->loadMigrationsFrom($migrations);
 
             $this->commands([
                 Console\Commands\EfacturaUploadCommand::class,
@@ -79,6 +82,26 @@ class EfacturaServiceProvider extends ServiceProvider
         }
 
         $this->registerRoutes();
+    }
+
+    /**
+     * The package migrations: only the token ones when `efactura.pipeline_tables` is false.
+     *
+     * @return list<string>
+     */
+    protected function migrations(): array
+    {
+        $directory = __DIR__.'/../database/migrations';
+
+        if (config('efactura.pipeline_tables', true)) {
+            return glob($directory.'/*.php') ?: [];
+        }
+
+        return array_map(fn (string $name) => "{$directory}/{$name}.php", [
+            '2024_01_01_000001_create_efactura_tokens_table',
+            '2024_01_01_000004_encrypt_efactura_token_credentials',
+            '2024_01_01_000009_make_efactura_token_expiry_an_instant',
+        ]);
     }
 
     protected function registerRoutes(): void

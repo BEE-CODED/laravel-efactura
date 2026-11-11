@@ -18,21 +18,28 @@ All of them **except \`RetryRateLimitedUploads\`** additionally declare \`tries 
 > this is tolerable: the job is an idempotent scanner and the next scheduled run re-scans anyway —
 > but do not rely on it retrying a transient failure.
 
-The three high-frequency periodic jobs — **ProcessPendingUploads**, **CheckUploadStatuses**, **DownloadResponses** — additionally guard against a backlog that piles up while the queue worker is down and then drains all at once on recovery (which would re-scan the same rows and exhaust ANAF's per-message rate limits before processing can advance):
-- They implement \`ShouldBeUniqueUntilProcessing\`, keyed per-CUI via \`uniqueId()\`, so the scheduler will not enqueue a duplicate while one is still queued unprocessed. Lock TTL: \`jobs.unique_for_seconds\` (default 3600).
-- They self-discard when stale (\`DiscardsWhenStale\` trait): a job that waited in the queue longer than \`jobs.max_staleness_seconds\` (default 120) returns immediately without running. Safe because these jobs are idempotent all-rows scanners — the next scheduled run re-scans. **Only these three use \`DiscardsWhenStale\`.**
+The periodic jobs **ProcessPendingUploads**, **CheckUploadStatuses**, **DownloadResponses** and **SyncMessages** additionally guard against a backlog that piles up while the queue worker is down and then drains all at once on recovery (which would re-scan the same rows and exhaust ANAF's per-message rate limits before processing can advance):
+- They are unique, keyed per-CUI via \`uniqueId()\`, so the scheduler will not enqueue a duplicate while one is still queued. Lock TTL: \`jobs.unique_for_seconds\` (default 3600).
+- They self-discard when stale (\`DiscardsWhenStale\` trait): a job that waited in the queue longer than \`jobs.max_staleness_seconds\` (default 120) returns immediately without running. Safe because these jobs are idempotent scanners — the next scheduled run re-scans. The per-CUI jobs a run without a CUI dispatches are exempt: they wait behind each other (with many CUIs, past the limit), and their unique lock already keeps one per CUI queued. A per-CUI job the scheduler dispatches directly keeps the guard. **Only these four use \`DiscardsWhenStale\`.**
 
-**Uniqueness at a glance** — \`ShouldBeUniqueUntilProcessing\` is implemented by **five** jobs, not just those three:
+**Fan-out (v4.0).** Without a CUI, \`SyncMessages\` dispatches one \`SyncMessages($cui)\` per active token, and \`CheckUploadStatuses\`, \`DownloadResponses\` and \`DownloadReceivedInvoices\` dispatch one job of their own kind per active token that has work due; the null-CUI job does no work itself. Each CUI then runs, times out and retries on its own, so one slow CUI no longer uses up the 120 s of all the others.
 
-| Job | \`uniqueFor\` | \`uniqueId()\` |
-|-----|-------------|---------------|
-| \`ProcessPendingUploads\` | \`jobs.unique_for_seconds\` (3600) | per-CUI (\`$cui ?? 'all'\`) |
-| \`CheckUploadStatuses\` | \`jobs.unique_for_seconds\` (3600) | per-CUI (\`$cui ?? 'all'\`) |
-| \`DownloadResponses\` | \`jobs.unique_for_seconds\` (3600) | per-CUI (\`$cui ?? 'all'\`) |
-| \`RetryRateLimitedUploads\` | **hardcoded 600** (ignores the config key) | none — keyed on the class |
-| \`SweepStaleUploads\` | \`jobs.unique_for_seconds\` (3600) | none — keyed on the class |
+On \`QUEUE_CONNECTION=sync\` the per-CUI jobs run inline inside the parent, so one CUI's exception propagates through it and stops that run.
 
-\`DownloadReceivedInvoices\`, \`SyncMessages\`, \`ProcessSingleUpload\` and \`CheckSingleUploadStatus\` are **not** unique-constrained.
+**No overlap per CUI (v4.0).** \`CheckUploadStatuses\`, \`DownloadResponses\` and \`DownloadReceivedInvoices\` run behind \`WithoutOverlapping($cui ?? 'all')\` with \`dontRelease()\` and a lock that expires after the timeout + 30 s: a run that outlasts a short schedule interval is not overlapped by the next one on another worker (which would spend the same rows' daily quota twice); the second run is dropped.
+
+**Uniqueness at a glance:**
+
+| Job | Contract | \`uniqueFor\` | \`uniqueId()\` |
+|-----|----------|-------------|---------------|
+| \`ProcessPendingUploads\` | \`ShouldBeUniqueUntilProcessing\` | \`jobs.unique_for_seconds\` (3600) | per-CUI (\`$cui ?? 'all'\`) |
+| \`CheckUploadStatuses\` | \`ShouldBeUniqueUntilProcessing\` | \`jobs.unique_for_seconds\` (3600) | per-CUI (\`$cui ?? 'all'\`) |
+| \`DownloadResponses\` | \`ShouldBeUniqueUntilProcessing\` | \`jobs.unique_for_seconds\` (3600) | per-CUI (\`$cui ?? 'all'\`) |
+| \`SyncMessages\` | \`ShouldBeUnique\` (v4.0) | \`jobs.unique_for_seconds\` (3600) | per-CUI (\`$cui ?? 'all'\`) |
+| \`RetryRateLimitedUploads\` | \`ShouldBeUniqueUntilProcessing\` | **hardcoded 600** (ignores the config key) | none — keyed on the class |
+| \`SweepStaleUploads\` | \`ShouldBeUniqueUntilProcessing\` | \`jobs.unique_for_seconds\` (3600) | none — keyed on the class |
+
+\`DownloadReceivedInvoices\` (which has a \`uniqueId()\` for its overlap lock only), \`ProcessSingleUpload\` and \`CheckSingleUploadStatus\` are **not** unique-constrained.
 
 ---
 
@@ -61,7 +68,7 @@ Finds all \`EfacturaUpload\` records with status \`Pending\` and dispatches a \`
 new CheckUploadStatuses(?string $cui = null)
 \`\`\`
 
-Checks ANAF processing status for all uploads currently in \`Processing\` state. For each, calls \`EFacturaClient::getStatusMessage()\` and transitions to \`Completed\` or \`Failed\` accordingly; the full outcome table is in the \`upload-pipeline\` topic.
+Without a CUI, dispatches one \`CheckUploadStatuses($cui)\` per active CUI with uploads due. With a CUI, checks ANAF processing status for its uploads currently in \`Processing\` state whose \`next_poll_at\` is null or past (v4.0; set after each "in progress" answer by the SDK's \`PollSchedule\`). For each, calls \`EFacturaClient::getStatusMessage()\` and transitions to \`Completed\` or \`Failed\` accordingly; the full outcome table is in the \`upload-pipeline\` topic.
 
 - \`ok\` without a download id is \`Completed\` (no response to download); \`nok\` without a download id is \`Failed\` / \`indeterminate\`, keeping the index
 - Permanent failures (4xx, unreadable 2xx, an index the SDK refuses) are counted in \`status_failures\` and park the upload \`indeterminate\` at \`polling.max_status_failures\` (default 5); transient ones (5xx, network, token) are retried uncounted
@@ -79,7 +86,7 @@ Checks ANAF processing status for all uploads currently in \`Processing\` state.
 new DownloadResponses(?string $cui = null)
 \`\`\`
 
-Downloads response ZIPs from ANAF for uploads that have a \`download_id\` but no \`response_path\` yet (applies to both Completed and Failed uploads that ANAF provided a response for).
+Without a CUI, dispatches one \`DownloadResponses($cui)\` per active CUI with responses to download. With a CUI, downloads response ZIPs from ANAF for its uploads that have a \`download_id\` but no \`response_path\` yet (applies to both Completed and Failed uploads that ANAF provided a response for).
 
 **Permanent failures are bounded.** ANAF can answer \`/descarcare\` with a 2xx whose body is not a ZIP (typically a JSON \`eroare\`). The SDK's \`guardDownloadBody()\` throws, so \`response_path\` stays null — and without a guard the row would be re-selected here on every run, forever. Each permanent failure (that, a 4xx, an id the SDK refuses, any other non-transient error) increments \`response_attempts\` and stamps \`response_failed_at\`; a transient one (5xx, network, token) is not counted; once \`response_attempts\` reaches \`EfacturaUpload::MAX_RESPONSE_ATTEMPTS\` (3) the row drops out of \`needsResponseDownload()\` and is left for \`efactura:reconcile\`. The upload's own \`status\` is untouched — ANAF accepted the invoice; only the receipt is missing.
 
@@ -97,7 +104,7 @@ A download at its per-message download limit (\`RateLimitScope::Download\`) is s
 new DownloadReceivedInvoices(?string $cui = null)
 \`\`\`
 
-Downloads received invoice ZIPs for \`EfacturaMessage\` records of type "received" that have not yet been downloaded. Fires \`InvoiceReceived\` event for each download.
+Without a CUI, dispatches one \`DownloadReceivedInvoices($cui)\` per active CUI with invoices to download. With a CUI, downloads received invoice ZIPs for its \`EfacturaMessage\` records of type "received" that have not yet been downloaded. Fires \`InvoiceReceived\` event for each download.
 
 A permanent download failure increments \`download_attempts\`; at \`EfacturaMessage::MAX_DOWNLOAD_ATTEMPTS\` (3) the message is no longer selected. Transient failures are not counted, a per-message download limit skips the message, and any other rate limit stops the batch.
 
@@ -113,7 +120,7 @@ A permanent download failure increments \`download_attempts\`; at \`EfacturaMess
 new SyncMessages(?string $cui = null)
 \`\`\`
 
-Syncs the ANAF message list for all active tokens (or filtered by CUI). Creates or updates \`EfacturaMessage\` records for each ANAF message (sent invoices, received invoices, processing errors, buyer messages). A listed message without a usable id is skipped with a warning and not counted.
+Without a CUI, dispatches one \`SyncMessages($cui)\` per active token and syncs nothing itself; a CUI that fails fails (and retries) its own job. With a CUI, syncs that CUI's ANAF message list through the paginated listing (\`/listaMesajePaginatieFactura\`): one fixed window per run, from 60 days minus 70 minutes ago to a minute ago (counted in UTC), page by page until the last (one \`paginated_list_per_day_cui\` call per page of 500). Creates or updates \`EfacturaMessage\` records for each ANAF message (sent invoices, received invoices, processing errors, buyer messages). A listed message without a usable id is skipped with a warning and not counted.
 
 **Feature flag:** \`features.sync_messages\`
 
@@ -168,7 +175,7 @@ Safety net for uploads left stranded in \`Failed\` by a safe-to-resubmit error �
 
 **Configuration:**
 - \`rate_limit.retry_batch_size\` (env: \`EFACTURA_RATE_LIMIT_RETRY_BATCH\`, default: 250) — Max uploads to reset per run
-- \`rate_limit.retry_max_age_days\` (env: \`EFACTURA_RATE_LIMIT_RETRY_MAX_DAYS\`, default: 7) — Ignore uploads older than this many days
+- \`rate_limit.retry_max_age_days\` (env: \`EFACTURA_RATE_LIMIT_RETRY_MAX_DAYS\`, default: 7) — Ignore failed uploads that failed (\`processed_at\`) more than this many days ago
 
 **Recommended schedule:** see [Recommended Scheduling](#recommended-scheduling).
 
@@ -244,12 +251,12 @@ The package schedules nothing itself. This is the one recommended cadence per jo
 | Job | Recommended cadence | Why |
 |-----|---------------------|-----|
 | \`ProcessPendingUploads\` | Every 5 minutes | Only dispatches queued uploads. Uploads count against the global per-minute limit (and, for RASP, a per-CUI daily one), not a per-document one |
-| \`CheckUploadStatuses\` | Every 10 minutes | Each poll uses one of the upload index's daily status reads (SDK \`status_per_day_message\`, default 50): about 8 hours of polling before the limit. An upload at its limit is skipped until it resets; the others are still polled |
-| \`DownloadResponses\` | Every 15 minutes | Each attempt uses one of the download id's daily downloads (SDK \`download_per_day_message\`, default 5); a successful download happens once |
+| \`CheckUploadStatuses\` | Every 10 minutes | Reads only uploads whose next read is due (\`next_poll_at\`, the SDK's \`PollSchedule\`: 1, 5, 15, then 60 minutes as the upload ages; a 10-minute run rounds the shorter ones up), so an old upload uses about 24 of its index's daily status reads (SDK \`status_per_day_message\`, default 50). An upload at its limit is skipped until it resets; the others are still polled. Without a CUI it dispatches one job per active CUI with uploads due |
+| \`DownloadResponses\` | Every 15 minutes | Each attempt uses one of the download id's daily downloads (SDK \`download_per_day_message\`, default 5); a successful download happens once. Without a CUI it dispatches one job per active CUI with responses to download |
 | \`RetryRateLimitedUploads\` | Every 30 minutes | A safety net: \`ProcessSingleUpload\` normally re-drives its own rate-limited upload. The interval gives an exhausted quota time to recover |
 | \`SweepStaleUploads\` | Every 15 minutes | With \`jobs.stale_uploading_minutes\` at 30, a stranded upload is parked within 45 minutes |
-| \`SyncMessages\` | Hourly | One message-list call per CUI per run (SDK \`simple_list_per_day_cui\`, default 750) |
-| \`DownloadReceivedInvoices\` | Hourly | Downloads what \`SyncMessages\` listed; each message's download uses one of its 5 daily downloads |
+| \`SyncMessages\` | Hourly | Without a CUI it dispatches one job per active CUI. Each pages through the last 60 days: one paginated-list call per 500 messages (SDK \`paginated_list_per_day_cui\`, default 50,000) |
+| \`DownloadReceivedInvoices\` | Hourly | Downloads what \`SyncMessages\` listed; each message's download uses one of its 5 daily downloads. Without a CUI it dispatches one job per active CUI with invoices to download |
 
 \`jobs.max_staleness_seconds\` (120) is shorter than every interval, so a run delayed in the queue is dropped instead of overlapping the next one.
 

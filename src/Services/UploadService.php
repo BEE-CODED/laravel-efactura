@@ -18,20 +18,21 @@ use BeeCoded\EFactura\Events\InvoiceFailed;
 use BeeCoded\EFactura\Events\InvoiceRateLimited;
 use BeeCoded\EFactura\Events\InvoiceUploaded;
 use BeeCoded\EFactura\Exceptions\DuplicateUploadException;
+use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Exceptions\RefreshCooldownException;
 use BeeCoded\EFactura\Jobs\ProcessSingleUpload;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFacturaSdk\Data\Invoice\UploadOptionsData;
 use BeeCoded\EFacturaSdk\Enums\StandardType;
+use BeeCoded\EFacturaSdk\Enums\UploadOutcomeKind;
+use BeeCoded\EFacturaSdk\Enums\UploadOutcomeReason;
 use BeeCoded\EFacturaSdk\Exceptions\ApiException;
-use BeeCoded\EFacturaSdk\Exceptions\AuthenticationException;
-use BeeCoded\EFacturaSdk\Exceptions\RateLimitExceededException;
-use BeeCoded\EFacturaSdk\Exceptions\ValidationException;
-use BeeCoded\EFacturaSdk\Exceptions\XmlParsingException;
 use BeeCoded\EFacturaSdk\Facades\UblBuilder;
+use BeeCoded\EFacturaSdk\Support\UploadOutcome;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
@@ -58,6 +59,8 @@ class UploadService
      */
     public function queueUpload(EFacturaUploadableInterface $model, ?array $options = null): EfacturaUpload
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         return $this->queueFor($model, [
             'standard' => $options['standard'] ?? 'UBL',
             'is_extern' => $options['extern'] ?? false,
@@ -74,6 +77,8 @@ class UploadService
      */
     public function queueB2CUpload(EFacturaUploadableInterface $model, ?array $options = null): EfacturaUpload
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         return $this->queueFor($model, [
             'standard' => 'UBL',
             'is_extern' => $options['extern'] ?? false,
@@ -137,7 +142,7 @@ class UploadService
             // changes behaviour for the driver that did.
             return EfacturaUpload::query()->withSavepointIfNeeded(fn () => EfacturaUpload::create([
                 'efactura_token_id' => $token->id,
-                'uploadable_type' => get_class($model),
+                'uploadable_type' => $this->morphTypes($model)[0],
                 'uploadable_id' => $model->getKey(),
                 'status' => UploadStatus::Pending,
                 ...$attributes,
@@ -160,11 +165,29 @@ class UploadService
         }
     }
 
+    /**
+     * Rows stored before the app added a morph map carry the class name, so both forms
+     * are looked up: missing one would insert a second row (the unique index sees two
+     * different types) and file the invoice twice.
+     */
     private function findExistingUpload(EFacturaUploadableInterface $model): ?EfacturaUpload
     {
-        return EfacturaUpload::where('uploadable_type', get_class($model))
+        return EfacturaUpload::whereIn('uploadable_type', $this->morphTypes($model))
             ->where('uploadable_id', $model->getKey())
             ->first();
+    }
+
+    /**
+     * The type morphOne() queries first (the morph map alias, or the class name), then the
+     * class name.
+     *
+     * @return non-empty-list<string>
+     */
+    private function morphTypes(EFacturaUploadableInterface $model): array
+    {
+        $type = $model instanceof Model ? $model->getMorphClass() : $model::class;
+
+        return array_values(array_unique([$type, $model::class]));
     }
 
     /**
@@ -223,11 +246,13 @@ class UploadService
                 'upload_index' => null,
                 'download_id' => null,
                 'response_path' => null,
+                'response_verification' => null,
                 'uploaded_at' => null,
                 'processed_at' => null,
                 'response_attempts' => 0,
                 'response_failed_at' => null,
                 'status_failures' => 0,
+                'next_poll_at' => null,
                 ...$attributes,
             ]) > 0;
 
@@ -329,6 +354,8 @@ class UploadService
      */
     public function processUpload(EfacturaUpload $upload): void
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
         $upload->loadMissing(['token', 'uploadable']);
 
         // Cheap pre-check so we neither prepare nor overwrite a row somebody else owns.
@@ -407,6 +434,8 @@ class UploadService
         // PHASE 2 — transmission. From here on, a failure's CLASSIFICATION depends on
         // whether it proves the document never entered ANAF's pipeline.
         if (!$this->claimForTransmission($upload, $xmlPath)) {
+            $this->deleteUnsentXml($upload, $xmlPath);
+
             return;
         }
 
@@ -478,8 +507,11 @@ class UploadService
     /**
      * Send a prepared document to ANAF and classify the outcome.
      *
-     * The catch order is load-bearing. See FailureReason for why "retryable" is
-     * narrower than "transient-looking".
+     * The SDK's UploadOutcome classifies the answer and whatever the upload call threw;
+     * this method only maps its verdict onto the row. Two things are decided here first,
+     * because UploadOutcome cannot know them: a refresh cooldown hands the claim back,
+     * and anything thrown before the document was handed to the client is transient.
+     * See FailureReason for why "retryable" is narrower than "transient-looking".
      */
     protected function transmit(EfacturaUpload $upload, string $xml, UploadOptionsData $uploadOptions): void
     {
@@ -506,13 +538,14 @@ class UploadService
             );
 
             $index = $response->indexIncarcare;
+            $outcome = UploadOutcome::fromResponse($response);
 
             // ANAF assigns an upload index only to a document it received, so a usable index
             // means its outcome is decided under that index whatever ExecutionStatus says.
             // Polling is read-only and reads that outcome (including a rejection, or a file
             // ANAF did not take in).
-            if ($index !== null && preg_match(self::UPLOAD_INDEX_PATTERN, $index) === 1) {
-                $this->markUploadAsProcessing($upload, $index);
+            if ($outcome->kind === UploadOutcomeKind::Accepted && $outcome->index !== null) {
+                $this->markUploadAsProcessing($upload, $outcome->index);
                 rescue(fn () => event(new InvoiceUploaded($upload)));
 
                 return;
@@ -520,7 +553,7 @@ class UploadService
 
             // ANAF explicitly answered ExecutionStatus=1 and assigned no index: a verdict on
             // the document, which was not taken in.
-            if ($index === null && $response->isFailed()) {
+            if ($outcome->kind === UploadOutcomeKind::Refused) {
                 $this->failTerminally(
                     $upload,
                     $response->errors ?? ['Unknown error'],
@@ -544,10 +577,6 @@ class UploadService
                 [__('efactura::messages.upload_outcome_unknown'), ...array_values(array_filter($response->errors ?? [], fn (string $error): bool => trim($error) !== ''))],
                 FailureReason::Indeterminate
             );
-        } catch (RateLimitExceededException $e) {
-            // The SDK's CLIENT-SIDE pre-flight limiter refused to make the call.
-            // Nothing was sent.
-            $this->markAsRateLimited($upload, $e->getMessage(), $e->retryAfterSeconds);
         } catch (RefreshCooldownException $e) {
             // Refused before anything was sent, without asking ANAF: hand the claim back, so
             // the job waits the cooldown out instead of spending a transient attempt.
@@ -555,27 +584,18 @@ class UploadService
                 'upload_id' => $upload->id,
             ]);
 
-            EfacturaUpload::where('id', $upload->id)
+            $released = EfacturaUpload::where('id', $upload->id)
                 ->where('status', UploadStatus::Uploading)
-                ->update(['status' => UploadStatus::Pending, 'errors' => [$e->getMessage()]]);
-        } catch (AuthenticationException $e) {
-            // Either the token refresh failed (before the call) or ANAF answered 401
-            // (rejected, not filed). Both prove the document did not enter the pipeline.
-            Log::warning('EFactura: Authentication failure during upload, will retry', [
-                'upload_id' => $upload->id,
-                'error' => $e->getMessage(),
-            ]);
+                ->update(['status' => UploadStatus::Pending, 'errors' => [$e->getMessage()], 'xml_path' => null]) > 0;
 
-            $this->markUploadAsFailed($upload, [$e->getMessage()], reason: FailureReason::Transient);
-        } catch (ApiException $e) {
-            $this->classifyApiException($upload, $e);
-        } catch (ValidationException|XmlParsingException $e) {
-            $this->failTerminally($upload, [$e->getMessage()], FailureReason::Validation);
+            if ($released) {
+                $this->deleteUnsentXml($upload, $upload->xml_path);
+            }
         } catch (\Throwable $e) {
             if (!$transmissionStarted) {
                 // Thrown before the client was even built, so the document provably never
-                // entered ANAF's pipeline. Two real cases land here, both RuntimeExceptions
-                // that match none of the specific catches above:
+                // entered ANAF's pipeline: a refused or failed token refresh, a refresh lock
+                // timeout, and two RuntimeExceptions that match nothing else:
                 //
                 //   - DecryptException, from a token row that predates the v3 encryption
                 //     migration. v3 makes that throw ON PURPOSE (fail loud, no plaintext
@@ -595,76 +615,64 @@ class UploadService
                     'error' => $e->getMessage(),
                 ]);
 
-                $this->markUploadAsFailed($upload, [$e->getMessage()], reason: FailureReason::Transient);
+                $this->failTransiently($upload, $e->getMessage());
 
                 return;
             }
 
-            // We have no idea where this landed. It may have been thrown after ANAF
-            // accepted the document. Re-driving it could DOUBLE-FILE a legal invoice,
-            // so it is parked for human reconciliation rather than retried or
-            // written off.
-            Log::error('EFactura: Upload failed with an indeterminate error', [
-                'upload_id' => $upload->id,
-                'upload_index' => $index,
-                'exception' => $e::class,
-                'error' => $e->getMessage(),
-            ]);
-
-            $this->failTerminally(
-                $upload,
-                [$e->getMessage()],
-                FailureReason::Indeterminate
-            );
+            $this->recordThrownOutcome($upload, $e, UploadOutcome::fromThrowable($e), $index);
         }
     }
 
     /**
-     * Classify an SDK ApiException by the HTTP status it carries.
+     * Map what the upload call threw, as UploadOutcome classified it, onto the row.
      *
-     * A genuine ANAF 429 arrives HERE, not as RateLimitExceededException: the SDK's
-     * isRetryable() deliberately excludes 429, so it throws a plain ApiException(429).
-     * RateLimitExceededException is only ever thrown by the SDK's client-side
-     * pre-flight limiter — which is bypassed entirely when rate_limits.enabled=false,
-     * when counters are lost to a cache:clear, or when several app servers share no
-     * cache. Treating both identically is the whole point of this method.
+     * - Refused (an ANAF 4xx other than 408/429, or the SDK's own validation): terminal.
+     * - Not sent, rate limited (the SDK's pre-flight limiter or ANAF's 429; a genuine 429
+     *   arrives as ApiException(429), and the pre-flight limiter is bypassed when
+     *   rate_limits.enabled=false, when counters are lost, or when servers share no cache):
+     *   handed back to Pending for the job to retry.
+     * - Not sent otherwise (a transport failure before anything was sent, ANAF refusing the
+     *   grant or token, any other authentication failure): transient, retried.
+     * - Uncertain (a 5xx, a 408 timeout, an unreadable 2xx answer, a transport failure that
+     *   may have delivered, anything unknown): ANAF may have filed it, so it is parked for
+     *   reconciliation. Re-sending could DOUBLE-FILE a legal invoice.
      */
-    protected function classifyApiException(EfacturaUpload $upload, ApiException $e): void
+    private function recordThrownOutcome(EfacturaUpload $upload, \Throwable $e, UploadOutcome $outcome, ?string $index): void
     {
-        if ($e->statusCode === 429) {
-            $this->markAsRateLimited($upload, $e->getMessage(), null);
+        if ($outcome->kind === UploadOutcomeKind::Refused) {
+            $this->failTerminally($upload, [$e->getMessage()], FailureReason::Validation);
 
             return;
         }
 
-        // Three shapes arrive here, and all are ambiguous — ANAF may have accepted the
-        // document and then failed to tell us — so none may be auto-resubmitted:
-        //
-        //   - a 5xx RESPONSE, which the SDK collapses to 502
-        //     (`$response->status() >= 500 ? 502 : $response->status()`);
-        //   - a transport failure with no response at all, which the SDK reports as 500
-        //     (`new ApiException($exception->getMessage(), 500, ...)` in BaseApiClient);
-        //   - a 2xx response whose body the SDK could not read ("Unable to parse upload
-        //     response", carrying the 2xx status): the POST was delivered and may be filed.
-        //
-        // There is deliberately no `statusCode === 0` branch: nothing in the SDK ever
-        // produces one. Every `new ApiException(` passes 500, 502, or $response->status(),
-        // and the constructor's $statusCode has no default — so that branch was dead code,
-        // and the comment claiming transport failures arrive as 0 was simply false.
-        if ($e->statusCode >= 500 || ($e->statusCode >= 200 && $e->statusCode < 300)) {
-            Log::error('EFactura: Upload failed with an indeterminate transport error or unreadable answer', [
+        if ($outcome->kind === UploadOutcomeKind::NotSent && $outcome->reason === UploadOutcomeReason::RateLimited) {
+            $this->markAsRateLimited($upload, $e->getMessage(), $outcome->retryAfterSeconds);
+
+            return;
+        }
+
+        if ($outcome->kind === UploadOutcomeKind::NotSent) {
+            Log::warning('EFactura: Upload was not sent, will retry', [
                 'upload_id' => $upload->id,
-                'status_code' => $e->statusCode,
+                'reason' => $outcome->reason?->value,
                 'error' => $e->getMessage(),
             ]);
 
-            $this->failTerminally($upload, [$e->getMessage()], FailureReason::Indeterminate);
+            $this->failTransiently($upload, $e->getMessage());
 
             return;
         }
 
-        // Any other 4xx is ANAF rejecting the request itself. Retrying is pointless.
-        $this->failTerminally($upload, [$e->getMessage()], FailureReason::Validation);
+        Log::error('EFactura: Upload failed with an indeterminate error', [
+            'upload_id' => $upload->id,
+            'upload_index' => $index,
+            'exception' => $e::class,
+            'status_code' => $e instanceof ApiException ? $e->statusCode : null,
+            'error' => $e->getMessage(),
+        ]);
+
+        $this->failTerminally($upload, [$e->getMessage()], FailureReason::Indeterminate);
     }
 
     /**
@@ -694,6 +702,8 @@ class UploadService
             'error' => $message,
         ]);
 
+        $xmlPath = $upload->xml_path;
+
         $released = EfacturaUpload::where('id', $upload->id)
             ->where('status', UploadStatus::Uploading)
             ->update([
@@ -701,12 +711,45 @@ class UploadService
                 'failure_reason' => FailureReason::RateLimited,
                 'errors' => [$message],
                 'processed_at' => null,
+                'xml_path' => null,
             ]) > 0;
 
         // A row a sweep or failed() already parked was not rate-limited by this write.
         if ($released) {
+            $this->deleteUnsentXml($upload, $xmlPath);
             rescue(fn () => event(new InvoiceRateLimited($upload->refresh(), [$message], $retryAfterSeconds)));
         }
+    }
+
+    /**
+     * Fail a claimed upload that provably was not sent, for its job to retry.
+     *
+     * The XML file of this attempt names no filed document, and the retry stores a new
+     * one, so it is deleted and the row no longer names it.
+     */
+    private function failTransiently(EfacturaUpload $upload, string $error): void
+    {
+        $xmlPath = $upload->xml_path;
+        $upload->xml_path = null;
+
+        $this->markUploadAsFailed($upload, [$error], reason: FailureReason::Transient);
+        $this->deleteUnsentXml($upload, $xmlPath);
+    }
+
+    /**
+     * Delete the XML file of an attempt that was not sent: every re-drive stores a new one,
+     * so a rate-limited row would otherwise leave one file per minute behind.
+     *
+     * Kept while the row names it: another run of the same row stores the same name
+     * within the same second.
+     */
+    private function deleteUnsentXml(EfacturaUpload $upload, ?string $path): void
+    {
+        if ($path === null || EfacturaUpload::whereKey($upload->getKey())->value('xml_path') === $path) {
+            return;
+        }
+
+        rescue(fn () => Storage::disk(config('efactura.storage.disk', 'local'))->delete($path));
     }
 
     /**
@@ -734,23 +777,7 @@ class UploadService
             'upload_index' => $uploadIndex,
             'uploaded_at' => now(),
             'status_failures' => 0,
-        ]);
-    }
-
-    /**
-     * Mark upload as completed.
-     *
-     * ANAF can answer `ok` without a download id. The invoice is still filed, so it is
-     * completed (demoting it would be the worse lie), with a note that no response can
-     * be downloaded.
-     */
-    public function markUploadAsCompleted(EfacturaUpload $upload, ?string $downloadId): void
-    {
-        $upload->update([
-            'status' => UploadStatus::Completed,
-            'download_id' => $downloadId,
-            'processed_at' => now(),
-            ...($downloadId === null ? ['errors' => [__('efactura::messages.completed_without_download_id')]] : []),
+            'next_poll_at' => null,
         ]);
     }
 
@@ -979,10 +1006,12 @@ class UploadService
             'uploaded_at' => now(),
             'processed_at' => null,
             'status_failures' => 0,
+            'next_poll_at' => null,
             // A parked row's response belonged to the outcome it was parked with; the
             // next status check records the download id for this index.
             'download_id' => null,
             'response_path' => null,
+            'response_verification' => null,
             'response_attempts' => 0,
             'response_failed_at' => null,
         ]) > 0;
@@ -1040,9 +1069,11 @@ class UploadService
             'uploaded_at' => null,
             'download_id' => null,
             'response_path' => null,
+            'response_verification' => null,
             'response_attempts' => 0,
             'response_failed_at' => null,
             'status_failures' => 0,
+            'next_poll_at' => null,
         ]) > 0;
 
         if ($resolved && $indexed !== null) {
@@ -1085,19 +1116,22 @@ class UploadService
 
         $swept = 0;
 
-        EfacturaUpload::where('status', UploadStatus::Uploading)
-            ->where('updated_at', '<', $cutoff)
-            ->each(function (EfacturaUpload $upload) use ($staleAfterMinutes, &$swept) {
-                $parked = $this->parkStrandedUploadAsIndeterminate(
-                    $upload,
-                    "Upload was stuck in the uploading state for over {$staleAfterMinutes} minutes; "
-                        .'its worker died without reporting a failure.',
-                );
+        // lazyById, not each(): each() pages by OFFSET, and every parked row leaves the
+        // scope, so the next page would skip as many rows as this one parked.
+        $stale = EfacturaUpload::where('status', UploadStatus::Uploading)
+            ->where('updated_at', '<', $cutoff);
 
-                if ($parked) {
-                    $swept++;
-                }
-            });
+        foreach ($stale->lazyById() as $upload) {
+            $parked = $this->parkStrandedUploadAsIndeterminate(
+                $upload,
+                "Upload was stuck in the uploading state for over {$staleAfterMinutes} minutes; "
+                    .'its worker died without reporting a failure.',
+            );
+
+            if ($parked) {
+                $swept++;
+            }
+        }
 
         return $swept;
     }
@@ -1140,15 +1174,17 @@ class UploadService
 
         $dispatched = 0;
 
-        $query->with('token')->each(function (EfacturaUpload $upload) use (&$dispatched) {
+        // lazyById, not each(): a row a worker takes (at once on the sync queue) leaves the
+        // scope, and each()'s OFFSET pages would skip as many rows.
+        foreach ($query->with('token')->lazyById() as $upload) {
             // Its job, if any, sleeps the cooldown out; a new one would only stack on it.
             if ($upload->token && $this->tokenService->refreshCooldownSeconds($upload->token) > 0) {
-                return;
+                continue;
             }
 
             ProcessSingleUpload::dispatch($upload);
             $dispatched++;
-        });
+        }
 
         return $dispatched;
     }

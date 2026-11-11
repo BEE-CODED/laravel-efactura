@@ -359,3 +359,11 @@ describe('EfacturaAuthCommand', function () {
             ->assertExitCode(0);
     });
 });
+
+it('refuses efactura:auth and efactura:reconcile while e-Factura is disabled', function (string $command) {
+    config(['efactura.enabled' => false]);
+
+    $this->artisan($command)
+        ->expectsOutput('e-Factura is disabled.')
+        ->assertExitCode(1);
+})->with(['efactura:auth 12345678', 'efactura:reconcile']);

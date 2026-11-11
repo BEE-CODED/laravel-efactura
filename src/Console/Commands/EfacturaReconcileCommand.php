@@ -11,6 +11,7 @@
 
 namespace BeeCoded\EFactura\Console\Commands;
 
+use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\UploadService;
 use Illuminate\Console\Command;
@@ -53,6 +54,14 @@ class EfacturaReconcileCommand extends Command
 
     public function handle(UploadService $uploadService): int
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
+        if (!config('efactura.enabled')) {
+            $this->error('e-Factura is disabled.');
+
+            return self::FAILURE;
+        }
+
         if ($this->option('filed')) {
             return $this->resolveAsFiled($uploadService);
         }

@@ -28,6 +28,7 @@ class Invoice extends Model implements EFacturaUploadableInterface
                     city: $this->company->city,
                     county: $this->company->county,  // ISO 3166-2:RO code
                     countryCode: 'RO',
+                    bucharestSector: $this->company->bucharest_sector, // 1..6; SDK 4.0 needs it for Bucharest
                 ),
             ),
             customer: new PartyData(
@@ -111,7 +112,7 @@ This trait provides:
 
 ### File Paths
 - \`getEfacturaResponsePath(): ?string\` — Path to response ZIP
-- \`getEfacturaXmlPath(): ?string\` — Path to generated XML
+- \`getEfacturaXmlPath(): ?string\` — Path to the generated XML of the attempt sent (null while an unsent upload waits after a rate limit, a refresh cooldown or a transient failure; that attempt's file is deleted)
 - \`getEfacturaErrors(): ?array\` — Upload errors if failed
 
 ### Scopes

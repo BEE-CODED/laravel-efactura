@@ -161,18 +161,6 @@ describe('CheckUploadStatuses Job', function () {
         $job->handle($downloadService);
     });
 
-    it('calls checkAllStatuses when enabled', function () {
-        config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true]);
-
-        $downloadService = Mockery::mock(DownloadService::class);
-        $downloadService->shouldReceive('checkAllStatuses')
-            ->once()
-            ->with(null);
-
-        $job = new CheckUploadStatuses;
-        $job->handle($downloadService);
-    });
-
     it('passes CUI to checkAllStatuses', function () {
         config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true]);
 
@@ -203,18 +191,6 @@ describe('DownloadResponses Job', function () {
 
         $downloadService = Mockery::mock(DownloadService::class);
         $downloadService->shouldNotReceive('downloadAllResponses');
-
-        $job = new DownloadResponses;
-        $job->handle($downloadService);
-    });
-
-    it('calls downloadAllResponses when enabled', function () {
-        config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true]);
-
-        $downloadService = Mockery::mock(DownloadService::class);
-        $downloadService->shouldReceive('downloadAllResponses')
-            ->once()
-            ->with(null);
 
         $job = new DownloadResponses;
         $job->handle($downloadService);
@@ -255,18 +231,6 @@ describe('DownloadReceivedInvoices Job', function () {
         $job->handle($downloadService);
     });
 
-    it('calls downloadAllReceivedInvoices when enabled', function () {
-        config(['efactura.enabled' => true, 'efactura.features.download_received' => true]);
-
-        $downloadService = Mockery::mock(DownloadService::class);
-        $downloadService->shouldReceive('downloadAllReceivedInvoices')
-            ->once()
-            ->with(null);
-
-        $job = new DownloadReceivedInvoices;
-        $job->handle($downloadService);
-    });
-
     it('passes CUI to downloadAllReceivedInvoices', function () {
         config(['efactura.enabled' => true, 'efactura.features.download_received' => true]);
 
@@ -300,18 +264,6 @@ describe('SyncMessages Job', function () {
 
         $messageSyncService->shouldNotReceive('syncAllMessages');
         $messageSyncService->shouldNotReceive('syncMessages');
-
-        $job = new SyncMessages;
-        $job->handle($messageSyncService, $tokenService);
-    });
-
-    it('calls syncAllMessages when no CUI specified', function () {
-        config(['efactura.enabled' => true, 'efactura.features.sync_messages' => true]);
-
-        $messageSyncService = Mockery::mock(MessageSyncService::class);
-        $tokenService = Mockery::mock(TokenService::class);
-
-        $messageSyncService->shouldReceive('syncAllMessages')->once();
 
         $job = new SyncMessages;
         $job->handle($messageSyncService, $tokenService);
@@ -1098,6 +1050,7 @@ describe('RetryRateLimitedUploads Job', function () {
             'failure_reason' => FailureReason::RateLimited,
             'standard' => 'UBL',
             'errors' => ['Rate limit exceeded'],
+            'processed_at' => now(),
         ]);
 
         $job = new RetryRateLimitedUploads;
@@ -1131,7 +1084,7 @@ describe('RetryRateLimitedUploads Job', function () {
         Queue::assertNothingPushed();
     });
 
-    it('ignores uploads older than max age', function () {
+    it('ignores uploads that failed more than max age ago', function () {
         config([
             'efactura.enabled' => true,
             'efactura.features.upload_invoices' => true,
@@ -1150,8 +1103,8 @@ describe('RetryRateLimitedUploads Job', function () {
             'errors' => ['Rate limit exceeded'],
         ]);
 
-        // Backdate the upload beyond max age
-        EfacturaUpload::where('id', $upload->id)->update(['created_at' => now()->subDays(8)]);
+        // It failed beyond max age ago.
+        EfacturaUpload::where('id', $upload->id)->update(['processed_at' => now()->subDays(8)]);
 
         $job = new RetryRateLimitedUploads;
         $job->handle();
@@ -1179,6 +1132,7 @@ describe('RetryRateLimitedUploads Job', function () {
                 'failure_reason' => FailureReason::RateLimited,
                 'standard' => 'UBL',
                 'errors' => ['Rate limit exceeded'],
+                'processed_at' => now(),
             ]);
         }
 
@@ -1187,6 +1141,48 @@ describe('RetryRateLimitedUploads Job', function () {
 
         // Only 2 should be dispatched (batch size limit)
         Queue::assertPushed(ProcessSingleUpload::class, 2);
+    });
+
+    // env() keeps a number from .env a string, and retryableQuery() takes an int under strict_types.
+    it('accepts the retry limits as strings, as they arrive from .env', function () {
+        config([
+            'efactura.rate_limit.retry_max_age_days' => '14',
+            'efactura.rate_limit.retry_batch_size' => '250',
+        ]);
+        Queue::fake();
+
+        $upload = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => UploadStatus::Failed,
+            'failure_reason' => FailureReason::RateLimited,
+            'processed_at' => now(),
+        ]);
+
+        (new RetryRateLimitedUploads)->handle();
+
+        Queue::assertPushed(ProcessSingleUpload::class, fn (ProcessSingleUpload $job) => $job->upload->is($upload));
+    });
+
+    // A recycled row keeps its first created_at: the age is how long ago it failed.
+    it('retries an old recycled row that failed transiently just now', function () {
+        config(['efactura.rate_limit.retry_max_age_days' => 7]);
+        Queue::fake();
+
+        $upload = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => UploadStatus::Failed,
+            'failure_reason' => FailureReason::Transient,
+            'processed_at' => now(),
+        ]);
+        EfacturaUpload::where('id', $upload->id)->update(['created_at' => now()->subDays(30)]);
+
+        (new RetryRateLimitedUploads)->handle();
+
+        Queue::assertPushed(ProcessSingleUpload::class, fn (ProcessSingleUpload $job) => $job->upload->is($upload));
     });
 
     it('re-dispatches a stale released row once, not again on the next run while its job is queued', function () {
@@ -1251,9 +1247,9 @@ describe('Batch jobs discard themselves when stale', function () {
         config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true, 'efactura.jobs.max_staleness_seconds' => 120]);
 
         $downloadService = Mockery::mock(DownloadService::class);
-        $downloadService->shouldReceive('checkAllStatuses')->once()->with(null);
+        $downloadService->shouldReceive('checkAllStatuses')->once()->with('12345678');
 
-        $job = new CheckUploadStatuses; // fresh: enqueuedAt = now
+        $job = new CheckUploadStatuses('12345678'); // fresh: enqueuedAt = now
         $job->handle($downloadService);
     });
 });

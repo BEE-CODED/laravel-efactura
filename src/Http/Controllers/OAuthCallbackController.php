@@ -18,6 +18,7 @@ use BeeCoded\EFacturaSdk\Support\Validators\VatNumberValidator;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
+use Illuminate\Support\Str;
 
 class OAuthCallbackController extends Controller
 {
@@ -26,15 +27,23 @@ class OAuthCallbackController extends Controller
     ) {}
 
     /**
-     * Redirect to ANAF OAuth authorization.
+     * Session key of the nonce an authorization started here is bound to.
      */
-    public function redirect(string $cui): RedirectResponse
+    private const SESSION_NONCE_KEY = 'efactura_oauth_nonce';
+
+    /**
+     * Redirect to ANAF OAuth authorization.
+     *
+     * The state is bound to this browser session and the logged-in user, so only they can
+     * complete it.
+     */
+    public function redirect(Request $request, string $cui): RedirectResponse
     {
         if (!VatNumberValidator::isValid($cui)) {
             return $this->errorRedirect('Invalid CUI format provided.');
         }
 
-        $authUrl = $this->tokenService->getAuthorizationUrl($cui);
+        $authUrl = $this->tokenService->getAuthorizationUrl($cui, $this->sessionNonce($request), $request->user()?->getAuthIdentifier());
 
         return redirect()->away($authUrl);
     }
@@ -73,7 +82,8 @@ class OAuthCallbackController extends Controller
         }
 
         // Validate state token (CSRF protection)
-        $cui = $this->tokenService->validateOAuthState($state);
+        $nonce = $request->hasSession() ? $request->session()->get(self::SESSION_NONCE_KEY) : null;
+        $cui = $this->tokenService->validateOAuthState($state, is_string($nonce) ? $nonce : null, $request->user()?->getAuthIdentifier());
 
         if (!$cui) {
             return $this->errorRedirect('Invalid or expired state parameter. Please try again.');
@@ -95,6 +105,26 @@ class OAuthCallbackController extends Controller
 
             return $this->errorRedirect('Failed to exchange authorization code: '.$e->getMessage());
         }
+    }
+
+    /**
+     * The nonce of this browser session, created once; null without a session.
+     *
+     * One per session rather than per flow, so two tabs authorizing two CUIs both complete.
+     */
+    protected function sessionNonce(Request $request): ?string
+    {
+        if (!$request->hasSession()) {
+            return null;
+        }
+
+        $session = $request->session();
+
+        if (!is_string($nonce = $session->get(self::SESSION_NONCE_KEY))) {
+            $session->put(self::SESSION_NONCE_KEY, $nonce = Str::random(40));
+        }
+
+        return $nonce;
     }
 
     /**

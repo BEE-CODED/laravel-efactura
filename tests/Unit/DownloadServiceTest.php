@@ -100,13 +100,13 @@ describe('DownloadService', function () {
                 ->once()
                 ->andReturn(StatusResponseData::fromAnafResponse([
                     'stare' => 'ok',
-                    'id_descarcare' => 'DOWNLOAD456',
+                    'id_descarcare' => '3001130456',
                 ]));
 
             $this->downloadService->checkStatus($upload);
 
             expect($upload->fresh()->status)->toBe(UploadStatus::Completed)
-                ->and($upload->fresh()->download_id)->toBe('DOWNLOAD456');
+                ->and($upload->fresh()->download_id)->toBe('3001130456');
         });
 
         it('marks upload as failed when processing failed', function () {
@@ -125,7 +125,7 @@ describe('DownloadService', function () {
                 ->once()
                 ->andReturn(StatusResponseData::fromAnafResponse([
                     'stare' => 'nok',
-                    'id_descarcare' => 'ERROR_DL_123',
+                    'id_descarcare' => '3001130123',
                     'Errors' => ['Processing error'],
                 ]));
 
@@ -137,7 +137,7 @@ describe('DownloadService', function () {
             expect($upload->fresh()->status)->toBe(UploadStatus::Failed)
                 ->and($upload->fresh()->failure_reason)->toBe(FailureReason::Validation)
                 ->and($upload->fresh()->errors)->toBe(['Processing error'])
-                ->and($upload->fresh()->download_id)->toBe('ERROR_DL_123');
+                ->and($upload->fresh()->download_id)->toBe('3001130123');
 
             Event::assertDispatched(InvoiceFailed::class);
         });
@@ -290,7 +290,7 @@ describe('DownloadService', function () {
 
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andReturn(new DownloadResponseData(content: 'ZIP CONTENT', contentType: 'application/zip'));
+                ->andReturn(new DownloadResponseData(content: responseZip(), contentType: 'application/zip'));
 
             $this->downloadService->downloadResponse($upload);
 
@@ -386,7 +386,7 @@ describe('DownloadService', function () {
 
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andReturn(new DownloadResponseData(content: 'MESSAGE CONTENT', contentType: 'application/zip'));
+                ->andReturn(new DownloadResponseData(content: responseZip(), contentType: 'application/zip'));
 
             $this->downloadService->downloadMessage($message);
 
@@ -511,7 +511,7 @@ describe('DownloadService', function () {
 
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andReturn(new DownloadResponseData(content: 'ZIP', contentType: 'application/zip'));
+                ->andReturn(new DownloadResponseData(content: responseZip(), contentType: 'application/zip'));
 
             $this->downloadService->downloadAllResponses();
 
@@ -545,7 +545,7 @@ describe('DownloadService', function () {
 
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andReturn(new DownloadResponseData(content: 'CONTENT', contentType: 'application/zip'));
+                ->andReturn(new DownloadResponseData(content: responseZip(), contentType: 'application/zip'));
 
             $this->downloadService->downloadAllReceivedInvoices();
 

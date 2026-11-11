@@ -11,19 +11,28 @@
 
 namespace BeeCoded\EFactura\Jobs;
 
-use BeeCoded\EFactura\Exceptions\MessageSyncFailedException;
+use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
+use BeeCoded\EFactura\Jobs\Concerns\DiscardsWhenStale;
 use BeeCoded\EFactura\Services\MessageSyncService;
 use BeeCoded\EFactura\Services\TokenService;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 
-class SyncMessages implements ShouldQueue
+/**
+ * Syncs the ANAF message list of one CUI.
+ *
+ * Without a CUI it only dispatches one job per active token: each CUI gets its own
+ * timeout and its own retries, so one slow or broken CUI neither uses up the others'
+ * budget nor makes the queue list the healthy ones again. Unique per CUI.
+ */
+class SyncMessages implements ShouldBeUnique, ShouldQueue
 {
-    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use DiscardsWhenStale, Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public int $tries = 3;
 
@@ -33,71 +42,50 @@ class SyncMessages implements ShouldQueue
 
     public int $maxExceptions = 3;
 
+    public int $uniqueFor;
+
     public function __construct(
         public ?string $cui = null,
     ) {
         $this->onQueue(config('efactura.queue'));
+        $this->markEnqueued();
+        $this->uniqueFor = (int) config('efactura.jobs.unique_for_seconds', 3600);
+    }
+
+    public function uniqueId(): string
+    {
+        return $this->cui ?? 'all';
     }
 
     public function handle(MessageSyncService $messageSyncService, TokenService $tokenService): void
     {
+        PipelineTablesDisabledException::throwIfDisabled();
+
+        if ($this->isStale()) {
+            return;
+        }
+
         if (!config('efactura.enabled') || !config('efactura.features.sync_messages')) {
             return;
         }
 
-        // If CUI is specified, sync only that CUI
-        if ($this->cui) {
-            $token = $tokenService->getToken($this->cui);
-
-            if (!$token) {
-                Log::warning('EFactura: No token found for CUI', ['cui' => $this->cui]);
-
-                return;
+        if ($this->cui === null) {
+            foreach ($tokenService->getActiveTokens() as $token) {
+                dispatch((new self($token->cui))->asFanOutChild());
             }
-
-            // A single-CUI sync has no healthy neighbours to protect, and its failure
-            // may well be a transient ANAF blip, so it retries normally.
-            $messageSyncService->syncMessages($token);
 
             return;
         }
 
-        // Otherwise sync all active tokens
-        try {
-            $messageSyncService->syncAllMessages();
-        } catch (MessageSyncFailedException $e) {
-            $this->failBatch($e);
-        }
-    }
+        $token = $tokenService->getToken($this->cui);
 
-    /**
-     * Dead-letter a partially-failed batch WITHOUT retrying it.
-     *
-     * syncAllMessages() already isolates per-token failures and re-runs nothing, so
-     * by the time it throws, every healthy CUI has synced and the only thing left is
-     * a report of what did not. Letting that exception bubble would tell the queue
-     * worker to run the WHOLE batch again — from scratch — re-hitting
-     * /listaMesajeFactura for every HEALTHY CUI on each of tries=3. With 50 tokens and
-     * one permanently-revoked refresh token, that is 3x the list calls per healthy CUI
-     * per hour against ANAF's 750/day/CUI budget, spent re-asking questions that were
-     * already answered, to fix a token that no retry can fix.
-     *
-     * fail() keeps the failure just as loud — the job still dead-letters and still
-     * fires JobFailed — it simply does not pay for the same answer three times.
-     */
-    protected function failBatch(MessageSyncFailedException $e): void
-    {
-        Log::error('EFactura: batch message sync failed, not retrying', [
-            'failed_cuis' => array_keys($e->failures),
-            'error' => $e->getMessage(),
-        ]);
+        if (!$token) {
+            Log::warning('EFactura: No token found for CUI', ['cui' => $this->cui]);
 
-        // Outside a worker (e.g. a synchronous dispatch in a console context) there is
-        // no queue job to fail, so surface the error rather than swallow it.
-        if ($this->job === null) {
-            throw $e;
+            return;
         }
 
-        $this->fail($e);
+        // Errors bubble, so the queue retries this CUI alone.
+        $messageSyncService->syncMessages($token);
     }
 }
