@@ -31,8 +31,9 @@ use Illuminate\Support\Facades\Schema;
  * Existing rows start at 0, which is correct: none has been counted yet.
  *
  * DATA: a 3.x `failed` / `validation` row that has an upload index but no download id is
- * moved to `indeterminate`. 3.x wrote that shape only for a `nok` status without a download
- * id (an unknown index or "Nu aveti dreptul" answer, no verdict on the document); it never
+ * moved to `indeterminate`. A pre-3.0 `failed` row that migration 000005 left without a
+ * `failure_reason` is moved on the same condition: queueUpload() recycles it too. 3.x wrote
+ * that shape only for a `nok` status without a download id (an unknown index or "Nu aveti dreptul" answer, no verdict on the document); it never
  * stored the index on a failed upload answer, so 3.x upload-answer failures have no index
  * and are not moved. queueUpload() recycles `validation` rows, so re-queueing a moved row
  * would file it twice. 4.0 writes the shape only for "XML cu erori nepreluat de sistem"
@@ -65,7 +66,7 @@ return new class extends Migration
 
         DB::table('efactura_uploads')
             ->where('status', 'failed')
-            ->where('failure_reason', 'validation')
+            ->where(fn ($query) => $query->where('failure_reason', 'validation')->orWhereNull('failure_reason'))
             ->whereNotNull('upload_index')
             ->whereNull('download_id')
             ->update(['failure_reason' => 'indeterminate']);

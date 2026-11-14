@@ -78,6 +78,30 @@ describe('OAuthCallbackController', function () {
             expect(session('efactura_message'))->toContain('Authorization was cancelled');
         });
 
+        it("never shows the callback's own error text", function () {
+            config(['efactura.routes.error_redirect' => '/error']);
+            $this->tokenService->shouldReceive('forgetOAuthState')->once();
+
+            $this->controller->callback(Request::create('/callback', 'GET', [
+                'error' => 'x',
+                'error_description' => 'Your access is suspended, call 07xx',
+            ]));
+
+            expect(session('efactura_message'))->toBe('Authorization failed. Please try again or contact support.');
+        });
+
+        it('treats a non-string query value as absent', function (array $query, ?string $state) {
+            config(['efactura.routes.error_redirect' => '/error']);
+            $this->tokenService->shouldReceive('forgetOAuthState')->with($state)->once();
+
+            $this->controller->callback(Request::create('/callback', 'GET', $query));
+
+            expect(session('efactura_message'))->toContain('Missing authorization code');
+        })->with([
+            'error[] and state[]' => [['error' => ['1'], 'state' => ['x']], null],
+            'code[]' => [['code' => ['x'], 'state' => 's'], 's'],
+        ]);
+
         it('handles missing authorization code', function () {
             config(['efactura.routes.error_redirect' => '/error']);
 
@@ -217,8 +241,9 @@ describe('OAuthCallbackController', function () {
 
             $message = $reflection->invoke($this->controller, 'unknown_error', 'Some description');
 
-            expect($message)->toContain('unknown_error')
-                ->and($message)->toContain('Some description');
+            expect($message)->toBe('Authorization failed. Please try again or contact support.')
+                ->and($message)->not->toContain('Some description')
+                ->and($message)->not->toContain('unknown_error');
         });
     });
 

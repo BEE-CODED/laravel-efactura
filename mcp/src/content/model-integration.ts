@@ -133,8 +133,9 @@ use BeeCoded\\EFactura\\Facades\\EFactura;
 // Standard B2B upload
 $upload = EFactura::queueUpload($invoice);
 
-// B2C upload (consumer invoices)
+// B2C upload (consumer invoices); takes the same options
 $upload = EFactura::queueB2CUpload($invoice);
+$upload = EFactura::queueB2CUpload($creditNote, ['standard' => 'CN']);
 
 // With options
 $upload = EFactura::queueUpload($invoice, [
@@ -182,7 +183,7 @@ per-row atomic claim, and the invoice was filed at ANAF twice while \`morphOne\`
 
 ## Credit Notes
 
-For credit notes, set \`invoiceTypeCode\` to the enum case \`InvoiceTypeCode::CreditNote\` and provide \`precedingInvoiceNumber\`. Pass **negative** quantities for the items being credited. The taxAmount field is required (SDK v2.0+) and must be pre-computed.
+For credit notes, set \`invoiceTypeCode\` to the enum case \`InvoiceTypeCode::CreditNote\` and reference the original invoice in \`precedingInvoices\` (\`PrecedingInvoiceData\`). Pass **negative** quantities for the items being credited. The taxAmount field is required (SDK v2.0+) and must be pre-computed.
 
 > **Pass the enum, not the string.** \`InvoiceData::$invoiceTypeCode\` is typed \`?InvoiceTypeCode\`.
 > The SDK declares \`strict_types=1\`, so a string like \`'381'\` is **not** coerced — it throws a
@@ -194,6 +195,7 @@ For credit notes, set \`invoiceTypeCode\` to the enum case \`InvoiceTypeCode::Cr
 > exception: it is never negated and must stay **positive** (a negative one is a \`ValidationException\`).
 
 \`\`\`php
+use BeeCoded\\EFacturaSdk\\Data\\Invoice\\PrecedingInvoiceData;
 use BeeCoded\\EFacturaSdk\\Enums\\InvoiceTypeCode;
 
 public function toEfacturaData(): InvoiceData
@@ -201,7 +203,7 @@ public function toEfacturaData(): InvoiceData
     return new InvoiceData(
         invoiceNumber: $this->number,
         invoiceTypeCode: InvoiceTypeCode::CreditNote,  // value '381'
-        precedingInvoiceNumber: $this->original_invoice_number,
+        precedingInvoices: [new PrecedingInvoiceData($this->original_invoice_number, $this->original_issue_date)],
         // ... same structure, quantities are negative
         lines: $this->items->map(fn ($item) => new InvoiceLineData(
             name: $item->name,
@@ -216,7 +218,7 @@ public function toEfacturaData(): InvoiceData
 
 ### Credit Note Notes
 - \`invoiceTypeCode: InvoiceTypeCode::CreditNote\` (backing value \`'381'\`) identifies this as a credit note and switches the SDK to the UBL \`<CreditNote>\` document schema
-- \`precedingInvoiceNumber\` references the original invoice being reversed
+- \`precedingInvoices\` references the original invoice being reversed
 - Pass **negative** quantities for items being credited — but not because ANAF wants negatives. The SDK **negates** credit note line quantities (and the matching \`taxAmount\`) before building the XML, so ANAF receives the **positive** values a \`<CreditNote>\` document expects. Pass **positive** quantities for debit-back lines (e.g. discount reversals), which the same negation flips to negative.
-- This is a standard B2B or B2C upload — use \`EFactura::queueUpload()\` as normal
+- The package sends the standard you queue (default \`UBL\`), whatever the document type: queue a credit note with \`EFactura::queueUpload($creditNote, ['standard' => 'CN'])\` or \`EFactura::queueB2CUpload($creditNote, ['standard' => 'CN'])\`
 `;

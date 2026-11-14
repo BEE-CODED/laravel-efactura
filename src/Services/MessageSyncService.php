@@ -258,9 +258,9 @@ class MessageSyncService
         [$cifEmitent, $cifBeneficiar] = $this->extractCifs($token, $messageData, $type);
 
         EfacturaMessage::updateOrCreate(
-            ['message_id' => $messageData->id],
+            // Per token: two connected companies can both list one message (migration 000011).
+            ['efactura_token_id' => $token->id, 'message_id' => $messageData->id],
             [
-                'efactura_token_id' => $token->id,
                 'type' => $type,
                 // ANAF's message id IS the download id - it's what /descarcare?id= expects.
                 'download_id' => $messageData->id,

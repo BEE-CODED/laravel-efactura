@@ -4,10 +4,13 @@ declare(strict_types=1);
 
 use BeeCoded\EFactura\Enums\ResponseVerification;
 use BeeCoded\EFactura\Enums\UploadStatus;
+use BeeCoded\EFactura\Events\InvoiceReceived;
+use BeeCoded\EFactura\Models\EfacturaMessage;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\DownloadService;
 use BeeCoded\EFacturaSdk\Support\ArchiveInspector;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
 
@@ -20,7 +23,7 @@ beforeEach(function () {
     Storage::fake('local');
     Storage::disk('local')->put('efactura-test/INV-1.xml', VERIFY_INVOICE);
 
-    $token = EfacturaToken::create(['cui' => '12345678', 'access_token' => 'ACCESS', 'refresh_token' => 'REFRESH', 'expires_at' => now()->addHour()]);
+    $this->token = $token = EfacturaToken::create(['cui' => '12345678', 'access_token' => 'ACCESS', 'refresh_token' => 'REFRESH', 'expires_at' => now()->addHour()]);
     $this->upload = fn (UploadStatus $status, ?string $xmlPath = 'efactura-test/INV-1.xml') => EfacturaUpload::create([
         'efactura_token_id' => $token->id,
         'uploadable_type' => 'App\\Models\\Invoice',
@@ -92,4 +95,27 @@ it('counts an archive outside the limits but not a local temp-file failure', fun
 
     expect([$unopenable->fresh()->response_attempts, $unopenable->fresh()->response_path])->toBe([1, null])
         ->and([$local->fresh()->response_attempts, $local->fresh()->response_path])->toBe([0, null]);
+});
+
+it('counts a received archive outside the limits but not a local temp-file failure, and stores neither', function () {
+    Event::fake([InvoiceReceived::class]);
+    Http::fake([VERIFY_DOWNLOAD_URL => Http::response("PK\x03\x04not a zip", 200, ['Content-Type' => 'application/zip'])]);
+    $received = fn (string $id) => EfacturaMessage::create([
+        'efactura_token_id' => $this->token->id,
+        'message_id' => $id,
+        'download_id' => $id,
+        'type' => 'received',
+    ]);
+
+    $unopenable = $received('4001130001');
+    app(DownloadService::class)->downloadMessage($unopenable);
+
+    $this->app->instance(ArchiveInspector::class, new ArchiveInspector(sys_get_temp_dir().'/efactura-missing-'.uniqid()));
+    $this->app->forgetInstance(DownloadService::class);
+    $local = $received('4001130002');
+    app(DownloadService::class)->downloadMessage($local);
+
+    expect([$unopenable->fresh()->download_attempts, $unopenable->fresh()->is_downloaded, $unopenable->fresh()->xml_path])->toBe([1, false, null])
+        ->and([$local->fresh()->download_attempts, $local->fresh()->is_downloaded])->toBe([0, false]);
+    Event::assertNotDispatched(InvoiceReceived::class);
 });

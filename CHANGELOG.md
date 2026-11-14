@@ -39,7 +39,8 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
 
 - Migration `2024_01_01_000008_add_failure_counters_to_efactura_tables`: `efactura_uploads.status_failures`
   and `efactura_messages.download_attempts` (both default 0). Run `php artisan migrate` before queue workers start the 4.0 code (keep workers stopped during the deploy): 4.0 writes the new columns right after ANAF accepts an upload. It also
-  moves `failed` / `validation` rows that have an `upload_index` but no `download_id` to
+  moves `failed` rows with `validation` or no `failure_reason` (a pre-3.0 failure migration
+  `000005` could not classify) that have an `upload_index` but no `download_id` to
   `indeterminate`: 3.x recorded `nok` status answers without a download id that way, and
   re-queueing one filed it again. 3.x never stored the index on a failed upload answer, so those
   rows have no index; a 3.x `validation` row without an index cannot be told apart from a real
@@ -94,10 +95,21 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
   (`BeeCoded\EFactura\Enums\ResponseVerification`: `verified`, `limits_only`, `mismatch`; null for
   a response stored before 4.0) and `efactura_uploads.next_poll_at` with an index on
   `(status, next_poll_at)`.
+- Migration `2024_01_01_000011_key_efactura_messages_per_token` (not loaded when `pipeline_tables`
+  is false): `efactura_messages` is unique on `(efactura_token_id, message_id)` instead of
+  `message_id`, so a message listed to two connected companies is stored once per company. It is
+  re-entrant and cannot abort on data.
 
 ### Changed
 
 - **Requires `bee-coded/laravel-efactura-sdk` ^4.0.**
+- `queueB2CUpload()` honours `$options['standard']` like `queueUpload()` (it always stored `UBL`).
+  The package sends the standard you queue whatever the document type: queue a credit note with
+  `['standard' => 'CN']`.
+- The OAuth callback no longer shows an unrecognised `error` / `error_description` from the request:
+  it flashes a fixed message and reports the shortened values. A non-string `error`,
+  `error_description`, `code` or `state` counts as absent (it was a 500).
+  `getOAuthErrorMessage()`'s default ignores the description.
 - Upload answers: a digit-only `index_incarcare` makes the upload `Processing` with that index and
   fires `InvoiceUploaded`, whatever `ExecutionStatus` says (it was `Failed` / `validation`). An
   answer that does not say whether ANAF took the document in (an unreadable 2xx body, a non-digit
@@ -234,7 +246,8 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
   SPV) or `--not-filed=<id> --despite-index` (checked SPV, not there) for an upload that has an
   upload index.
 - Message sync also skips (with the same warning) a listed id that is not digits, and records every
-  `MESAJ CUMPARATOR…` tip as `received`.
+  `MESAJ CUMPARATOR…` tip as `received`, so they are downloaded and fire `InvoiceReceived` like a
+  received invoice; listeners check `$message->details['tip']`.
 - A received invoice is marked downloaded only while `is_downloaded` is still false, and
   `InvoiceReceived` fires only for the run that marked it. A run that loses that write, or the
   `response_path` write of a response download, deletes the file it stored (unless the winner
@@ -284,6 +297,9 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
   outside the limits (not a ZIP, empty, encrypted, too large, too many members) is counted against
   `EfacturaUpload::MAX_RESPONSE_ATTEMPTS` like any permanent download failure; a local failure
   (temporary file, reading the stored XML) is retried by the next run without counting.
+  Received-invoice archives get the same limits-only check before they are stored: one outside the
+  limits counts against `EfacturaMessage::MAX_DOWNLOAD_ATTEMPTS` and fires no `InvoiceReceived`; a
+  local failure is retried without counting.
   `DownloadService` takes an optional `ArchiveInspector` as its third constructor argument. The SDK
   needs `ext-zip` and `ext-dom`.
 - Status polling follows the SDK's `PollSchedule`: after each "still in progress" answer the upload's
@@ -362,6 +378,7 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
 ### Fixed
 
 - Messages listed without an id no longer merge into one `efactura_messages` row.
+- Message sync no longer moves one ANAF message between two tokens that list the same id.
 - `InvoiceRateLimited` fires only when the upload was actually handed back to `pending`; a row a
   sweep or `failed()` parked during the call no longer announces a rate limit.
 - A model read before its row was reset for a retry (for example by a second job on the same row)

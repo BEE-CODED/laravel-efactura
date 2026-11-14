@@ -650,6 +650,25 @@ class DownloadService
             return;
         }
 
+        // Limits only, like a rejection report: a received archive holds no upload of ours.
+        try {
+            $this->archiveInspector->verify($response->content);
+        } catch (\Throwable $e) {
+            if ($e instanceof ArchiveLimitException && $e->reason !== ArchiveLimitReason::Io) {
+                $this->recordMessageDownloadFailure($message, $e, requested: true);
+
+                return;
+            }
+
+            Log::error('EFactura: received archive could not be checked', [
+                'message_id' => $message->id,
+                'exception' => $e::class,
+                'error' => $e->getMessage(),
+            ]);
+
+            return;
+        }
+
         // As for responses: a storage failure is retried without counting an attempt.
         try {
             $path = $this->storeMessageDownload($message, $response->content);

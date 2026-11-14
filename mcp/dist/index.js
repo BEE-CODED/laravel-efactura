@@ -21071,7 +21071,7 @@ The wrapper decorates the SDK's \`AnafDetailsClientInterface\` binding with \`Re
 
 ### Response Archive Check and Poll Schedule (v4.0)
 
-Before a response ZIP is stored, \`DownloadService\` checks it with the SDK's \`ArchiveInspector\`: against the uploaded XML when the upload is \`Completed\` and its \`xml_path\` file exists (\`response_verification\` = \`verified\`), else limits only (\`limits_only\`). A ZIP without the uploaded invoice is stored as received, marked \`mismatch\` and logged. An archive outside the limits (not a ZIP, empty, encrypted, too large, too many members) counts toward \`EfacturaUpload::MAX_RESPONSE_ATTEMPTS\`; a local temp-file failure is retried uncounted. After each "in progress" status answer \`next_poll_at\` is set by the SDK's \`PollSchedule\` (1, 5, 15, then 60 min by age since \`uploaded_at\`), and \`needsStatusCheck()\` takes only due rows.
+Before a response ZIP is stored, \`DownloadService\` checks it with the SDK's \`ArchiveInspector\`: against the uploaded XML when the upload is \`Completed\` and its \`xml_path\` file exists (\`response_verification\` = \`verified\`), else limits only (\`limits_only\`). A ZIP without the uploaded invoice is stored as received, marked \`mismatch\` and logged. An archive outside the limits (not a ZIP, empty, encrypted, too large, too many members) counts toward \`EfacturaUpload::MAX_RESPONSE_ATTEMPTS\`; a local temp-file failure is retried uncounted. A received-invoice ZIP gets the same limits-only check before it is stored: one outside the limits counts toward \`EfacturaMessage::MAX_DOWNLOAD_ATTEMPTS\` and fires no \`InvoiceReceived\`. After each "in progress" status answer \`next_poll_at\` is set by the SDK's \`PollSchedule\` (1, 5, 15, then 60 min by age since \`uploaded_at\`), and \`needsStatusCheck()\` takes only due rows.
 `,
   setup: `# Laravel e-Factura Wrapper \u2014 Setup & Installation
 
@@ -21097,7 +21097,7 @@ This publishes \`config/efactura.php\`.
 php artisan vendor:publish --tag=efactura-migrations
 \`\`\`
 
-This publishes **10** migration files (3 create the tables, 4 were added in v3.x, and \`..._000008\`, \`..._000009\` and \`..._000010\` in v4.0). The package also loads them itself, so publishing is optional. With \`pipeline_tables\` false only the 3 token migrations (\`000001\`, \`000004\`, \`000009\`) are loaded and published.
+This publishes **11** migration files (3 create the tables, 4 were added in v3.x, and \`..._000008\` to \`..._000011\` in v4.0). The package also loads them itself, so publishing is optional. With \`pipeline_tables\` false only the 3 token migrations (\`000001\`, \`000004\`, \`000009\`) are loaded and published.
 
 ## Step 4: Run Migrations
 
@@ -21108,7 +21108,7 @@ php artisan migrate
 Creates three tables:
 - \`efactura_tokens\` \u2014 OAuth tokens per CUI (credentials encrypted at rest)
 - \`efactura_uploads\` \u2014 Upload tracking (polymorphic, unique per model)
-- \`efactura_messages\` \u2014 Synced ANAF messages
+- \`efactura_messages\` \u2014 Synced ANAF messages, one row per token and ANAF message id
 
 The v3.0.0 migrations are \`..._000004_encrypt_efactura_token_credentials\`,
 \`..._000005_add_failure_reason_to_efactura_uploads_table\` and
@@ -21796,7 +21796,8 @@ Every behaviour change since v3.1.1 (also in \`CHANGELOG.md\`):
 13. **Laravel 11 is no longer supported:** \`illuminate/*\` is now \`^12.0|^13.0\`.
 14. **OAuth routes:** \`routes.middleware\` defaults to \`['web', 'auth']\` (was \`['web']\`). Add a
     check that the user may act for the CUI (for example \`can:\`), or disable the routes.
-15. **Migration \`000008\` reclassifies** 3.x \`failed\` / \`validation\` rows with an \`upload_index\` and
+15. **Migration \`000008\` reclassifies** pre-4.0 \`failed\` rows with \`validation\` or no
+    \`failure_reason\` (pre-3.0, left unclassified by \`000005\`) with an \`upload_index\` and
     no \`download_id\` (3.x \`nok\` answers without a download id) as \`indeterminate\` (review with
     \`efactura:reconcile\`). 3.x never stored the index on a failed upload answer. Idempotent before 4.0
     writes rows; re-run after a rollback it also moves 4.0's "nepreluat" rows (the safe direction). A 3.x \`validation\` row
@@ -21880,10 +21881,14 @@ Every behaviour change since v3.1.1 (also in \`CHANGELOG.md\`):
     \`efactura:reconcile\` now refuse while \`enabled\` is false.
 33. **Migration \`000010\`** adds \`efactura_uploads.response_verification\` (\`ResponseVerification\`:
     \`verified\`, \`limits_only\`, \`mismatch\`) and \`next_poll_at\` (index \`(status, next_poll_at)\`).
-    Response ZIPs are checked by the SDK's \`ArchiveInspector\` (needs \`ext-zip\`, \`ext-dom\`); status
+    Response and received-invoice ZIPs are checked by the SDK's \`ArchiveInspector\` (received ones
+    against the limits only) (needs \`ext-zip\`, \`ext-dom\`); status
     reads follow \`PollSchedule\`, so \`CheckUploadStatuses\` reads and fans out to due rows only.
     \`efactura:status --upload=<id>\` still checks at once.
 34. **\`CachedAnafLookup\`:** a cached, fail-closed company check (see the overview topic).
+35. **Migration \`000011\`** makes \`efactura_messages\` unique per \`(efactura_token_id, message_id)\`;
+    sync looks a message up by both, so two connected companies that list the same ANAF id each keep
+    their own row.
 
 ## Upgrading v2 \u2192 v3.0
 
@@ -21998,8 +22003,9 @@ while v2 is still serving traffic is only true until the next request reintroduc
 writes stopped (Step 1) the result is authoritative.
 
 **It is no longer catastrophic if you miss one.** Token encryption is ordered **first** (Step 4), so
-an abort here costs you the index and nothing else \u2014 e-Factura keeps working. This step saves you a
-failed deploy; it is no longer the difference between working and company-wide outage.
+an abort here no longer leaves tokens unreadable. It still stops the run: the migrations after it
+(\`000007\` onwards) do not run until it succeeds, so keep the workers stopped and the app down until
+it does. This step saves you that failed deploy.
 
 ---
 
@@ -22025,7 +22031,7 @@ Three new migrations run, **in this order**:
 |-------|-----------|--------------|
 | 1st | \`..._000004_encrypt_efactura_token_credentials\` | Encrypts the plaintext \`access_token\` / \`refresh_token\` already in \`efactura_tokens\`. **Ordered first deliberately**: it is the migration that restores service for the v3 code you just deployed, so nothing that can abort is allowed to run ahead of it |
 | 2nd | \`..._000005_add_failure_reason_to_efactura_uploads_table\` | Adds the indexed \`failure_reason\` column; backfills \`rate_limited\` for rows whose legacy \`errors\` text carries a \`RATE_LIMIT_EXCEEDED:\` marker. Anything unrecognised stays \`NULL\` rather than being guessed. **Re-entrant** \u2014 an interrupted backfill resumes on the next \`migrate\` instead of wedging on a duplicate-column error |
-| 3rd | \`..._000006_add_unique_uploadable_index_to_efactura_uploads_table\` | Adds the unique \`(uploadable_type, uploadable_id)\` index. **Aborts on pre-3.0 duplicates** before touching this table's schema (Step 2). Ordered last because it is the only one expected to abort |
+| 3rd | \`..._000006_add_unique_uploadable_index_to_efactura_uploads_table\` | Adds the unique \`(uploadable_type, uploadable_id)\` index. **Aborts on pre-3.0 duplicates** before touching this table's schema (Step 2). Ordered after encryption because it is the only one expected to abort; an abort stops the run, so the migrations after it have not run either |
 | 4th | \`..._000007_add_response_attempt_tracking_to_efactura_uploads_table\` | Adds \`response_attempts\` and \`response_failed_at\` so a poisoned \`/descarcare\` body (2xx but not a ZIP) is retried a bounded number of times instead of on every scheduled run forever. Additive columns only; cannot abort |
 
 ### What breaks
@@ -22085,7 +22091,7 @@ the aborting one is not. What you are left with depends on where it stopped:
 |------------|-------|---------|
 | \`..._000004\` (encryption) | Tokens partly or not encrypted. e-Factura is **down** | Idempotent \u2014 fix the cause and re-run \`php artisan migrate\`. It resumes safely and cannot double-encrypt |
 | \`..._000005\` (failure_reason) | Tokens **encrypted, service is up**. Column may exist with the backfill unfinished | Re-entrant \u2014 re-run \`php artisan migrate\`. It skips the DDL it already did and resumes the backfill |
-| \`..._000006\` (unique index) | Tokens **encrypted, service is up**. Only the index is missing | Resolve the duplicates (Step 2), then re-run \`php artisan migrate\`. No rush \u2014 but the pre-3.0 duplicate race stays open until you do |
+| \`..._000006\` (unique index) | Tokens **encrypted**. The index is missing **and \`000007\` onwards have not run** (Laravel stops at the first failure). The code writes their columns, from queue workers and web requests alike, so with the app up every upload ANAF accepts is parked for reconciliation | Do not run Step 5: keep the queue workers stopped and the app down until \`php artisan migrate\` finishes. Resolve the duplicates (Step 2), then re-run \`php artisan migrate\`. If service must resume first, run each later migration (\`000007\` onwards) with \`php artisan migrate --path=\u2026\` (one \`--path\` per file, or your published copies), then run Step 5. The pre-3.0 duplicate race stays open until the index exists |
 
 **Emergency lever \u2014 restore service immediately.** If you are down and need tokens working *now*,
 without first resolving duplicates or anything else, run the encryption migration on its own:
@@ -22452,7 +22458,7 @@ These were broken in v2 and are fixed in v3. Expect **new** traffic and **new** 
 - **Message sync actually runs.** It read \`$response->messages\`, a property the SDK never declared,
   and the exception was swallowed \u2014 so every run "succeeded" while syncing **zero** messages. It now
   reads \`$response->mesaje\`. Your first sync after upgrading may create a large batch of
-  \`EfacturaMessage\` rows (60-day lookback) and fire \`InvoiceReceived\` for each downloaded invoice.
+  \`EfacturaMessage\` rows (60-day lookback) and fire \`InvoiceReceived\` for each downloaded invoice or buyer message.
   Make sure those listeners can cope with a burst.
 - **Token refresh actually works.** The wrapper held the same cache lock the SDK acquires internally;
   since Laravel locks are not re-entrant, refresh deadlocked against itself and threw
@@ -22660,8 +22666,9 @@ use BeeCoded\\EFactura\\Facades\\EFactura;
 // Standard B2B upload
 $upload = EFactura::queueUpload($invoice);
 
-// B2C upload (consumer invoices)
+// B2C upload (consumer invoices); takes the same options
 $upload = EFactura::queueB2CUpload($invoice);
+$upload = EFactura::queueB2CUpload($creditNote, ['standard' => 'CN']);
 
 // With options
 $upload = EFactura::queueUpload($invoice, [
@@ -22709,7 +22716,7 @@ per-row atomic claim, and the invoice was filed at ANAF twice while \`morphOne\`
 
 ## Credit Notes
 
-For credit notes, set \`invoiceTypeCode\` to the enum case \`InvoiceTypeCode::CreditNote\` and provide \`precedingInvoiceNumber\`. Pass **negative** quantities for the items being credited. The taxAmount field is required (SDK v2.0+) and must be pre-computed.
+For credit notes, set \`invoiceTypeCode\` to the enum case \`InvoiceTypeCode::CreditNote\` and reference the original invoice in \`precedingInvoices\` (\`PrecedingInvoiceData\`). Pass **negative** quantities for the items being credited. The taxAmount field is required (SDK v2.0+) and must be pre-computed.
 
 > **Pass the enum, not the string.** \`InvoiceData::$invoiceTypeCode\` is typed \`?InvoiceTypeCode\`.
 > The SDK declares \`strict_types=1\`, so a string like \`'381'\` is **not** coerced \u2014 it throws a
@@ -22721,6 +22728,7 @@ For credit notes, set \`invoiceTypeCode\` to the enum case \`InvoiceTypeCode::Cr
 > exception: it is never negated and must stay **positive** (a negative one is a \`ValidationException\`).
 
 \`\`\`php
+use BeeCoded\\EFacturaSdk\\Data\\Invoice\\PrecedingInvoiceData;
 use BeeCoded\\EFacturaSdk\\Enums\\InvoiceTypeCode;
 
 public function toEfacturaData(): InvoiceData
@@ -22728,7 +22736,7 @@ public function toEfacturaData(): InvoiceData
     return new InvoiceData(
         invoiceNumber: $this->number,
         invoiceTypeCode: InvoiceTypeCode::CreditNote,  // value '381'
-        precedingInvoiceNumber: $this->original_invoice_number,
+        precedingInvoices: [new PrecedingInvoiceData($this->original_invoice_number, $this->original_issue_date)],
         // ... same structure, quantities are negative
         lines: $this->items->map(fn ($item) => new InvoiceLineData(
             name: $item->name,
@@ -22743,9 +22751,9 @@ public function toEfacturaData(): InvoiceData
 
 ### Credit Note Notes
 - \`invoiceTypeCode: InvoiceTypeCode::CreditNote\` (backing value \`'381'\`) identifies this as a credit note and switches the SDK to the UBL \`<CreditNote>\` document schema
-- \`precedingInvoiceNumber\` references the original invoice being reversed
+- \`precedingInvoices\` references the original invoice being reversed
 - Pass **negative** quantities for items being credited \u2014 but not because ANAF wants negatives. The SDK **negates** credit note line quantities (and the matching \`taxAmount\`) before building the XML, so ANAF receives the **positive** values a \`<CreditNote>\` document expects. Pass **positive** quantities for debit-back lines (e.g. discount reversals), which the same negation flips to negative.
-- This is a standard B2B or B2C upload \u2014 use \`EFactura::queueUpload()\` as normal
+- The package sends the standard you queue (default \`UBL\`), whatever the document type: queue a credit note with \`EFactura::queueUpload($creditNote, ['standard' => 'CN'])\` or \`EFactura::queueB2CUpload($creditNote, ['standard' => 'CN'])\`
 `;
 
 // src/content/event-reference.ts
@@ -22978,10 +22986,11 @@ ANAF's response carries no such hint. Do not assume it is set; the wrapper's own
 public function __construct(public EfacturaMessage $message)
 \`\`\`
 
-**Trigger:** Fired after a received invoice has been downloaded from ANAF (triggered by \`DownloadReceivedInvoices\` job or \`efactura:sync --download\`). Only the run that marks the message downloaded fires it (v4.0), so overlapping runs announce it once.
+**Trigger:** Fired after a received invoice has been downloaded from ANAF (triggered by \`DownloadReceivedInvoices\` job or \`efactura:sync --download\`). Only the run that marks the message downloaded fires it (v4.0), so overlapping runs announce it once. It also fires for buyer messages (\`MESAJ CUMPARATOR\u2026\`), which sync as \`received\`: check \`$event->message->details['tip']\` (\`FACTURA PRIMITA\` for a supplier invoice).
 
 **Use Cases:**
 - Process incoming invoices from suppliers
+- Record buyer messages separately
 - Auto-match received invoices with existing purchase orders
 - Trigger accounts payable workflows
 - Notify procurement team of new supplier invoices
@@ -23148,7 +23157,7 @@ A download at its per-message download limit (\`RateLimitScope::Download\`) is s
 new DownloadReceivedInvoices(?string $cui = null)
 \`\`\`
 
-Without a CUI, dispatches one \`DownloadReceivedInvoices($cui)\` per active CUI with invoices to download. With a CUI, downloads received invoice ZIPs for its \`EfacturaMessage\` records of type "received" that have not yet been downloaded. Fires \`InvoiceReceived\` event for each download.
+Without a CUI, dispatches one \`DownloadReceivedInvoices($cui)\` per active CUI with invoices to download. With a CUI, downloads received invoice ZIPs for its \`EfacturaMessage\` records of type "received" that have not yet been downloaded. Fires \`InvoiceReceived\` event for each downloaded invoice or buyer message (check \`details['tip']\`).
 
 A permanent download failure increments \`download_attempts\`; at \`EfacturaMessage::MAX_DOWNLOAD_ATTEMPTS\` (3) the message is no longer selected. Transient failures are not counted, a per-message download limit skips the message, and any other rate limit stops the batch.
 

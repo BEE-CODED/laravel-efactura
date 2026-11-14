@@ -53,30 +53,31 @@ class OAuthCallbackController extends Controller
      */
     public function callback(Request $request): RedirectResponse
     {
+        $state = $this->queryString($request, 'state');
+
         // Check for OAuth error response first
-        $error = $request->get('error');
+        $error = $this->queryString($request, 'error');
 
         if ($error) {
-            $errorDescription = $request->get('error_description', '');
+            $errorDescription = $this->queryString($request, 'error_description') ?? '';
 
             report(new \RuntimeException(
-                "OAuth authorization failed: {$error} - {$errorDescription}"
+                'OAuth authorization failed: '.Str::limit($error, 100).' - '.Str::limit($errorDescription, 300)
             ));
 
             // Clean up any orphan session state from the state parameter
-            $this->cleanupOAuthSession($request->get('state'));
+            $this->cleanupOAuthSession($state);
 
             $message = $this->getOAuthErrorMessage($error, $errorDescription);
 
             return $this->errorRedirect($message);
         }
 
-        $code = $request->get('code');
-        $state = $request->get('state');
+        $code = $this->queryString($request, 'code');
 
         if (!$code) {
             // Clean up any orphan session state
-            $this->cleanupOAuthSession($request->get('state'));
+            $this->cleanupOAuthSession($state);
 
             return $this->errorRedirect('Missing authorization code from ANAF.');
         }
@@ -128,7 +129,19 @@ class OAuthCallbackController extends Controller
     }
 
     /**
+     * A query value, or null when absent or not a string (e.g. error[]=1).
+     */
+    private function queryString(Request $request, string $key): ?string
+    {
+        $value = $request->get($key);
+
+        return is_string($value) ? $value : null;
+    }
+
+    /**
      * Get user-friendly message for OAuth error.
+     *
+     * Both values come from the callback URL, which anyone can craft: never show them.
      */
     protected function getOAuthErrorMessage(string $error, string $description): string
     {
@@ -137,7 +150,7 @@ class OAuthCallbackController extends Controller
             'invalid_scope' => 'The requested permissions are not available. Please contact support.',
             'temporarily_unavailable' => 'ANAF authorization service is temporarily unavailable. Please try again later.',
             'server_error' => 'ANAF authorization service encountered an error. Please try again.',
-            default => "Authorization failed: {$error}. ".($description ?: 'Please try again or contact support.'),
+            default => 'Authorization failed. Please try again or contact support.',
         };
     }
 

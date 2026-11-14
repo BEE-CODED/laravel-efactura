@@ -227,10 +227,11 @@ ANAF's response carries no such hint. Do not assume it is set; the wrapper's own
 public function __construct(public EfacturaMessage $message)
 \`\`\`
 
-**Trigger:** Fired after a received invoice has been downloaded from ANAF (triggered by \`DownloadReceivedInvoices\` job or \`efactura:sync --download\`). Only the run that marks the message downloaded fires it (v4.0), so overlapping runs announce it once.
+**Trigger:** Fired after a received invoice has been downloaded from ANAF (triggered by \`DownloadReceivedInvoices\` job or \`efactura:sync --download\`). Only the run that marks the message downloaded fires it (v4.0), so overlapping runs announce it once. It also fires for buyer messages (\`MESAJ CUMPARATOR…\`), which sync as \`received\`: check \`$event->message->details['tip']\` (\`FACTURA PRIMITA\` for a supplier invoice).
 
 **Use Cases:**
 - Process incoming invoices from suppliers
+- Record buyer messages separately
 - Auto-match received invoices with existing purchase orders
 - Trigger accounts payable workflows
 - Notify procurement team of new supplier invoices

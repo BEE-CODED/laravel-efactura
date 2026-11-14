@@ -112,6 +112,18 @@ describe('UploadService', function () {
                 ->and($upload->status)->toBe(UploadStatus::Pending);
         });
 
+        it('stores the requested standard', function () {
+            $this->tokenService->shouldReceive('getToken')
+                ->with('12345678')
+                ->once()
+                ->andReturn($this->token);
+
+            $upload = $this->uploadService->queueB2CUpload($this->invoice, ['standard' => 'CN']);
+
+            expect($upload->is_b2c)->toBeTrue()
+                ->and($upload->standard)->toBe('CN');
+        });
+
         it('throws exception when no token found', function () {
             $this->tokenService->shouldReceive('getToken')
                 ->with('12345678')

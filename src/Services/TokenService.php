@@ -147,9 +147,9 @@ class TokenService
         }
 
         try {
-            $decoded = json_decode(base64_decode($state), true);
+            $decoded = EFacturaSdkAuth::decodeState($state);
 
-            if (!is_array($decoded) || !isset($decoded['token'], $decoded['cui'])) {
+            if (!isset($decoded['token'], $decoded['cui'])) {
                 return null;
             }
 
@@ -206,9 +206,9 @@ class TokenService
         }
 
         try {
-            $decoded = json_decode(base64_decode($state), true);
+            $decoded = EFacturaSdkAuth::decodeState($state);
 
-            if (is_array($decoded) && isset($decoded['token']) && is_string($decoded['token'])) {
+            if (isset($decoded['token']) && is_string($decoded['token'])) {
                 Cache::forget(self::OAUTH_STATE_CACHE_PREFIX.$decoded['token']);
             }
         } catch (\Exception) {

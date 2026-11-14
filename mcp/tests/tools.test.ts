@@ -92,7 +92,7 @@ describe("get-model-integration-guide", () => {
 
   it("covers credit notes", () => {
     expect(modelIntegrationContent).toContain("credit note");
-    expect(modelIntegrationContent).toContain("precedingInvoiceNumber");
+    expect(modelIntegrationContent).toContain("precedingInvoices");
   });
 
   it("covers taxAmount requirement", () => {

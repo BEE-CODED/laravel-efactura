@@ -80,7 +80,7 @@ class UploadService
         PipelineTablesDisabledException::throwIfDisabled();
 
         return $this->queueFor($model, [
-            'standard' => 'UBL',
+            'standard' => $options['standard'] ?? 'UBL',
             'is_extern' => $options['extern'] ?? false,
             'is_self_billed' => $options['self_billed'] ?? false,
             'is_b2c' => true,

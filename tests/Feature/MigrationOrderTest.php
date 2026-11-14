@@ -196,11 +196,30 @@ describe('v4 reclassification of 3.x rejections that kept an index', function ()
             $row(2, '5001130256', '3001130059'),
             // Never taken in: stays a rejection.
             $row(3, null, null),
+            // A pre-3.0 failure 000005 left unclassified, with an index: parked too.
+            [...$row(4, '5001130257', null), 'failure_reason' => null],
+            // The same without an index: left as it is.
+            [...$row(5, null, null), 'failure_reason' => null],
         ]);
 
         loadMigrationMatching('add_failure_counters')->up();
 
         expect(DB::table('efactura_uploads')->orderBy('uploadable_id')->pluck('failure_reason')->all())
-            ->toBe(['indeterminate', 'validation', 'validation']);
+            ->toBe(['indeterminate', 'validation', 'validation', 'indeterminate', null]);
+    });
+});
+
+describe('v4 per-token message key', function () {
+    it('survives a re-run, including one interrupted between its two index changes', function () {
+        $migration = loadMigrationMatching('key_efactura_messages_per_token');
+
+        $migration->up();
+
+        // MySQL commits each ALTER on its own: the new index exists, the old one is back.
+        Schema::table('efactura_messages', fn (Blueprint $table) => $table->unique('message_id'));
+        $migration->up();
+
+        expect(Schema::hasIndex('efactura_messages', ['efactura_token_id', 'message_id'], 'unique'))->toBeTrue()
+            ->and(Schema::hasIndex('efactura_messages', ['message_id'], 'unique'))->toBeFalse();
     });
 });

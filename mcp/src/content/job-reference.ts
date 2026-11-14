@@ -104,7 +104,7 @@ A download at its per-message download limit (\`RateLimitScope::Download\`) is s
 new DownloadReceivedInvoices(?string $cui = null)
 \`\`\`
 
-Without a CUI, dispatches one \`DownloadReceivedInvoices($cui)\` per active CUI with invoices to download. With a CUI, downloads received invoice ZIPs for its \`EfacturaMessage\` records of type "received" that have not yet been downloaded. Fires \`InvoiceReceived\` event for each download.
+Without a CUI, dispatches one \`DownloadReceivedInvoices($cui)\` per active CUI with invoices to download. With a CUI, downloads received invoice ZIPs for its \`EfacturaMessage\` records of type "received" that have not yet been downloaded. Fires \`InvoiceReceived\` event for each downloaded invoice or buyer message (check \`details['tip']\`).
 
 A permanent download failure increments \`download_attempts\`; at \`EfacturaMessage::MAX_DOWNLOAD_ATTEMPTS\` (3) the message is no longer selected. Transient failures are not counted, a per-message download limit skips the message, and any other rate limit stops the batch.
 

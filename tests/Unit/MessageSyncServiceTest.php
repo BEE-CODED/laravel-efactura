@@ -235,6 +235,34 @@ describe('MessageSyncService', function () {
             expect($message->cif_beneficiar)->toBe('33333333');
         });
 
+        it('keeps one row per token when two connected companies list the same id', function () {
+            $buyer = EfacturaToken::create([
+                'cui' => '87654321',
+                'access_token' => 'buyer_access',
+                'refresh_token' => 'buyer_refresh',
+                'expires_at' => now()->addHour(),
+                'is_active' => true,
+            ]);
+
+            $this->tokenService->shouldReceive('executeWithClient')
+                ->twice()
+                ->andReturn(
+                    anafListResponse([anafMessage(['id' => '3001130059', 'tip' => 'FACTURA TRIMISA'])]),
+                    anafListResponse([anafMessage(['id' => '3001130059', 'tip' => 'FACTURA PRIMITA', 'cif' => '87654321'])]),
+                );
+
+            $this->messageSyncService->syncMessages($this->token);
+            $this->messageSyncService->syncMessages($buyer);
+
+            expect(EfacturaMessage::where('message_id', '3001130059')->count())->toBe(2)
+                ->and(EfacturaMessage::forToken($this->token)->sole()->type)->toBe('sent')
+                ->and(EfacturaMessage::forToken($buyer)->received()->notDownloaded()->sole()->message_id)->toBe('3001130059');
+
+            // 000011's down() cannot restore unique(message_id) over these rows, and sqlite
+            // :memory: keeps them until Testbench rolls the migrations back.
+            EfacturaMessage::query()->delete();
+        });
+
         it('handles a response with no messages', function () {
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()

@@ -83,7 +83,7 @@ The wrapper decorates the SDK's \`AnafDetailsClientInterface\` binding with \`Re
 
 ### Response Archive Check and Poll Schedule (v4.0)
 
-Before a response ZIP is stored, \`DownloadService\` checks it with the SDK's \`ArchiveInspector\`: against the uploaded XML when the upload is \`Completed\` and its \`xml_path\` file exists (\`response_verification\` = \`verified\`), else limits only (\`limits_only\`). A ZIP without the uploaded invoice is stored as received, marked \`mismatch\` and logged. An archive outside the limits (not a ZIP, empty, encrypted, too large, too many members) counts toward \`EfacturaUpload::MAX_RESPONSE_ATTEMPTS\`; a local temp-file failure is retried uncounted. After each "in progress" status answer \`next_poll_at\` is set by the SDK's \`PollSchedule\` (1, 5, 15, then 60 min by age since \`uploaded_at\`), and \`needsStatusCheck()\` takes only due rows.
+Before a response ZIP is stored, \`DownloadService\` checks it with the SDK's \`ArchiveInspector\`: against the uploaded XML when the upload is \`Completed\` and its \`xml_path\` file exists (\`response_verification\` = \`verified\`), else limits only (\`limits_only\`). A ZIP without the uploaded invoice is stored as received, marked \`mismatch\` and logged. An archive outside the limits (not a ZIP, empty, encrypted, too large, too many members) counts toward \`EfacturaUpload::MAX_RESPONSE_ATTEMPTS\`; a local temp-file failure is retried uncounted. A received-invoice ZIP gets the same limits-only check before it is stored: one outside the limits counts toward \`EfacturaMessage::MAX_DOWNLOAD_ATTEMPTS\` and fires no \`InvoiceReceived\`. After each "in progress" status answer \`next_poll_at\` is set by the SDK's \`PollSchedule\` (1, 5, 15, then 60 min by age since \`uploaded_at\`), and \`needsStatusCheck()\` takes only due rows.
 `,
 
   setup: `# Laravel e-Factura Wrapper — Setup & Installation
@@ -110,7 +110,7 @@ This publishes \`config/efactura.php\`.
 php artisan vendor:publish --tag=efactura-migrations
 \`\`\`
 
-This publishes **10** migration files (3 create the tables, 4 were added in v3.x, and \`..._000008\`, \`..._000009\` and \`..._000010\` in v4.0). The package also loads them itself, so publishing is optional. With \`pipeline_tables\` false only the 3 token migrations (\`000001\`, \`000004\`, \`000009\`) are loaded and published.
+This publishes **11** migration files (3 create the tables, 4 were added in v3.x, and \`..._000008\` to \`..._000011\` in v4.0). The package also loads them itself, so publishing is optional. With \`pipeline_tables\` false only the 3 token migrations (\`000001\`, \`000004\`, \`000009\`) are loaded and published.
 
 ## Step 4: Run Migrations
 
@@ -121,7 +121,7 @@ php artisan migrate
 Creates three tables:
 - \`efactura_tokens\` — OAuth tokens per CUI (credentials encrypted at rest)
 - \`efactura_uploads\` — Upload tracking (polymorphic, unique per model)
-- \`efactura_messages\` — Synced ANAF messages
+- \`efactura_messages\` — Synced ANAF messages, one row per token and ANAF message id
 
 The v3.0.0 migrations are \`..._000004_encrypt_efactura_token_credentials\`,
 \`..._000005_add_failure_reason_to_efactura_uploads_table\` and
@@ -813,7 +813,8 @@ Every behaviour change since v3.1.1 (also in \`CHANGELOG.md\`):
 13. **Laravel 11 is no longer supported:** \`illuminate/*\` is now \`^12.0|^13.0\`.
 14. **OAuth routes:** \`routes.middleware\` defaults to \`['web', 'auth']\` (was \`['web']\`). Add a
     check that the user may act for the CUI (for example \`can:\`), or disable the routes.
-15. **Migration \`000008\` reclassifies** 3.x \`failed\` / \`validation\` rows with an \`upload_index\` and
+15. **Migration \`000008\` reclassifies** pre-4.0 \`failed\` rows with \`validation\` or no
+    \`failure_reason\` (pre-3.0, left unclassified by \`000005\`) with an \`upload_index\` and
     no \`download_id\` (3.x \`nok\` answers without a download id) as \`indeterminate\` (review with
     \`efactura:reconcile\`). 3.x never stored the index on a failed upload answer. Idempotent before 4.0
     writes rows; re-run after a rollback it also moves 4.0's "nepreluat" rows (the safe direction). A 3.x \`validation\` row
@@ -897,10 +898,14 @@ Every behaviour change since v3.1.1 (also in \`CHANGELOG.md\`):
     \`efactura:reconcile\` now refuse while \`enabled\` is false.
 33. **Migration \`000010\`** adds \`efactura_uploads.response_verification\` (\`ResponseVerification\`:
     \`verified\`, \`limits_only\`, \`mismatch\`) and \`next_poll_at\` (index \`(status, next_poll_at)\`).
-    Response ZIPs are checked by the SDK's \`ArchiveInspector\` (needs \`ext-zip\`, \`ext-dom\`); status
+    Response and received-invoice ZIPs are checked by the SDK's \`ArchiveInspector\` (received ones
+    against the limits only) (needs \`ext-zip\`, \`ext-dom\`); status
     reads follow \`PollSchedule\`, so \`CheckUploadStatuses\` reads and fans out to due rows only.
     \`efactura:status --upload=<id>\` still checks at once.
 34. **\`CachedAnafLookup\`:** a cached, fail-closed company check (see the overview topic).
+35. **Migration \`000011\`** makes \`efactura_messages\` unique per \`(efactura_token_id, message_id)\`;
+    sync looks a message up by both, so two connected companies that list the same ANAF id each keep
+    their own row.
 
 ## Upgrading v2 → v3.0
 
@@ -1015,8 +1020,9 @@ while v2 is still serving traffic is only true until the next request reintroduc
 writes stopped (Step 1) the result is authoritative.
 
 **It is no longer catastrophic if you miss one.** Token encryption is ordered **first** (Step 4), so
-an abort here costs you the index and nothing else — e-Factura keeps working. This step saves you a
-failed deploy; it is no longer the difference between working and company-wide outage.
+an abort here no longer leaves tokens unreadable. It still stops the run: the migrations after it
+(\`000007\` onwards) do not run until it succeeds, so keep the workers stopped and the app down until
+it does. This step saves you that failed deploy.
 
 ---
 
@@ -1042,7 +1048,7 @@ Three new migrations run, **in this order**:
 |-------|-----------|--------------|
 | 1st | \`..._000004_encrypt_efactura_token_credentials\` | Encrypts the plaintext \`access_token\` / \`refresh_token\` already in \`efactura_tokens\`. **Ordered first deliberately**: it is the migration that restores service for the v3 code you just deployed, so nothing that can abort is allowed to run ahead of it |
 | 2nd | \`..._000005_add_failure_reason_to_efactura_uploads_table\` | Adds the indexed \`failure_reason\` column; backfills \`rate_limited\` for rows whose legacy \`errors\` text carries a \`RATE_LIMIT_EXCEEDED:\` marker. Anything unrecognised stays \`NULL\` rather than being guessed. **Re-entrant** — an interrupted backfill resumes on the next \`migrate\` instead of wedging on a duplicate-column error |
-| 3rd | \`..._000006_add_unique_uploadable_index_to_efactura_uploads_table\` | Adds the unique \`(uploadable_type, uploadable_id)\` index. **Aborts on pre-3.0 duplicates** before touching this table's schema (Step 2). Ordered last because it is the only one expected to abort |
+| 3rd | \`..._000006_add_unique_uploadable_index_to_efactura_uploads_table\` | Adds the unique \`(uploadable_type, uploadable_id)\` index. **Aborts on pre-3.0 duplicates** before touching this table's schema (Step 2). Ordered after encryption because it is the only one expected to abort; an abort stops the run, so the migrations after it have not run either |
 | 4th | \`..._000007_add_response_attempt_tracking_to_efactura_uploads_table\` | Adds \`response_attempts\` and \`response_failed_at\` so a poisoned \`/descarcare\` body (2xx but not a ZIP) is retried a bounded number of times instead of on every scheduled run forever. Additive columns only; cannot abort |
 
 ### What breaks
@@ -1102,7 +1108,7 @@ the aborting one is not. What you are left with depends on where it stopped:
 |------------|-------|---------|
 | \`..._000004\` (encryption) | Tokens partly or not encrypted. e-Factura is **down** | Idempotent — fix the cause and re-run \`php artisan migrate\`. It resumes safely and cannot double-encrypt |
 | \`..._000005\` (failure_reason) | Tokens **encrypted, service is up**. Column may exist with the backfill unfinished | Re-entrant — re-run \`php artisan migrate\`. It skips the DDL it already did and resumes the backfill |
-| \`..._000006\` (unique index) | Tokens **encrypted, service is up**. Only the index is missing | Resolve the duplicates (Step 2), then re-run \`php artisan migrate\`. No rush — but the pre-3.0 duplicate race stays open until you do |
+| \`..._000006\` (unique index) | Tokens **encrypted**. The index is missing **and \`000007\` onwards have not run** (Laravel stops at the first failure). The code writes their columns, from queue workers and web requests alike, so with the app up every upload ANAF accepts is parked for reconciliation | Do not run Step 5: keep the queue workers stopped and the app down until \`php artisan migrate\` finishes. Resolve the duplicates (Step 2), then re-run \`php artisan migrate\`. If service must resume first, run each later migration (\`000007\` onwards) with \`php artisan migrate --path=…\` (one \`--path\` per file, or your published copies), then run Step 5. The pre-3.0 duplicate race stays open until the index exists |
 
 **Emergency lever — restore service immediately.** If you are down and need tokens working *now*,
 without first resolving duplicates or anything else, run the encryption migration on its own:
@@ -1469,7 +1475,7 @@ These were broken in v2 and are fixed in v3. Expect **new** traffic and **new** 
 - **Message sync actually runs.** It read \`$response->messages\`, a property the SDK never declared,
   and the exception was swallowed — so every run "succeeded" while syncing **zero** messages. It now
   reads \`$response->mesaje\`. Your first sync after upgrading may create a large batch of
-  \`EfacturaMessage\` rows (60-day lookback) and fire \`InvoiceReceived\` for each downloaded invoice.
+  \`EfacturaMessage\` rows (60-day lookback) and fire \`InvoiceReceived\` for each downloaded invoice or buyer message.
   Make sure those listeners can cope with a burst.
 - **Token refresh actually works.** The wrapper held the same cache lock the SDK acquires internally;
   since Laravel locks are not re-entrant, refresh deadlocked against itself and threw

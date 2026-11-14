@@ -34,11 +34,12 @@ use Illuminate\Support\Facades\Schema;
  * skipping the constraint — is not a decision a migration gets to make about legal
  * records. Resolve them, then re-run. See the v3 upgrade notes.
  *
- * RUNS LAST, DELIBERATELY. This is the only v3 migration that is EXPECTED to abort,
- * so it is numbered behind the ones that must not be stranded by an abort — above
- * all the token-encryption migration, which is what restores service for the v3 code
- * that is already deployed. An abort here now costs only this index: the tokens are
- * encrypted and e-Factura keeps working. See MigrationOrderTest.
+ * ORDERED AFTER TOKEN ENCRYPTION. This is the only migration EXPECTED to abort, so
+ * the token-encryption migration (which restores service for the code already
+ * deployed) runs before it. An abort here still stops the run: the later migrations
+ * (000007 onwards) have not run either, and the code writes their columns, so keep
+ * the queue workers stopped and the application down until `migrate` finishes. See
+ * MigrationOrderTest.
  *
  * COST: on a large efactura_uploads this is not free. Building a unique index takes
  * a brief exclusive metadata lock and can run for minutes on millions of rows, and
@@ -100,10 +101,12 @@ return new class extends Migration
             .'Affected models (first 20):'.PHP_EOL.$examples.PHP_EOL.PHP_EOL
             .'Review each against ANAF, keep the row reflecting the real filing, remove the '
             .'rest, then re-run `php artisan migrate`.'.PHP_EOL.PHP_EOL
-            .'This abort is safe to take your time over: it is the LAST v3 migration, so the '
-            .'ones before it — including token encryption — have already run. e-Factura keeps '
-            .'working. Only this index is missing, which means the pre-3.0 duplicate race stays '
-            .'open until you finish.'
+            .'Keep the queue workers stopped and the application down until `php artisan migrate` '
+            .'finishes: token encryption has run, but the migrations after this one (000007 '
+            .'onwards) have not, and the code writes their columns. If service must resume '
+            .'before the duplicates are resolved, first run each later migration on its own '
+            .'with `php artisan migrate --path=<its file>`. The pre-3.0 duplicate race stays '
+            .'open until this index exists.'
         );
     }
 };

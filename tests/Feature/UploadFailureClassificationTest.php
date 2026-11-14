@@ -942,3 +942,17 @@ describe('the XML file of an attempt that was not sent', function () {
             ->and(Storage::disk('local')->exists($upload->fresh()->xml_path))->toBeTrue();
     });
 });
+
+describe('a B2C upload', function () {
+    it('sends the standard it was queued with to /uploadb2c', function () {
+        Http::fake([UPLOAD_URL => Http::response(
+            '<?xml version="1.0"?><header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" ExecutionStatus="0" index_incarcare="5001130256"/>'
+        )]);
+        makeUblSpy(fn () => null);
+
+        $this->uploadService->processUpload($this->uploadService->queueB2CUpload($this->invoice, ['standard' => 'CN']));
+
+        Http::assertSent(fn ($request) => str_contains($request->url(), '/uploadb2c?')
+            && str_contains($request->url(), 'standard=CN'));
+    });
+});

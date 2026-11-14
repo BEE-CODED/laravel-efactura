@@ -1,6 +1,7 @@
 <?php
 
 use BeeCoded\EFactura\Enums\FailureReason;
+use BeeCoded\EFactura\Enums\StatusCheckOutcome;
 use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Events\InvoiceFailed;
 use BeeCoded\EFactura\Events\InvoiceProcessed;
@@ -44,10 +45,7 @@ describe('DownloadService', function () {
                 'standard' => 'UBL',
             ]);
 
-            // Should not call any token service methods
-            $this->downloadService->checkStatus($upload);
-
-            expect(true)->toBeTrue();
+            expect($this->downloadService->checkStatus($upload))->toBe(StatusCheckOutcome::NotPollable);
         });
 
         it('skips terminal status uploads', function () {
@@ -60,10 +58,7 @@ describe('DownloadService', function () {
                 'standard' => 'UBL',
             ]);
 
-            // Should not call any token service methods
-            $this->downloadService->checkStatus($upload);
-
-            expect(true)->toBeTrue();
+            expect($this->downloadService->checkStatus($upload))->toBe(StatusCheckOutcome::NotPollable);
         });
 
         it('skips upload with missing token', function () {
@@ -233,10 +228,11 @@ describe('DownloadService', function () {
                 'standard' => 'UBL',
             ]);
 
-            // Should not call any token service methods
+            $this->tokenService->shouldNotReceive('executeWithClient');
+
             $this->downloadService->downloadResponse($upload);
 
-            expect(true)->toBeTrue();
+            expect($upload->fresh()->response_attempts)->toBe(0);
         });
 
         it('skips upload with existing response_path', function () {
@@ -250,10 +246,11 @@ describe('DownloadService', function () {
                 'standard' => 'UBL',
             ]);
 
-            // Should not call any token service methods
+            $this->tokenService->shouldNotReceive('executeWithClient');
+
             $this->downloadService->downloadResponse($upload);
 
-            expect(true)->toBeTrue();
+            expect($upload->fresh()->response_attempts)->toBe(0);
         });
 
         it('skips upload with missing token', function () {
@@ -333,10 +330,11 @@ describe('DownloadService', function () {
                 'is_downloaded' => true,
             ]);
 
-            // Should not call any token service methods
+            $this->tokenService->shouldNotReceive('executeWithClient');
+
             $this->downloadService->downloadMessage($message);
 
-            expect(true)->toBeTrue();
+            expect($message->fresh()->download_attempts)->toBe(0);
         });
 
         it('skips messages without download_id', function () {
@@ -348,10 +346,11 @@ describe('DownloadService', function () {
                 'is_downloaded' => false,
             ]);
 
-            // Should not call any token service methods
+            $this->tokenService->shouldNotReceive('executeWithClient');
+
             $this->downloadService->downloadMessage($message);
 
-            expect(true)->toBeTrue();
+            expect($message->fresh()->download_attempts)->toBe(0);
         });
 
         it('skips messages with missing token', function () {
