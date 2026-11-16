@@ -205,7 +205,7 @@ Preparation (steps 3–4) is strictly **before** anything is transmitted, so a f
 **Rate limit handling:** two distinct mechanisms, depending on *when* the limit is hit:
 
 - **Pre-flight (step 1)** — quota already exhausted: the job \`release()\`s itself with a delay matching the bucket reset (min 10s) and returns. The upload row stays \`Pending\` (v4.0: only its \`updated_at\` is touched, so \`ProcessPendingUploads\` does not add a second job), and **no event fires**.
-- **Mid-call** — the limit is hit during the API call. \`UploadService\` releases the row back to \`Pending\` with \`failure_reason = rate_limited\` and fires **\`InvoiceRateLimited\`** (*not* \`InvoiceFailed\`). \`ProcessSingleUpload\` re-reads the row, sees \`Pending\` / \`rate_limited\`, and \`release(60)\`s itself.
+- **Mid-call** — the limit is hit during the API call. \`UploadService\` releases the row back to \`Pending\` with \`failure_reason = rate_limited\` and fires **\`InvoiceRateLimited\`** (*not* \`InvoiceFailed\`). \`ProcessSingleUpload\` re-reads the row, sees \`Pending\` / \`rate_limited\`, and \`release()\`s itself for the limiter's \`retryAfterSeconds\`, at least 60 s (at most 12 h per release; after ANAF's own 429, 60 s). Re-queueing the row meanwhile updates it but does not dispatch it again: the dispatchers skip a rate-limited row, so the waiting job sends it when the wait ends.
 
 > **Changed in v3.0.0.** The mid-call path used to write a \`RATE_LIMIT_EXCEEDED:\` marker into the
 > free-text \`errors\` payload and fire \`InvoiceFailed\` — a false alarm followed by a successful
@@ -258,7 +258,7 @@ The package schedules nothing itself. This is the one recommended cadence per jo
 | \`SyncMessages\` | Hourly | Without a CUI it dispatches one job per active CUI. Each pages through the last 60 days: one paginated-list call per 500 messages (SDK \`paginated_list_per_day_cui\`, default 50,000) |
 | \`DownloadReceivedInvoices\` | Hourly | Downloads what \`SyncMessages\` listed; each message's download uses one of its 5 daily downloads. Without a CUI it dispatches one job per active CUI with invoices to download |
 
-\`jobs.max_staleness_seconds\` (120) is shorter than every interval, so a run delayed in the queue is dropped instead of overlapping the next one.
+\`jobs.max_staleness_seconds\` (120) is shorter than every interval, so a \`ProcessPendingUploads\`, \`CheckUploadStatuses\`, \`DownloadResponses\` or \`SyncMessages\` run delayed in the queue is dropped instead of overlapping the next one (only these four use \`DiscardsWhenStale\`; a late \`DownloadReceivedInvoices\`, \`RetryRateLimitedUploads\` or \`SweepStaleUploads\` still runs).
 
 \`\`\`php
 // In routes/console.php (Laravel 11+) or app/Console/Kernel.php

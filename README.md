@@ -105,7 +105,8 @@ The full list is in [CHANGELOG.md](CHANGELOG.md). Every behaviour change since v
     laravel/framework 12.27.1 or later, through the SDK).
 15. **The OAuth routes require a logged-in user by default:** `routes.middleware` is now
     `['web', 'auth']` (it was `['web']`). `auth` alone still lets any logged-in user authorise any
-    CUI: add your own check, or disable the routes. A published `config/efactura.php` keeps the
+    CUI: add your own check (a `can:` gate also runs on the callback with a null CUI), or disable
+    the routes. A published `config/efactura.php` keeps the
     value it has. See [OAuth Flow](#oauth-flow).
 16. **Migration `000008` reclassifies pre-4.0 rows.** It also moves pre-4.0 `failed` /
     `validation` rows, or failed rows with no `failure_reason` (a pre-3.0 failure migration `000005`
@@ -124,8 +125,8 @@ The full list is in [CHANGELOG.md](CHANGELOG.md). Every behaviour change since v
     `AuthenticationException`); a worker that waited on the refresh lock while the grant was refused
     does not ask again. An upload refused this way stays `pending` and its job sleeps the rest of
     the cooldown without building its XML or spending a transient attempt; the dispatchers add no
-    job for it meanwhile, and a status run logs the cooldown once per grant instead of an error per
-    row. **A grant that stays refused leaves its uploads `pending` for at most
+    job for it meanwhile, and a status or download run logs the cooldown once per grant instead of an
+    error per row. **A grant that stays refused leaves its uploads `pending` for at most
     `rate_limit.retry_window_hours` (24 h), then abandons them with `InvoiceFailed`.** Usually
     sooner: after each cooldown the next caller asks ANAF again, and when that caller is an upload
     job the refusal spends one of its transient attempts, so an upload whose grant stays refused is
@@ -150,9 +151,11 @@ The full list is in [CHANGELOG.md](CHANGELOG.md). Every behaviour change since v
     `queueUpload()` recycles a failed row only if it is still in the state it read (another worker
     may have re-driven it), and resets `response_attempts`, `response_failed_at` and
     `status_failures`. The transient cap (`jobs.max_transient_attempts`) counts transient failures
-    of one queued job; rate-limit releases no longer use it up. An XML file that cannot be stored is
-    a `transient` failure (it was `validation`) and fires no `InvoiceFailed`.
-19. **Status checks and downloads** record an answer only on a row that is still `Processing` (a
+    of one queued job; rate-limit releases no longer use it up. An XML file that cannot be stored,
+    or a database error while the invoice is built, is a `transient` failure (it was `validation`)
+    and fires no `InvoiceFailed`.
+19. **Status checks and downloads** record an answer only on a row that is still `Processing` under
+    the upload index that was asked about (a
     response only when none is stored yet and the row still has the download id that was fetched),
     and fire `InvoiceFailed` / `InvoiceProcessed` only for
     the run that recorded it, so overlapping runs announce it once. The `InvoiceFailed` of a `nok`
@@ -955,10 +958,19 @@ middleware in `config/efactura.php`:
 'middleware' => ['web', 'auth', 'can:authorize-efactura,cui'],
 ```
 
-(a Gate you define that receives the `cui` route parameter), or set `EFACTURA_ROUTES_ENABLED=false`
-and run the flow from your own controller with `EFactura::getAuthorizationUrl()` and your own
-callback. The callback route needs the same logged-in browser session, including when the flow was
-started with `php artisan efactura:auth`.
+The same stack also runs on `efactura/callback`, which has no `{cui}`, so there the gate receives
+`null`. It must allow that, or no callback completes: a `string $cui` parameter throws a `TypeError`
+(500), and a check for the CUI answers 403.
+
+```php
+Gate::define('authorize-efactura', fn ($user, ?string $cui = null) => $cui === null || $user->mayActFor($cui)); // mayActFor: your own check
+```
+
+The callback needs no CUI check. It only completes a state that the same session and user started
+through `auth/{cui}` (below), or a URL from `efactura:auth`. Alternatively, set
+`EFACTURA_ROUTES_ENABLED=false` and run the flow from your own controller with
+`EFactura::getAuthorizationUrl()` and your own callback. The callback route needs the same logged-in
+browser session, including when the flow was started with `php artisan efactura:auth`.
 
 **The state is bound to who started it.** An authorization started through `efactura/auth/{cui}` is
 tied to that browser session (a random nonce kept in the session) and to the logged-in user; the
@@ -1102,8 +1114,10 @@ quotas named are the SDK's daily per-message and per-CUI limits (`config/efactur
 | `DownloadReceivedInvoices` | Hourly | Downloads what `SyncMessages` listed; each message's download uses one of its 5 daily downloads. Without a CUI it dispatches one job per active CUI with invoices to download |
 
 A faster cadence than this mainly spends those quotas sooner. `jobs.max_staleness_seconds` (120)
-is shorter than every interval, so a run delayed in the queue is dropped instead of overlapping the
-next one; the per-CUI jobs a run without a CUI dispatches are never dropped, since they wait behind
+is shorter than every interval, so a `ProcessPendingUploads`, `CheckUploadStatuses`,
+`DownloadResponses` or `SyncMessages` run delayed in the queue is dropped instead of overlapping the
+next one (only these four use `DiscardsWhenStale`; a late `DownloadReceivedInvoices`,
+`RetryRateLimitedUploads` or `SweepStaleUploads` still runs). The per-CUI jobs a run without a CUI dispatches are never dropped, since they wait behind
 each other. A per-CUI `CheckUploadStatuses`, `DownloadResponses` or `DownloadReceivedInvoices` run also
 never starts while another run for the same CUI is still working (`WithoutOverlapping`; the second
 one is dropped, not delayed), so a run that outlasts a short interval does not poll the same rows
@@ -1181,9 +1195,13 @@ Cadences: see [Recommended schedule](#recommended-schedule).
   and no event fires
 - If the limit is hit **during** the upload, the row is released back to `pending` /
   `failure_reason = rate_limited`, `InvoiceRateLimited` fires (**not** `InvoiceFailed`), and the job
-  releases with a 60-second delay. The row is deliberately **not** marked `Failed`: it never left the
+  releases after the SDK limiter's `retryAfterSeconds` (for example up to 24 h for the daily RASP
+  limit; at most 12 h per release, then it waits again for the rest), at least 60 seconds; after
+  ANAF's own 429, 60 seconds. Re-queueing the row while it waits (for example with other
+  options) updates the row but does not dispatch it again: the dispatchers skip a rate-limited row,
+  so the waiting job sends it when the wait ends. The row is deliberately **not** marked `Failed`: it never left the
   pipeline, and `Failed` would make `isEfacturaProcessed()` report `true` for an upload that flips
-  back to `pending` a minute later
+  back to `pending` later
 - Transient failures (auth blips) are re-driven after `EFACTURA_JOB_TRANSIENT_RETRY_DELAY` (default
   30s), capped at `EFACTURA_JOB_MAX_TRANSIENT_ATTEMPTS` (default 5) transient failures of one queued
   job, counted in the cache for the retry window (rate-limit releases do not count); once exhausted
@@ -1391,14 +1409,16 @@ Pending → Uploading → Processing → Completed
 
 ## Status Check Outcomes
 
-`CheckUploadStatuses` (and `CheckSingleUploadStatus`, `efactura:status`) polls every `Processing`
-upload with `DownloadService::checkStatus()`, which reads each answer through the SDK's
+`CheckUploadStatuses` (and `efactura:status` without `--upload`) polls every `Processing` upload
+whose `next_poll_at` is due (null or past); `CheckSingleUploadStatus` and `efactura:status --upload`
+read the one upload they are given straight away. Each read goes through
+`DownloadService::checkStatus()`, which reads each answer through the SDK's
 `StatusResponseData::verdict()`. A download id is ANAF's digits (1 to 64); any other id cannot be
 downloaded and counts as no download id.
 
 | ANAF answer or failure | Result |
 |------------------------|--------|
-| `in prelucrare` | Nothing changes; the next run polls again |
+| `in prelucrare` | Stays `Processing`; `next_poll_at` is set from the SDK's `PollSchedule` (1, 5, 15, then 60 minutes as the upload ages) and `CheckUploadStatuses` skips it until then |
 | `ok` with a download id | `Completed`; `DownloadResponses` then downloads the response and fires `InvoiceProcessed` |
 | `ok` without a download id | `Completed` with `download_id = null` and a note in `errors`. Filed, but no response can be downloaded, so `InvoiceProcessed` never fires for it |
 | `nok` with a download id | `Failed` / `validation` + `InvoiceFailed`; the error report is downloaded later |
@@ -1411,8 +1431,9 @@ downloaded and counts as no download id.
 | The upload's per-message status limit (SDK `RateLimitScope::Status`) | This upload is skipped, not counted; the batch carries on |
 | A global SDK limit, any other rate limit, or ANAF's 429 | The batch stops; the next run carries on |
 
-An answer is recorded only while the upload is still `Processing`, and its event fires only for the
-run that recorded it, so overlapping runs never announce one answer twice.
+An answer is recorded only while the upload is still `Processing` under the index that was asked
+about, and its event fires only for the run that recorded it, so overlapping runs never announce one
+answer twice.
 
 Response and received-invoice downloads follow the same rules: a permanent failure is counted (3
 attempts), a transient one is retried, a per-message download limit (`RateLimitScope::Download`)

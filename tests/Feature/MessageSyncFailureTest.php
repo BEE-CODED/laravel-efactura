@@ -14,6 +14,7 @@ use BeeCoded\EFactura\Jobs\SyncMessages;
 use BeeCoded\EFactura\Models\EfacturaMessage;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Services\MessageSyncService;
+use BeeCoded\EFacturaSdk\Enums\MessageFilter;
 use BeeCoded\EFacturaSdk\Exceptions\ApiException;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Carbon;
@@ -430,4 +431,18 @@ describe('SyncMessages job', function () {
         // behavioural difference from the batch path above.
         expect(fn () => SyncMessages::dispatch('12345678'))->toThrow(ApiException::class);
     });
+});
+
+describe('message filters', function () {
+    it('sends the filter of each public sync to ANAF', function (Closure $sync, string $filtru) {
+        Http::fake([MESSAGES_URL => Http::response(anafMessagesBody('12345678'))]);
+
+        $sync($this->messageSyncService, makeSyncToken('12345678'));
+
+        expect(syncQueries()->sole()['filtru'] ?? null)->toBe($filtru);
+    })->with([
+        'syncSentMessages' => [fn (MessageSyncService $service, EfacturaToken $token) => $service->syncSentMessages($token), 'T'],
+        'syncReceivedMessages' => [fn (MessageSyncService $service, EfacturaToken $token) => $service->syncReceivedMessages($token), 'P'],
+        'syncAllMessages' => [fn (MessageSyncService $service) => $service->syncAllMessages(MessageFilter::InvoiceSent), 'T'],
+    ]);
 });

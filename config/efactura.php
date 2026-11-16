@@ -186,8 +186,10 @@ return [
     |             but `auth` alone lets ANY logged-in user start an authorization
     |             for ANY CUI. Add your own check that the user may act for that
     |             company (for example a `can:` middleware on the `cui` route
-    |             parameter), or disable these routes and run the flow from your
-    |             own controller. The callback also needs the logged-in browser,
+    |             parameter; the stack also runs on the callback, where that gate
+    |             receives a null CUI and must allow it, see the README's OAuth
+    |             Flow), or disable these routes and run the flow from your own
+    |             controller. The callback also needs the logged-in browser,
     |             including after the `efactura:auth` command.
     |
     */

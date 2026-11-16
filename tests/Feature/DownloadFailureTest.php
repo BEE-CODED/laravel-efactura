@@ -165,6 +165,28 @@ describe('checkStatus', function () {
         Event::assertDispatched(InvoiceFailed::class, fn (InvoiceFailed $e) => $e->errors !== []);
         Http::assertNotSent(fn ($request) => str_contains($request->url(), '/descarcare'));
     });
+
+    it('records no answer for the previous index on a row sent again meanwhile', function (Closure $answer) {
+        Event::fake([InvoiceFailed::class]);
+        $upload = makeProcessingUpload($this->token);
+        Http::fake([STATUS_URL => function () use ($upload, $answer) {
+            // Failed, re-queued and sent again under a new index while ANAF answered.
+            EfacturaUpload::whereKey($upload->id)->update(['upload_index' => '5001130256']);
+
+            return $answer();
+        }]);
+
+        $this->downloadService->checkStatus($upload);
+
+        $upload->refresh();
+        expect([$upload->status, $upload->upload_index, $upload->failure_reason, $upload->download_id, $upload->next_poll_at])
+            ->toBe([UploadStatus::Processing, '5001130256', null, null, null]);
+        Event::assertNotDispatched(InvoiceFailed::class);
+    })->with([
+        'nok' => [fn () => anafStatus('nok', '3001130059')],
+        'ok' => [fn () => anafStatus('ok', '3001130059')],
+        'in prelucrare' => [fn () => anafStatus('in prelucrare')],
+    ]);
 });
 
 describe('downloadResponse', function () {
@@ -549,9 +571,9 @@ describe('status answers without a download id', function () {
      * ANAF's download ids are digits. Any other id cannot be downloaded, so it is no verdict
      * on the document: as if ANAF had named none.
      */
-    it('reads a download id that is not digits as none', function (string $stare, UploadStatus $status, ?FailureReason $reason) {
+    it('reads a download id that is not digits as none', function (Closure $answer, UploadStatus $status, ?FailureReason $reason) {
         Event::fake([InvoiceFailed::class]);
-        Http::fake([STATUS_URL => anafStatus($stare, 'DL999')]);
+        Http::fake([STATUS_URL => $answer()]);
 
         $upload = makeProcessingUpload($this->token);
 
@@ -560,8 +582,10 @@ describe('status answers without a download id', function () {
         $upload->refresh();
         expect([$upload->status, $upload->failure_reason, $upload->download_id])->toBe([$status, $reason, null]);
     })->with([
-        'ok' => ['ok', UploadStatus::Completed, null],
-        'nok' => ['nok', UploadStatus::Failed, FailureReason::Indeterminate],
+        'ok' => [fn () => anafStatus('ok', 'DL999'), UploadStatus::Completed, null],
+        'nok' => [fn () => anafStatus('nok', 'DL999'), UploadStatus::Failed, FailureReason::Indeterminate],
+        'error answer' => [fn () => Http::response(['eroare' => 'Nu aveti dreptul', 'id_descarcare' => 'DL999']), UploadStatus::Failed, FailureReason::Indeterminate],
+        'unrecognised status' => [fn () => anafStatus('necunoscut', 'DL999'), UploadStatus::Failed, FailureReason::Indeterminate],
     ]);
 });
 
@@ -670,6 +694,27 @@ describe('permanent status-check failures', function () {
         expect($upload->status)->toBe(UploadStatus::Processing)
             ->and($upload->status_failures)->toBe(2);
     });
+
+    it('leaves the count of a row sent again meanwhile', function (Closure $answer) {
+        config(['efactura.polling.max_status_failures' => 2]);
+        $upload = makeProcessingUpload($this->token);
+        $upload->update(['status_failures' => 1]);
+        Http::fake([STATUS_URL => function () use ($upload, $answer) {
+            // Sent again under a new index, with a count of its own, while ANAF answered.
+            EfacturaUpload::whereKey($upload->id)->update(['upload_index' => '5001130256', 'status_failures' => 1]);
+
+            return $answer();
+        }]);
+
+        $this->downloadService->checkStatus($upload->refresh());
+
+        $upload->refresh();
+        expect([$upload->status, $upload->upload_index, $upload->failure_reason, $upload->status_failures])
+            ->toBe([UploadStatus::Processing, '5001130256', null, 1]);
+    })->with([
+        'a permanent failure' => [fn () => Http::response(['eroare' => 'Bad request'], 400)],
+        'an answer' => [fn () => anafStatus('in prelucrare')],
+    ]);
 });
 
 describe('permanent download failures', function () {
@@ -928,5 +973,37 @@ describe('a throwing listener after a recorded download state', function () {
         $message->refresh();
         expect($message->is_downloaded)->toBeTrue()
             ->and($message->download_attempts)->toBe(0);
+    });
+});
+
+describe('per-CUI batch jobs', function () {
+    it('changes only the rows of the CUI the job is given', function () {
+        Storage::fake('local');
+        Http::fake([
+            STATUS_URL => anafStatus('in prelucrare'),
+            DOWNLOAD_URL => Http::response(responseZip(), 200, ['Content-Type' => 'application/zip']),
+        ]);
+        $other = EfacturaToken::create(['cui' => '87654321', 'access_token' => 'ACCESS2', 'refresh_token' => 'REFRESH2', 'expires_at' => now()->addHour(), 'is_active' => true]);
+        $upload = fn (array $attributes) => EfacturaUpload::create(['efactura_token_id' => $other->id, 'uploadable_type' => 'App\\Models\\Invoice', 'standard' => 'UBL', ...$attributes]);
+        $message = fn (EfacturaToken $token, string $id) => EfacturaMessage::create(['efactura_token_id' => $token->id, 'message_id' => $id, 'type' => 'received', 'download_id' => $id, 'is_downloaded' => false]);
+
+        $poll = makeProcessingUpload($this->token);
+        $response = makeCompletedUpload($this->token);
+        $received = $message($this->token, '4001130001');
+        $otherPoll = $upload(['uploadable_id' => 3, 'status' => UploadStatus::Processing, 'upload_index' => '5001130299']);
+        $otherResponse = $upload(['uploadable_id' => 4, 'status' => UploadStatus::Completed, 'download_id' => '3001130099']);
+        $otherReceived = $message($other, '4001130099');
+
+        (new CheckUploadStatuses('12345678'))->handle($this->downloadService);
+        (new DownloadResponses('12345678'))->handle($this->downloadService);
+        (new DownloadReceivedInvoices('12345678'))->handle($this->downloadService);
+
+        expect($poll->refresh()->next_poll_at)->not->toBeNull()
+            ->and($response->refresh()->response_path)->not->toBeNull()
+            ->and($received->refresh()->is_downloaded)->toBeTrue()
+            ->and($otherPoll->refresh()->next_poll_at)->toBeNull()
+            ->and($otherResponse->refresh()->response_path)->toBeNull()
+            ->and($otherReceived->refresh()->is_downloaded)->toBeFalse();
+        Http::assertSentCount(3);
     });
 });

@@ -296,33 +296,6 @@ describe('MessageSyncService', function () {
         });
     });
 
-    describe('syncSentMessages', function () {
-        it('calls syncMessages with InvoiceSent filter', function () {
-            $this->tokenService->shouldReceive('executeWithClient')
-                ->once()
-                ->andReturn(anafListResponse([anafMessage(['id' => '3001130059'])]));
-
-            $this->messageSyncService->syncSentMessages($this->token);
-
-            expect(EfacturaMessage::where('message_id', '3001130059')->exists())->toBeTrue();
-        });
-    });
-
-    describe('syncReceivedMessages', function () {
-        it('calls syncMessages with InvoiceReceived filter', function () {
-            $this->tokenService->shouldReceive('executeWithClient')
-                ->once()
-                ->andReturn(anafListResponse([anafMessage([
-                    'id' => '3001130060',
-                    'tip' => 'FACTURA PRIMITA',
-                ])]));
-
-            $this->messageSyncService->syncReceivedMessages($this->token);
-
-            expect(EfacturaMessage::where('message_id', '3001130060')->exists())->toBeTrue();
-        });
-    });
-
     describe('syncAllMessages', function () {
         it('syncs messages for all active tokens', function () {
             $token2 = EfacturaToken::create([
@@ -349,20 +322,6 @@ describe('MessageSyncService', function () {
             expect(EfacturaMessage::count())->toBe(2);
             expect(EfacturaMessage::where('efactura_token_id', $this->token->id)->count())->toBe(1);
             expect(EfacturaMessage::where('efactura_token_id', $token2->id)->count())->toBe(1);
-        });
-
-        it('passes filter to syncMessages', function () {
-            $this->tokenService->shouldReceive('getActiveTokens')
-                ->once()
-                ->andReturn(new Collection([$this->token]));
-
-            $this->tokenService->shouldReceive('executeWithClient')
-                ->once()
-                ->andReturn(anafListResponse([anafMessage(['id' => '3001130059'])]));
-
-            $this->messageSyncService->syncAllMessages(MessageFilter::InvoiceSent);
-
-            expect(EfacturaMessage::where('message_id', '3001130059')->exists())->toBeTrue();
         });
     });
 

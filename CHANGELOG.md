@@ -16,8 +16,10 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
   `orchestra/testbench` `^10.0|^11.0` for development), matching the SDK 4.0 requirement.
 - `routes.middleware` defaults to `['web', 'auth']` (it was `['web']`): a guest can no longer start
   an authorization. `auth` does not check that the user may act for the CUI; gate the
-  `efactura/auth/{cui}` route yourself (for example a `can:` middleware) or disable the routes. The
-  callback also needs the logged-in browser, including after `efactura:auth`. A published config
+  `efactura/auth/{cui}` route yourself (for example a `can:` middleware; a `can:` gate in
+  `routes.middleware` also runs on `efactura/callback` with a null CUI and must allow it, see the
+  README's OAuth Flow) or disable the routes. The callback also needs the logged-in browser,
+  including after `efactura:auth`. A published config
   keeps its value.
 - An authorization started through the `efactura/auth/{cui}` route is bound to that browser session
   and user: the callback refuses it ("Invalid or expired state parameter") in another session or for
@@ -131,6 +133,7 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
 - Status answers are read through the SDK's `StatusResponseData::verdict()`. A download id that is
   not ANAF's digits (1 to 64) cannot be downloaded and counts as none: `ok` with one is `Completed`
   with `download_id = null`, `nok` with one is `Failed` / `indeterminate` (both stored the id before).
+  An error-only or unrecognised answer that names such an id is parked `indeterminate` without it.
 - Status answers: `ok` without a download id is `Completed` with `download_id = null` and a note in
   `errors`; no response is downloaded, so `InvoiceProcessed` does not fire for it.
 - Status answers: `nok` without a download id is `Failed` / `indeterminate`, keeping the upload
@@ -194,8 +197,8 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
   `InvoiceFailed`; usually sooner, because after each cooldown the next caller asks ANAF again and
   an upload job's refusal spends one transient attempt, so a lone upload is abandoned after about
   (`jobs.max_transient_attempts` − 1) × the 15-minute cooldown (about an hour at the defaults). The cooldown also
-  refuses calls while the access token still has its last 120 seconds or less to run. A status run skips the grant's rows and logs the cooldown once per grant, as a
-  warning, instead of an error per row. A new grant is tried at once. Tokens are not deactivated
+  refuses calls while the access token still has its last 120 seconds or less to run. A status or download run skips the grant's rows and logs the cooldown once per
+  grant, as a warning, instead of an error per row. A new grant is tried at once. Tokens are not deactivated
   automatically.
 - The wrapper's refresh lock is held for the SDK HTTP timeout (rounded up) plus 30 seconds, like
   the SDK's own lock, instead of a fixed 120 seconds.
@@ -227,12 +230,24 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
   (`efactura:upload:{id}:transient:{job uuid}`, kept for `rate_limit.retry_window_hours`) instead of
   `attempts()`, so rate-limit releases no longer use it up. A run without a queue job (`handle()`
   called directly) counts under an id of its own.
+- A `ProcessSingleUpload` whose upload the SDK's limiter refused waits the limiter's
+  `retryAfterSeconds` (stored in the cache as `efactura:upload:{id}:rate_limited_until`), at least
+  60 seconds and at most 12 hours per release (SQS refuses a longer one; the next run reads the rest
+  of the wait), instead of rebuilding the XML every minute; after ANAF's own 429 it still waits 60
+  seconds. New `UploadService::rateLimitWaitSeconds()`. Re-queueing the row while its job
+  waits (for example with other options) updates the row but does not dispatch it again: the
+  dispatchers skip a rate-limited row, so the waiting job sends it when the wait ends; the daily RASP limit can mean
+  up to 24 hours.
 - An XML file, response or received invoice that cannot be written to the storage disk (`put()`
   returns `false` or throws) is an error. For an upload it is `transient` (it was `validation`) and
-  fires no `InvoiceFailed`; a download is logged and retried by the next run without counting
+  fires no `InvoiceFailed`. A database error (`QueryException`) while the invoice is built
+  (`toEfacturaData()`) is `transient` too (it was `validation`) and fires no `InvoiceFailed`; a download is logged and retried by the next run without counting
   against the download attempts. `failBeforeTransmission()` fires `InvoiceFailed` only for a reason
   that is not retried.
-- Status checks record an answer only on a row that is still `Processing`, and response downloads
+- Status checks record an answer only on a row that is still `Processing` under the upload index
+  they asked about (a row sent again meanwhile keeps its state, including `next_poll_at`
+  and `status_failures`), and
+  response downloads
   store a path only when none is stored and the row still has the download id they fetched, so
   overlapping runs fire `InvoiceFailed` / `InvoiceProcessed` once and a row re-queued meanwhile
   gets no old file. The `InvoiceFailed` of a `nok` with a download id carries ANAF's errors.
@@ -317,8 +332,8 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
 
 - Status answers (`DownloadService`), response paths, recycled failed rows (`EfacturaUpload`),
   received-invoice downloads (`EfacturaMessage`) and refreshed grants (`EfacturaToken`) are written
-  with query-builder updates guarded on the state they expect (`status = processing`,
-  `response_path IS NULL` and the fetched `download_id`, `is_downloaded = false`, an older
+  with query-builder updates guarded on the state they expect (`status = processing` and the polled
+  `upload_index`, `response_path IS NULL` and the fetched `download_id`, `is_downloaded = false`, an older
   `expires_at`), so overlapping runs
   cannot both apply one answer. Eloquent's `updating` / `updated` / `saving` / `saved` events and
   model observers do not fire for them.
@@ -396,6 +411,10 @@ Every behaviour change since 3.1.1. The README's "Upgrading to v4.0" section exp
 - A failed row that was recycled long after it was first queued and then failed transiently was
   never retried by `RetryRateLimitedUploads` (its age counted from its first attempt).
 - Every re-drive of a rate-limited upload left another XML file behind (about one a minute).
+- A `pending` upload queued again with other options (`queueB2CUpload()`, `standard`, `extern`,
+  `self_billed`) while a worker was preparing it was sent with the old options. The claim now also
+  checks those options: the worker sends nothing, the row stays `pending`, and the next attempt
+  sends it with the new options.
 - In an app with a morph map the trait helpers and scopes (`isUploadedToEfactura()`,
   `notUploadedToEfactura()`, …) never saw the upload, because the row stored the class name.
 - An authorization started on the web could be completed by another browser: whoever got a user to

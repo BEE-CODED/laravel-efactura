@@ -111,12 +111,16 @@ class ProcessSingleUpload implements ShouldQueue
         $reason = $this->upload->failure_reason;
 
         // A rate-limited upload never leaves Pending — it is still in the pipeline, waiting
-        // out ANAF's quota, so there is no failed state to reset. Pending with no reason was
-        // refused by the token refresh cooldown before anything was sent. Either way wait, at
-        // least the rest of a running cooldown, without spending a transient attempt.
+        // out ANAF's quota, so there is no failed state to reset; it waits at least the SDK
+        // limiter's retryAfterSeconds. Pending with no reason was refused by the token refresh
+        // cooldown, or lost its claim to a re-queue with other options, before anything was
+        // sent. Either way wait, at least the rest of a running cooldown, without spending a
+        // transient attempt.
         if ($this->upload->isPending() && ($reason === null || $reason === FailureReason::RateLimited)) {
             $cooldown = $this->upload->token ? app(TokenService::class)->refreshCooldownSeconds($this->upload->token) : 0;
-            $delay = max($cooldown, $this->retryDelayFor($reason ?? FailureReason::Transient));
+            // SQS refuses a release over 12 h; the next run reads the remaining wait again.
+            $wait = $reason === FailureReason::RateLimited ? min($uploadService->rateLimitWaitSeconds($this->upload), 43200) : 0;
+            $delay = max($cooldown, $wait, $this->retryDelayFor($reason ?? FailureReason::Transient));
 
             Log::info('EFactura: Upload still pending, releasing for a later attempt', [
                 'upload_id' => $this->upload->id,

@@ -12,6 +12,7 @@
 use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Events\TokenRefreshed;
 use BeeCoded\EFactura\Exceptions\RefreshCooldownException;
+use BeeCoded\EFactura\Models\EfacturaMessage;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\DownloadService;
@@ -797,6 +798,25 @@ describe('a grant ANAF refuses to refresh', function () {
             ->with('EFactura: Token refresh is cooling down, status checks wait', Mockery::any())
             ->once();
         Http::assertSentCount(1);
+    });
+
+    it('logs the cooldown once per grant in a download run, not once per row', function () {
+        Http::fake();
+        $token = makeExpiringToken();
+        foreach (['3001130051', '3001130052'] as $i => $id) {
+            EfacturaUpload::create(['efactura_token_id' => $token->id, 'uploadable_type' => 'App\\Models\\Invoice', 'uploadable_id' => $i + 1, 'status' => UploadStatus::Completed, 'download_id' => $id]);
+            EfacturaMessage::create(['efactura_token_id' => $token->id, 'message_id' => "400113000{$i}", 'type' => 'received', 'download_id' => "400113000{$i}", 'is_downloaded' => false]);
+        }
+        coolDownGrant($token, 600);
+
+        Log::spy();
+        app(DownloadService::class)->downloadAllResponses();
+        app(DownloadService::class)->downloadAllReceivedInvoices();
+
+        Log::shouldNotHaveReceived('error');
+        Log::shouldHaveReceived('warning')->with('EFactura: Token refresh is cooling down, response downloads wait', Mockery::any())->once();
+        Log::shouldHaveReceived('warning')->with('EFactura: Token refresh is cooling down, received invoice downloads wait', Mockery::any())->once();
+        Http::assertNothingSent();
     });
 
     it('tries a grant re-authorised mid-run although the run still holds the old token', function () {

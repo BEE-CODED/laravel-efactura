@@ -20,6 +20,7 @@ use BeeCoded\EFactura\Events\InvoiceProcessed;
 use BeeCoded\EFactura\Events\InvoiceReceived;
 use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Models\EfacturaMessage;
+use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFacturaSdk\Data\Response\StatusResponseData;
 use BeeCoded\EFacturaSdk\Enums\ArchiveLimitReason;
@@ -89,8 +90,11 @@ class DownloadService
             );
 
             // ANAF answered, so whatever it said, the status is readable again.
+            // Guarded like recordVerdict(): a row sent again meanwhile keeps its own count.
             if ($upload->status_failures > 0) {
-                $upload->update(['status_failures' => 0]);
+                EfacturaUpload::whereKey($upload->id)
+                    ->where('upload_index', $upload->upload_index)
+                    ->update(['status_failures' => 0]);
             }
 
             // The SDK's reading of the answer: Ready and Rejected need a download id of ANAF's
@@ -159,6 +163,7 @@ class DownloadService
                 $age = $upload->uploaded_at ? (int) $upload->uploaded_at->diffInSeconds(now(), true) : 10800;
                 EfacturaUpload::whereKey($upload->id)
                     ->where('status', UploadStatus::Processing)
+                    ->where('upload_index', $upload->upload_index)
                     ->update(['next_poll_at' => now()->addSeconds(max(PollSchedule::status($age) - self::POLL_MARGIN_SECONDS, self::POLL_MARGIN_SECONDS))]);
 
                 return StatusCheckOutcome::Checked;
@@ -237,9 +242,16 @@ class DownloadService
      */
     private function countPermanentStatusFailure(EfacturaUpload $upload, \Throwable $e): void
     {
-        $upload->increment('status_failures');
+        // Guarded like recordVerdict(): a failure for an old index is not the re-sent row's.
+        $counted = EfacturaUpload::whereKey($upload->id)
+            ->where('upload_index', $upload->upload_index)
+            ->increment('status_failures');
 
-        $failures = $upload->status_failures;
+        if ($counted === 0) {
+            return;
+        }
+
+        $failures = (int) EfacturaUpload::whereKey($upload->id)->value('status_failures');
 
         if ($failures < (int) config('efactura.polling.max_status_failures', 5)) {
             return;
@@ -333,6 +345,11 @@ class DownloadService
      */
     protected function parkAsIndeterminate(EfacturaUpload $upload, array $errors, ?string $downloadId = null): void
     {
+        // Only ANAF's digits can be downloaded; any other id counts as none, as for ok and nok.
+        if ($downloadId !== null && preg_match('/\A[0-9]{1,64}\z/', $downloadId) !== 1) {
+            $downloadId = null;
+        }
+
         if (!$this->recordFailure($upload, $errors, $downloadId, FailureReason::Indeterminate)) {
             return;
         }
@@ -347,7 +364,8 @@ class DownloadService
     }
 
     /**
-     * Record a status verdict only on a row that is still Processing.
+     * Record a status verdict only on a row that is still Processing under the index that
+     * was asked about.
      *
      * Overlapping status runs can both hold the row; only the one whose write lands
      * records the verdict, and only it announces it.
@@ -359,6 +377,8 @@ class DownloadService
     {
         $recorded = EfacturaUpload::where('id', $upload->id)
             ->where('status', UploadStatus::Processing)
+            // The answer is for the index this run asked about; a row sent again meanwhile has another.
+            ->where('upload_index', $upload->upload_index)
             ->update($attributes) > 0;
 
         if ($recorded) {
@@ -766,21 +786,12 @@ class DownloadService
             $query->forToken($token);
         }
 
-        // A grant in its refresh cooldown would refuse every row: say so once per token.
         $coolingDown = [];
 
         // lazyById, not each(): each() pages by OFFSET, so rows that leave the scope while
         // a page is processed shift the rest below the next offset and are skipped.
         foreach ($query->lazyById() as $upload) {
-            if ($upload->token && ($seconds = $this->tokenService->refreshCooldownSeconds($upload->token)) > 0) {
-                if (!isset($coolingDown[$upload->token->id])) {
-                    $coolingDown[$upload->token->id] = true;
-                    Log::warning('EFactura: Token refresh is cooling down, status checks wait', [
-                        'cui' => $upload->token->cui,
-                        'retry_in_seconds' => $seconds,
-                    ]);
-                }
-
+            if ($this->waitsOutRefreshCooldown($upload->token, $coolingDown, 'EFactura: Token refresh is cooling down, status checks wait')) {
                 continue;
             }
 
@@ -807,7 +818,13 @@ class DownloadService
             $query->forToken($token);
         }
 
+        $coolingDown = [];
+
         foreach ($query->lazyById() as $upload) {
+            if ($this->waitsOutRefreshCooldown($upload->token, $coolingDown, 'EFactura: Token refresh is cooling down, response downloads wait')) {
+                continue;
+            }
+
             $this->downloadResponse($upload);
         }
     }
@@ -833,9 +850,34 @@ class DownloadService
             $query->forToken($token);
         }
 
+        $coolingDown = [];
+
         foreach ($query->lazyById() as $message) {
+            if ($this->waitsOutRefreshCooldown($message->token, $coolingDown, 'EFactura: Token refresh is cooling down, received invoice downloads wait')) {
+                continue;
+            }
+
             $this->downloadMessage($message);
         }
+    }
+
+    /**
+     * Whether the grant is in its refresh cooldown, which would refuse every row; said once per grant.
+     *
+     * @param  array<int, true>  $warned
+     */
+    private function waitsOutRefreshCooldown(?EfacturaToken $token, array &$warned, string $message): bool
+    {
+        if (!$token || ($seconds = $this->tokenService->refreshCooldownSeconds($token)) <= 0) {
+            return false;
+        }
+
+        if (!isset($warned[$token->id])) {
+            $warned[$token->id] = true;
+            Log::warning($message, ['cui' => $token->cui, 'retry_in_seconds' => $seconds]);
+        }
+
+        return true;
     }
 
     /**

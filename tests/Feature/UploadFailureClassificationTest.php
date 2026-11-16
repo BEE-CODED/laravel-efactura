@@ -30,6 +30,7 @@ use GuzzleHttp\Psr7\Request as Psr7Request;
 use Illuminate\Cache\Events\CacheMissed;
 use Illuminate\Contracts\Filesystem\Filesystem;
 use Illuminate\Contracts\Queue\Job;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
@@ -325,6 +326,23 @@ describe('the atomic claim', function () {
 
         Http::assertNothingSent();
     });
+
+    it('sends nothing when the row is re-queued with other options while it is being prepared', function () {
+        Http::fake([UPLOAD_URL => Http::response('<?xml version="1.0"?><header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" ExecutionStatus="0" index_incarcare="5001130257"/>')]);
+        $upload = $this->uploadService->queueUpload($this->invoice);
+        makeUblSpy(fn () => $this->uploadService->queueB2CUpload($this->invoice, ['standard' => 'CN']));
+
+        $this->uploadService->processUpload($upload);
+
+        Http::assertNothingSent();
+        expect($upload->fresh())->status->toBe(UploadStatus::Pending)
+            ->is_b2c->toBeTrue()->standard->toBe('CN')->xml_path->toBeNull();
+
+        // The next attempt reads the row afresh and sends what it now says.
+        makeUblSpy(fn () => null);
+        $this->uploadService->processUpload($upload->fresh());
+        Http::assertSent(fn ($request) => str_contains($request->url(), '/uploadb2c?') && str_contains($request->url(), 'standard=CN'));
+    });
 });
 
 describe('a token that predates the encryption migration', function () {
@@ -404,6 +422,23 @@ describe('an XML file that cannot be stored', function () {
             ->and($upload->fresh()->failure_reason)->toBe(FailureReason::Transient)
             ->and($upload->fresh()->xml_path)->toBeNull();
 
+        Event::assertNotDispatched(InvoiceFailed::class);
+        Http::assertNothingSent();
+    });
+});
+
+describe('a database error while the invoice is built', function () {
+    it('is a transient failure, announced to nobody, and nothing is sent', function () {
+        Event::fake([InvoiceFailed::class]);
+        // Constructed, not raised by a failing query: that would abort the test transaction on PostgreSQL.
+        makeUblSpy(fn () => throw new QueryException('testing', 'select * from invoice_lines', [], new PDOException('SQLSTATE[40P01]: deadlock detected')));
+        Http::fake();
+
+        $upload = makePendingUpload();
+        $this->uploadService->processUpload($upload);
+
+        expect($upload->fresh()->status)->toBe(UploadStatus::Failed)
+            ->and($upload->fresh()->failure_reason)->toBe(FailureReason::Transient);
         Event::assertNotDispatched(InvoiceFailed::class);
         Http::assertNothingSent();
     });
@@ -807,6 +842,30 @@ describe('a refresh cooldown read back as a numeric string', function () {
         expect($this->delays)->toHaveCount(1)
             ->and($this->delays[0])->toBeGreaterThan(590)->toBeLessThanOrEqual(600)
             ->and($upload->fresh()->failure_reason)->toBe(FailureReason::RateLimited);
+        Http::assertNothingSent();
+    });
+});
+
+describe('an upload refused by the SDK\'s daily RASP limit', function () {
+    it('waits until the limit lets it through, not a minute', function () {
+        config(['efactura-sdk.rate_limits.enabled' => true, 'efactura-sdk.rate_limits.rasp_upload_per_day_cui' => 1]);
+        app()->forgetInstance(RateLimiter::class);
+        app(RateLimiter::class)->checkRaspUpload('12345678');
+        Http::fake();
+        $upload = makePendingUpload();
+        $upload->update(['standard' => 'RASP']);
+
+        $delays = [];
+        $queueJob = Mockery::mock(Job::class);
+        $queueJob->shouldReceive('uuid')->andReturn('job-uuid-rasp');
+        $queueJob->shouldReceive('release')->andReturnUsing(function (int $delay) use (&$delays) {
+            $delays[] = $delay;
+        });
+        app()->call([(new ProcessSingleUpload($upload->fresh()))->setJob($queueJob), 'handle']);
+
+        expect($upload->fresh()->failure_reason)->toBe(FailureReason::RateLimited)
+            ->and($delays)->toHaveCount(1)
+            ->and($delays[0])->toBeGreaterThan(3600);
         Http::assertNothingSent();
     });
 });

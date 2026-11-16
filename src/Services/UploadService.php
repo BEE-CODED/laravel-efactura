@@ -33,7 +33,9 @@ use BeeCoded\EFacturaSdk\Support\UploadOutcome;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\QueryException;
 use Illuminate\Database\UniqueConstraintViolationException;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 
@@ -291,7 +293,8 @@ class UploadService
     {
         if ($existing->isPending()) {
             // Guarded: a worker may claim the row between the check above and this write,
-            // and we must never rewrite the mode of a document already going to ANAF.
+            // and we must never rewrite the mode of a document already going to ANAF. A worker
+            // preparing the old options then loses its claim.
             $applied = EfacturaUpload::where('id', $existing->id)
                 ->where('status', UploadStatus::Pending)
                 ->update($attributes) > 0;
@@ -385,7 +388,8 @@ class UploadService
 
         // PHASE 1 — preparation. Everything here happens strictly BEFORE anything is
         // transmitted, so a failure proves nothing was filed. A broken invoice or a
-        // broken model is the author's data problem: terminal, no point retrying.
+        // broken model is the author's data problem: terminal, no point retrying. A
+        // database error is transient.
         try {
             $model = $upload->uploadable;
 
@@ -406,6 +410,17 @@ class UploadService
                 extern: $upload->is_extern,
                 selfBilled: $upload->is_self_billed,
             );
+        } catch (QueryException $e) {
+            // A deadlock, timeout or lost connection while the model loads its data: nothing was
+            // sent and it may clear, so it is retried, not recorded as the invoice's fault.
+            Log::warning('EFactura: Upload preparation hit a database error, will retry', [
+                'upload_id' => $upload->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            $this->failBeforeTransmission($upload, [$e->getMessage()], FailureReason::Transient);
+
+            return;
         } catch (\Throwable $e) {
             Log::error('EFactura: Upload preparation failed', [
                 'upload_id' => $upload->id,
@@ -449,12 +464,19 @@ class UploadService
      * only one that transmits. Recording xml_path in the SAME statement keeps it a fact
      * about the document that was actually put on the wire, and clearing the previous
      * attempt's markers here is what keeps a re-driven row from carrying a stale
-     * failure_reason into Processing/Completed.
+     * failure_reason into Processing/Completed. The claim is taken only with the options
+     * this run read and is about to send.
      */
     private function claimForTransmission(EfacturaUpload $upload, string $xmlPath): bool
     {
         $claimed = EfacturaUpload::where('id', $upload->id)
             ->where('status', UploadStatus::Pending)
+            // A re-queue that changed the options while the document was prepared makes the
+            // claim fail, and the next attempt reads them afresh.
+            ->where('standard', $upload->standard)
+            ->where('is_extern', $upload->is_extern)
+            ->where('is_self_billed', $upload->is_self_billed)
+            ->where('is_b2c', $upload->is_b2c)
             ->update([
                 'status' => UploadStatus::Uploading,
                 'xml_path' => $xmlPath,
@@ -716,9 +738,28 @@ class UploadService
 
         // A row a sweep or failed() already parked was not rate-limited by this write.
         if ($released) {
+            // The SDK limiter says when it lets the call through (null for ANAF's own 429).
+            rescue(fn () => $retryAfterSeconds > 0
+                ? Cache::put($this->rateLimitKey($upload), now()->addSeconds($retryAfterSeconds)->getTimestamp(), $retryAfterSeconds)
+                : Cache::forget($this->rateLimitKey($upload)), report: false);
+
             $this->deleteUnsentXml($upload, $xmlPath);
             rescue(fn () => event(new InvoiceRateLimited($upload->refresh(), [$message], $retryAfterSeconds)));
         }
+    }
+
+    /** Seconds left of the wait the SDK limiter named for a rate-limited upload (0 when none). */
+    public function rateLimitWaitSeconds(EfacturaUpload $upload): int
+    {
+        $until = rescue(fn () => Cache::get($this->rateLimitKey($upload)), null, false);
+
+        // Redis hands a stored int back as a numeric string.
+        return is_numeric($until) ? max(0, (int) $until - now()->getTimestamp()) : 0;
+    }
+
+    private function rateLimitKey(EfacturaUpload $upload): string
+    {
+        return "efactura:upload:{$upload->id}:rate_limited_until";
     }
 
     /**
@@ -1145,9 +1186,10 @@ class UploadService
      *
      * Rows waiting out a rate limit are skipped: markAsRateLimited releases the
      * claim back to Pending (the upload never left the pipeline), but its own
-     * ProcessSingleUpload is still queued on a 60s release. ProcessSingleUpload
-     * has no uniqueness guard, so dispatching again would stack a second job on
-     * the same row every scheduled tick — each retrying every 60s until the 24h
+     * ProcessSingleUpload is still queued on its release (the limiter's wait, at
+     * least 60s). ProcessSingleUpload has no uniqueness guard, so dispatching again
+     * would stack a second job on the same row every scheduled tick — each retrying
+     * every 60s or more until the 24h
      * retryUntil. With `rate_limits.enabled = false`, which is exactly when real
      * ANAF 429s reach us and the quota pre-flight is skipped, that is unbounded
      * hammering: it saturates the 1000/60min quota hard enough to stop it

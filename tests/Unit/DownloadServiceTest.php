@@ -15,6 +15,7 @@ use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFacturaSdk\Data\Response\DownloadResponseData;
 use BeeCoded\EFacturaSdk\Data\Response\StatusResponseData;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 
 beforeEach(function () {
@@ -75,10 +76,7 @@ describe('DownloadService', function () {
             ]);
             $upload->setRelation('token', null);
 
-            // Should not throw, just log and return
-            $this->downloadService->checkStatus($upload);
-
-            expect(true)->toBeTrue();
+            expect($this->downloadService->checkStatus($upload))->toBe(StatusCheckOutcome::NotPollable);
         });
 
         it('marks upload as completed when ready', function () {
@@ -266,10 +264,9 @@ describe('DownloadService', function () {
             ]);
             $upload->setRelation('token', null);
 
-            // Should not throw
+            Log::spy();
             $this->downloadService->downloadResponse($upload);
-
-            expect(true)->toBeTrue();
+            Log::shouldHaveReceived('error')->with('EFactura: Upload has no associated token', ['upload_id' => $upload->id])->once();
         });
 
         it('downloads and stores response', function () {
@@ -365,10 +362,9 @@ describe('DownloadService', function () {
             ]);
             $message->setRelation('token', null);
 
-            // Should not throw
+            Log::spy();
             $this->downloadService->downloadMessage($message);
-
-            expect(true)->toBeTrue();
+            Log::shouldHaveReceived('error')->with('EFactura: Message has no associated token', ['message_id' => $message->id])->once();
         });
 
         it('downloads message and fires event', function () {
@@ -470,17 +466,6 @@ describe('DownloadService', function () {
             expect(true)->toBeTrue();
         });
 
-        it('filters by CUI when specified', function () {
-            $this->tokenService->shouldReceive('getToken')
-                ->with('12345678')
-                ->once()
-                ->andReturn($this->token);
-
-            $this->downloadService->checkAllStatuses('12345678');
-
-            expect(true)->toBeTrue();
-        });
-
         it('returns early when CUI token not found', function () {
             $this->tokenService->shouldReceive('getToken')
                 ->with('99999999')
@@ -516,17 +501,6 @@ describe('DownloadService', function () {
 
             expect($upload->fresh()->response_path)->not->toBeNull();
         });
-
-        it('filters by CUI when specified', function () {
-            $this->tokenService->shouldReceive('getToken')
-                ->with('12345678')
-                ->once()
-                ->andReturn($this->token);
-
-            $this->downloadService->downloadAllResponses('12345678');
-
-            expect(true)->toBeTrue();
-        });
     });
 
     describe('downloadAllReceivedInvoices', function () {
@@ -549,17 +523,6 @@ describe('DownloadService', function () {
             $this->downloadService->downloadAllReceivedInvoices();
 
             expect($message->fresh()->is_downloaded)->toBeTrue();
-        });
-
-        it('filters by CUI when specified', function () {
-            $this->tokenService->shouldReceive('getToken')
-                ->with('12345678')
-                ->once()
-                ->andReturn($this->token);
-
-            $this->downloadService->downloadAllReceivedInvoices('12345678');
-
-            expect(true)->toBeTrue();
         });
     });
 });

@@ -112,7 +112,7 @@ public function __construct(public EfacturaUpload $upload)
 public function __construct(public EfacturaUpload $upload, public array $errors = [])
 \`\`\`
 
-**Trigger:** Fired when an upload reaches a **terminal** \`Failed\` state. The \`errors\` array contains error details from ANAF or the upload process (for a \`nok\` status answer, ANAF's errors — v4.0; it could be \`[]\`). A status-check verdict is recorded only on a row still \`Processing\`, so when two runs poll one upload only the run that recorded it fires this event (v4.0). A \`transient\` failure, including an XML file that could not be stored, never fires it. It fires from these places:
+**Trigger:** Fired when an upload reaches a **terminal** \`Failed\` state. The \`errors\` array contains error details from ANAF or the upload process (for a \`nok\` status answer, ANAF's errors — v4.0; it could be \`[]\`). A status-check verdict is recorded only on a row still \`Processing\` under the polled index, so when two runs poll one upload only the run that recorded it fires this event (v4.0). A \`transient\` failure, including an XML file that could not be stored or a database error while the invoice was built, never fires it. It fires from these places:
 
 | Source | Situation | \`failure_reason\` |
 |--------|-----------|------------------|
@@ -185,7 +185,7 @@ limiter (\`RateLimitExceededException\`) or a genuine HTTP 429 (\`ApiException\`
 
 | Path | Who re-submits it |
 |------|-------------------|
-| \`ProcessSingleUpload\` (the normal queued path) | The job itself — \`release(60)\`, then it picks the \`Pending\` row straight back up |
+| \`ProcessSingleUpload\` (the normal queued path) | The job itself — it \`release()\`s for the limiter's \`retryAfterSeconds\`, at least 60 s, then picks the \`Pending\` row straight back up |
 | \`efactura:upload --sync\` (inline) | **The next \`--sync\` run.** There is no job to release, so \`processPendingUploads()\` stops the batch and the row waits at \`Pending\` / \`rate_limited\`; the next \`--sync\` run takes it again (v4.0). The queue dispatchers leave it alone (it has a \`failure_reason\`); \`RetryRateLimitedUploads\` takes it only once it has not changed for \`rate_limit.retry_window_hours\` |
 
 **Non-terminal — do NOT treat this as a failure.** Either way the upload is still going to be
@@ -207,8 +207,8 @@ re-submitted; it is not a verdict on the document. For a terminal signal, listen
 
 \`retryAfterSeconds\` is populated only on the SDK client-side-limiter path (from
 \`RateLimitExceededException::$retryAfterSeconds\`). On a genuine ANAF **HTTP 429** it is \`null\` —
-ANAF's response carries no such hint. Do not assume it is set; the wrapper's own retry uses a fixed
-60-second release regardless.
+ANAF's response carries no such hint. Do not assume it is set. The wrapper's own retry waits the limiter's
+\`retryAfterSeconds\` (at least 60 s, at most 12 h per release) and 60 s after ANAF's 429.
 
 **Use Cases:**
 - Backpressure metrics — how often you are hitting ANAF's ceiling

@@ -21296,18 +21296,18 @@ This job handles the full upload for one invoice:
 
 ### 4. CheckUploadStatuses (scheduled)
 
-For each upload in \`Processing\` state, \`DownloadService::checkStatus()\` calls ANAF's \`getStatusMessage()\`:
+For each \`Processing\` upload whose \`next_poll_at\` is due (null or past; \`CheckSingleUploadStatus\` and \`efactura:status --upload\` read one upload straight away), \`DownloadService::checkStatus()\` calls ANAF's \`getStatusMessage()\`:
 
 | ANAF answer or failure | Result |
 |------------------------|--------|
-| \`in prelucrare\` | Nothing changes; polled again next run |
+| \`in prelucrare\` | Stays \`Processing\`; \`next_poll_at\` is set from the SDK's \`PollSchedule\` (1, 5, 15, then 60 min) and the batch skips it until then |
 | \`ok\` with a download id | \`Completed\` |
 | \`ok\` without a download id (none, or one that is not 1\u201364 digits: SDK \`verdict()\`) | \`Completed\` with \`download_id = null\` and a note in \`errors\` (ANAF said it is filed). No response is downloaded, so \`InvoiceProcessed\` never fires for it |
 | \`nok\` with a download id | \`Failed\` / \`validation\` + \`InvoiceFailed\` |
 | \`nok\` without a download id (none, or not 1\u201364 digits) | \`Failed\` / \`indeterminate\` + \`InvoiceFailed\`, keeping \`upload_index\`. **Changed in v4.0** (was \`validation\`): it is no verdict on the document |
-| Only an error (SDK \`hasAnafError()\`: an XML \`<Errors/>\` header or a JSON \`eroare\` \u2014 an unknown index, "Nu aveti dreptul") | \`Failed\` / \`indeterminate\` + \`InvoiceFailed\`, keeping \`upload_index\` and ANAF's errors (v4.0) |
+| Only an error (SDK \`hasAnafError()\`: an XML \`<Errors/>\` header or a JSON \`eroare\` \u2014 an unknown index, "Nu aveti dreptul") | \`Failed\` / \`indeterminate\` + \`InvoiceFailed\`, keeping \`upload_index\` and ANAF's errors (v4.0; a download id that is not 1\u201364 digits is dropped) |
 | "XML cu erori nepreluat de sistem" | \`Failed\` / \`validation\` + \`InvoiceFailed\`; nothing to download |
-| No recognisable status | \`Failed\` / \`indeterminate\` + \`InvoiceFailed\` |
+| No recognisable status | \`Failed\` / \`indeterminate\` + \`InvoiceFailed\` (a download id that is not 1\u201364 digits is dropped) |
 | Permanent failure: a 4xx, an unreadable 2xx answer, an index the SDK refuses (\`ValidationException\`), any other error | \`status_failures\` + 1; at \`polling.max_status_failures\` (default 5) \`Failed\` / \`indeterminate\` + \`InvoiceFailed\` |
 | Transient failure: thrown before the request (token read/refresh), \`AuthenticationException\`, a 5xx or transport error | Retried next run, not counted |
 | \`RateLimitExceededException\` with \`$scope === RateLimitScope::Status\` (this upload's per-message limit) | This upload is skipped, not counted; the batch carries on |
@@ -21319,7 +21319,7 @@ Any status answer resets \`status_failures\` to 0, and so do \`markUploadAsProce
 
 ### 5. DownloadResponses (scheduled)
 
-For uploads with a \`download_id\` but no \`response_path\`, downloads the response ZIP from ANAF and stores it to disk. A permanent failure (a 2xx body that is not a ZIP, a 4xx, an id the SDK refuses, any other error) increments \`response_attempts\`, up to \`EfacturaUpload::MAX_RESPONSE_ATTEMPTS\` (3); a transient one is retried without counting. A \`RateLimitExceededException\` with \`RateLimitScope::Download\` skips that upload; any other rate limit stops the batch. \`DownloadReceivedInvoices\` applies the same rules to received invoices, counting in \`efactura_messages.download_attempts\` up to \`EfacturaMessage::MAX_DOWNLOAD_ATTEMPTS\` (3).
+For uploads with a \`download_id\` but no \`response_path\`, downloads the response ZIP from ANAF and stores it to disk. A permanent failure (a 2xx body that is not a ZIP, a 4xx, an id the SDK refuses, any other error) increments \`response_attempts\`, up to \`EfacturaUpload::MAX_RESPONSE_ATTEMPTS\` (3); a transient one is retried without counting. A \`RateLimitExceededException\` with \`RateLimitScope::Download\` skips that upload; any other rate limit stops the batch. \`DownloadReceivedInvoices\` applies the same rules to received invoices, counting in \`efactura_messages.download_attempts\` up to \`EfacturaMessage::MAX_DOWNLOAD_ATTEMPTS\` (3). A grant in its refresh cooldown is skipped with one warning per run, here and in \`CheckUploadStatuses\`.
 
 Fires \`InvoiceProcessed\` after download, **only** when the upload's status is \`Completed\` \u2014 a Failed upload's error-report ZIP is downloaded and stored, but fires no event here.
 
@@ -21382,7 +21382,7 @@ If the limit is instead hit **during** the API call, the ordering is:
 
 1. \`UploadService\` releases the claim: the row goes back to **\`Pending\`** with \`failure_reason = rate_limited\` and \`processed_at = null\`. It is deliberately **not** marked \`Failed\` \u2014 it never left the pipeline, and a \`Failed\` row would make \`isEfacturaProcessed()\` report \`true\` for an upload that flips back to \`Pending\` 60 seconds later
 2. **\`InvoiceRateLimited\` fires** \u2014 *not* \`InvoiceFailed\`. The upload is still in the pipeline
-3. Back in \`ProcessSingleUpload\`, the row is re-read; seeing \`Pending\` + \`rate_limited\` it \`release(60)\`s itself without a reset
+3. Back in \`ProcessSingleUpload\`, the row is re-read; seeing \`Pending\` + \`rate_limited\` it \`release()\`s itself for the limiter's \`retryAfterSeconds\`, at least 60 s (at most 12 h per release), without a reset
 
 Two distinct exceptions land here, and v3 treats them identically:
 - \`RateLimitExceededException\` \u2014 the SDK's **client-side** pre-flight limiter refused the call
@@ -21390,7 +21390,7 @@ Two distinct exceptions land here, and v3 treats them identically:
 
 So \`ProcessSingleUpload\` normally recovers its **own** rate-limited upload. \`RetryRateLimitedUploads\` is only the **safety net**, for rows nothing else will re-drive: a \`Failed\` row with a retryable reason (the worker died between steps 1 and 3, or the migration backfilled it), and a live \`Pending\` / \`rate_limited\` row whose released job was lost.
 
-> **\`ProcessPendingUploads\` deliberately skips \`Pending\` / \`rate_limited\` rows.** A rate-limited row is Pending, but its own \`ProcessSingleUpload\` is already queued on a 60-second release, and \`ProcessSingleUpload\` carries no uniqueness guard \u2014 so dispatching it again would stack another job on the same row every scheduled tick. A genuinely queued row has \`failure_reason\` **NULL** (\`resetForRetry()\` clears it), which is what separates "nobody is on this" from "a job is waiting one out". Recovery for the latter is \`RetryRateLimitedUploads\`, and the atomic \`WHERE status = pending\` claim means a duplicate job can never reach ANAF twice.
+> **\`ProcessPendingUploads\` deliberately skips \`Pending\` / \`rate_limited\` rows.** A rate-limited row is Pending, but its own \`ProcessSingleUpload\` is already queued on a release (the limiter's \`retryAfterSeconds\`, at least 60 s), and \`ProcessSingleUpload\` carries no uniqueness guard \u2014 so dispatching it again would stack another job on the same row every scheduled tick. A genuinely queued row has \`failure_reason\` **NULL** (\`resetForRetry()\` clears it), which is what separates "nobody is on this" from "a job is waiting one out". Recovery for the latter is \`RetryRateLimitedUploads\`, and the atomic \`WHERE status = pending\` claim means a duplicate job can never reach ANAF twice.
 
 \`ProcessSingleUpload\` uses \`retryUntil()\` based on \`rate_limit.retry_window_hours\` (default 24h). Once that window passes the **job** stops retrying and \`failed()\` resolves the row by where it actually got to:
 
@@ -21795,7 +21795,8 @@ Every behaviour change since v3.1.1 (also in \`CHANGELOG.md\`):
     table.
 13. **Laravel 11 is no longer supported:** \`illuminate/*\` is now \`^12.0|^13.0\`.
 14. **OAuth routes:** \`routes.middleware\` defaults to \`['web', 'auth']\` (was \`['web']\`). Add a
-    check that the user may act for the CUI (for example \`can:\`), or disable the routes.
+    check that the user may act for the CUI (for example \`can:\`; a \`can:\` gate also runs on the
+    callback with a null CUI and must allow it), or disable the routes.
 15. **Migration \`000008\` reclassifies** pre-4.0 \`failed\` rows with \`validation\` or no
     \`failure_reason\` (pre-3.0, left unclassified by \`000005\`) with an \`upload_index\` and
     no \`download_id\` (3.x \`nok\` answers without a download id) as \`indeterminate\` (review with
@@ -21809,7 +21810,7 @@ Every behaviour change since v3.1.1 (also in \`CHANGELOG.md\`):
     uploads \`pending\` for at most \`rate_limit.retry_window_hours\`, then \`failed()\` abandons them with
     \`InvoiceFailed\` (usually after about (\`jobs.max_transient_attempts\` \u2212 1) \xD7 the 15-minute cooldown, about an hour at the defaults: each ask after a
     cooldown spends an upload's transient attempt). The cooldown also refuses calls in the access
-    token's last 120 s. A status run logs the cooldown once per grant. See the \`token-management\` topic.
+    token's last 120 s. A status or download run logs the cooldown once per grant. See the \`token-management\` topic.
 17. **Uploads:** \`ProcessPendingUploads\` and \`dispatchPendingUploads()\` skip
     a \`pending\` row with a \`failure_reason\`, or changed within \`jobs.transient_retry_delay_seconds\`
     + 60 s, including a freshly queued row (\`EfacturaUpload::awaitingDispatch()\`): scheduler-only hosts
@@ -22211,7 +22212,7 @@ Two situations throw \`DuplicateUploadException\`:
 | \`Failed\` / \`indeterminate\` | anything | **Throws** \u2014 delivery is unknown, re-sending could double-file |
 | \`Uploading\` / \`Processing\` / \`Completed\` | **different** options (\`b2c\`, \`standard\`, \`extern\`, \`self_billed\`) | **Throws** \u2014 the options describe what was already sent; rewriting them would make the row lie |
 | \`Uploading\` / \`Processing\` / \`Completed\` | the same options | Returns the existing row (idempotent) |
-| \`Pending\` | different options | Applies them to the row (atomic; if it loses the race to a claim, falls back to the conflict check above) |
+| \`Pending\` | different options | Applies them to the row (atomic; if it loses the race to a claim, falls back to the conflict check above); a worker already preparing the old options loses its claim, and the next attempt sends the new ones |
 | \`Failed\` (any other reason) | anything | Recycles the row for a fresh attempt |
 
 That fourth row matters: before v3.0.0, \`queueB2CUpload()\` on a model that already had a \`Pending\`
@@ -22871,7 +22872,7 @@ public function __construct(public EfacturaUpload $upload)
 public function __construct(public EfacturaUpload $upload, public array $errors = [])
 \`\`\`
 
-**Trigger:** Fired when an upload reaches a **terminal** \`Failed\` state. The \`errors\` array contains error details from ANAF or the upload process (for a \`nok\` status answer, ANAF's errors \u2014 v4.0; it could be \`[]\`). A status-check verdict is recorded only on a row still \`Processing\`, so when two runs poll one upload only the run that recorded it fires this event (v4.0). A \`transient\` failure, including an XML file that could not be stored, never fires it. It fires from these places:
+**Trigger:** Fired when an upload reaches a **terminal** \`Failed\` state. The \`errors\` array contains error details from ANAF or the upload process (for a \`nok\` status answer, ANAF's errors \u2014 v4.0; it could be \`[]\`). A status-check verdict is recorded only on a row still \`Processing\` under the polled index, so when two runs poll one upload only the run that recorded it fires this event (v4.0). A \`transient\` failure, including an XML file that could not be stored or a database error while the invoice was built, never fires it. It fires from these places:
 
 | Source | Situation | \`failure_reason\` |
 |--------|-----------|------------------|
@@ -22944,7 +22945,7 @@ limiter (\`RateLimitExceededException\`) or a genuine HTTP 429 (\`ApiException\`
 
 | Path | Who re-submits it |
 |------|-------------------|
-| \`ProcessSingleUpload\` (the normal queued path) | The job itself \u2014 \`release(60)\`, then it picks the \`Pending\` row straight back up |
+| \`ProcessSingleUpload\` (the normal queued path) | The job itself \u2014 it \`release()\`s for the limiter's \`retryAfterSeconds\`, at least 60 s, then picks the \`Pending\` row straight back up |
 | \`efactura:upload --sync\` (inline) | **The next \`--sync\` run.** There is no job to release, so \`processPendingUploads()\` stops the batch and the row waits at \`Pending\` / \`rate_limited\`; the next \`--sync\` run takes it again (v4.0). The queue dispatchers leave it alone (it has a \`failure_reason\`); \`RetryRateLimitedUploads\` takes it only once it has not changed for \`rate_limit.retry_window_hours\` |
 
 **Non-terminal \u2014 do NOT treat this as a failure.** Either way the upload is still going to be
@@ -22966,8 +22967,8 @@ re-submitted; it is not a verdict on the document. For a terminal signal, listen
 
 \`retryAfterSeconds\` is populated only on the SDK client-side-limiter path (from
 \`RateLimitExceededException::$retryAfterSeconds\`). On a genuine ANAF **HTTP 429** it is \`null\` \u2014
-ANAF's response carries no such hint. Do not assume it is set; the wrapper's own retry uses a fixed
-60-second release regardless.
+ANAF's response carries no such hint. Do not assume it is set. The wrapper's own retry waits the limiter's
+\`retryAfterSeconds\` (at least 60 s, at most 12 h per release) and 60 s after ANAF's 429.
 
 **Use Cases:**
 - Backpressure metrics \u2014 how often you are hitting ANAF's ceiling
@@ -23258,7 +23259,7 @@ Preparation (steps 3\u20134) is strictly **before** anything is transmitted, so 
 **Rate limit handling:** two distinct mechanisms, depending on *when* the limit is hit:
 
 - **Pre-flight (step 1)** \u2014 quota already exhausted: the job \`release()\`s itself with a delay matching the bucket reset (min 10s) and returns. The upload row stays \`Pending\` (v4.0: only its \`updated_at\` is touched, so \`ProcessPendingUploads\` does not add a second job), and **no event fires**.
-- **Mid-call** \u2014 the limit is hit during the API call. \`UploadService\` releases the row back to \`Pending\` with \`failure_reason = rate_limited\` and fires **\`InvoiceRateLimited\`** (*not* \`InvoiceFailed\`). \`ProcessSingleUpload\` re-reads the row, sees \`Pending\` / \`rate_limited\`, and \`release(60)\`s itself.
+- **Mid-call** \u2014 the limit is hit during the API call. \`UploadService\` releases the row back to \`Pending\` with \`failure_reason = rate_limited\` and fires **\`InvoiceRateLimited\`** (*not* \`InvoiceFailed\`). \`ProcessSingleUpload\` re-reads the row, sees \`Pending\` / \`rate_limited\`, and \`release()\`s itself for the limiter's \`retryAfterSeconds\`, at least 60 s (at most 12 h per release; after ANAF's own 429, 60 s). Re-queueing the row meanwhile updates it but does not dispatch it again: the dispatchers skip a rate-limited row, so the waiting job sends it when the wait ends.
 
 > **Changed in v3.0.0.** The mid-call path used to write a \`RATE_LIMIT_EXCEEDED:\` marker into the
 > free-text \`errors\` payload and fire \`InvoiceFailed\` \u2014 a false alarm followed by a successful
@@ -23311,7 +23312,7 @@ The package schedules nothing itself. This is the one recommended cadence per jo
 | \`SyncMessages\` | Hourly | Without a CUI it dispatches one job per active CUI. Each pages through the last 60 days: one paginated-list call per 500 messages (SDK \`paginated_list_per_day_cui\`, default 50,000) |
 | \`DownloadReceivedInvoices\` | Hourly | Downloads what \`SyncMessages\` listed; each message's download uses one of its 5 daily downloads. Without a CUI it dispatches one job per active CUI with invoices to download |
 
-\`jobs.max_staleness_seconds\` (120) is shorter than every interval, so a run delayed in the queue is dropped instead of overlapping the next one.
+\`jobs.max_staleness_seconds\` (120) is shorter than every interval, so a \`ProcessPendingUploads\`, \`CheckUploadStatuses\`, \`DownloadResponses\` or \`SyncMessages\` run delayed in the queue is dropped instead of overlapping the next one (only these four use \`DiscardsWhenStale\`; a late \`DownloadReceivedInvoices\`, \`RetryRateLimitedUploads\` or \`SweepStaleUploads\` still runs).
 
 \`\`\`php
 // In routes/console.php (Laravel 11+) or app/Console/Kernel.php
@@ -23441,7 +23442,7 @@ Hardening for the periodic batch jobs so a backlog that accumulates while the qu
 |-----------|---------|------|---------|-------------|
 | \`jobs.max_staleness_seconds\` | \`EFACTURA_JOB_MAX_STALENESS\` | int | \`120\` | A periodic batch job (\`ProcessPendingUploads\`, \`CheckUploadStatuses\`, \`DownloadResponses\`, \`SyncMessages\`) that has waited in the queue longer than this self-discards instead of running \u2014 the next scheduled run re-scans. The per-CUI jobs a run without a CUI dispatches are never discarded: they wait behind each other and are unique per CUI. Safe because these jobs are idempotent all-rows scanners. Set to \`0\` to disable. The default is shorter than every recommended interval (Job Reference, "Recommended Scheduling"), so a delayed run never overlaps the next. |
 | \`jobs.unique_for_seconds\` | \`EFACTURA_JOB_UNIQUE_FOR\` | int | \`3600\` | Lock TTL (seconds) of the unique locks on the four batch jobs (\`ProcessPendingUploads\`, \`CheckUploadStatuses\`, \`DownloadResponses\` until processing starts; \`SyncMessages\` until it finishes) and on \`SweepStaleUploads\` \u2014 the ceiling after which a job stuck unprocessed in the queue stops blocking a fresh dispatch. (\`RetryRateLimitedUploads\` hardcodes its own \`uniqueFor = 600\` and ignores this key.) |
-| \`jobs.transient_retry_delay_seconds\` | \`EFACTURA_JOB_TRANSIENT_RETRY_DELAY\` | int | \`30\` | How long \`ProcessSingleUpload\` waits before re-driving an upload that failed transiently (auth / pre-flight blip). Rate-limited retries use a fixed 60s instead. **New in v3.0.0.** |
+| \`jobs.transient_retry_delay_seconds\` | \`EFACTURA_JOB_TRANSIENT_RETRY_DELAY\` | int | \`30\` | How long \`ProcessSingleUpload\` waits before re-driving an upload that failed transiently (auth / pre-flight blip). Rate-limited retries wait 60 s, or the SDK limiter's \`retryAfterSeconds\` when longer (at most 12 h per release). **New in v3.0.0.** |
 | \`jobs.max_transient_attempts\` | \`EFACTURA_JOB_MAX_TRANSIENT_ATTEMPTS\` | int | \`5\` | How many \`transient\` failures a single queued upload job may have before it is declared terminal (\`abandoned\`) and \`InvoiceFailed\` fires. Counted in the cache per job (v4.0); rate-limit releases do not count. Stops a durable fault (e.g. a revoked token answering 401) from hammering ANAF for the whole retry window. Set to \`0\` to disable the cap. **New in v3.0.0.** |
 | \`jobs.stale_uploading_minutes\` | \`EFACTURA_JOB_STALE_UPLOADING_MINUTES\` | int | \`30\` | An upload left in \`uploading\` longer than this had its worker die mid-flight. \`SweepStaleUploads\` parks it as \`Failed\` / \`indeterminate\` for human reconciliation \u2014 it is **never** re-submitted, because it may already be filed. \`<= 0\` makes the sweep a no-op. **New in v3.0.0.** |
 
@@ -23478,7 +23479,7 @@ OAuth callback routes configuration.
 |-----------|---------|------|---------|-------------|
 | \`routes.enabled\` | \`EFACTURA_ROUTES_ENABLED\` | bool | \`true\` | Register the built-in OAuth routes (\`GET /{prefix}/auth/{cui}\` and \`GET /{prefix}/callback\`). Set to \`false\` if you handle OAuth manually. |
 | \`routes.prefix\` | \`EFACTURA_ROUTES_PREFIX\` | string | \`'efactura'\` | URL prefix for OAuth routes. Default routes are \`/efactura/auth/{cui}\` and \`/efactura/callback\`. |
-| \`routes.middleware\` | *(not env)* | array | \`['web', 'auth']\` | Laravel middleware applied to both OAuth routes. Modify in \`config/efactura.php\` directly. **v4.0: the default adds \`auth\`** (it was \`['web']\`), so a guest is sent to the login page. \`auth\` does not check that the user may act for that CUI: add a check such as \`'can:authorize-efactura,cui'\` (a Gate receiving the \`cui\` route parameter), or disable the routes and run the flow yourself. The callback needs the logged-in browser too, including after \`efactura:auth\`. \`'web'\` is needed because the callback redirects with flashed session data (\`efactura_success\`, \`efactura_cui\`, \`efactura_message\`). **As of v3.0.0 the OAuth state itself no longer needs the session** \u2014 it lives in the cache \u2014 so a session-less stack works if you also replace the redirect handling. |
+| \`routes.middleware\` | *(not env)* | array | \`['web', 'auth']\` | Laravel middleware applied to both OAuth routes. Modify in \`config/efactura.php\` directly. **v4.0: the default adds \`auth\`** (it was \`['web']\`), so a guest is sent to the login page. \`auth\` does not check that the user may act for that CUI: add a check such as \`'can:authorize-efactura,cui'\` (a Gate receiving the \`cui\` route parameter; the stack also runs on the callback, where the gate receives \`null\`: define it as \`fn ($user, ?string $cui = null) => $cui === null || ...\`), or disable the routes and run the flow yourself. The callback needs the logged-in browser too, including after \`efactura:auth\`. \`'web'\` is needed because the callback redirects with flashed session data (\`efactura_success\`, \`efactura_cui\`, \`efactura_message\`). **As of v3.0.0 the OAuth state itself no longer needs the session** \u2014 it lives in the cache \u2014 so a session-less stack works if you also replace the redirect handling. |
 | \`routes.success_redirect\` | \`EFACTURA_SUCCESS_REDIRECT\` | string | \`'/'\` | URL to redirect to after successful OAuth authorization. |
 | \`routes.error_redirect\` | \`EFACTURA_ERROR_REDIRECT\` | string | \`'/'\` | URL to redirect to if OAuth authorization fails or state validation fails. |
 
