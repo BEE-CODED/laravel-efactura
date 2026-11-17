@@ -18,7 +18,9 @@ use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFactura\Tests\Fixtures\TestInvoice;
 use BeeCoded\EFacturaSdk\Services\RateLimiter;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Facades\Storage;
 
 /**
  * `efactura:upload` used to upload synchronously,
@@ -61,8 +63,6 @@ describe('efactura:upload by default', function () {
 
         $a = makePending(1);
         $b = makePending(2);
-        // A row is taken once its own job, if any, would have run.
-        $this->travel(91)->seconds();
 
         $this->artisan('efactura:upload')->assertExitCode(0);
 
@@ -75,8 +75,6 @@ describe('efactura:upload by default', function () {
         Queue::fake();
 
         $upload = makePending(1);
-        // Old enough to be taken, so an inline upload would have sent it.
-        $this->travel(91)->seconds();
 
         $this->artisan('efactura:upload')->assertExitCode(0);
 
@@ -121,7 +119,6 @@ describe('efactura:upload by default', function () {
 
         $mine = makePending(1);
         makePending(2, $otherToken);
-        $this->travel(91)->seconds();
 
         $this->artisan('efactura:upload', ['--cui' => '12345678'])->assertExitCode(0);
 
@@ -188,6 +185,26 @@ describe('efactura:upload --sync', function () {
             ->and($third->fresh()->next_poll_at)->toBeNull();
     });
 
+    // The first upload's refresh is refused and pauses the grant: the others are not touched.
+    it('stops a company whose grant ANAF refuses during the run', function () {
+        Storage::fake('local');
+        $this->token->update(['expires_at' => now()->addSeconds(60)]);
+        makePending(1);
+        $second = makePending(2);
+        $third = makePending(3);
+        Http::fake(['https://logincert.anaf.ro/anaf-oauth2/v1/token' => Http::response(['error' => 'invalid_grant'], 400)]);
+
+        $this->artisan('efactura:upload', ['--sync' => true])
+            ->expectsOutputToContain('Processed 1 upload(s).')
+            ->assertExitCode(0);
+
+        Http::assertSentCount(1);
+        expect($second->fresh())->status->toBe(UploadStatus::Pending)
+            ->next_poll_at->toBeNull()
+            ->and($third->fresh())->status->toBe(UploadStatus::Pending)
+            ->next_poll_at->toBeNull();
+    });
+
     it('prints a paused company as skipped, not processed', function () {
         $cooling = EfacturaToken::create([
             'cui' => '87654321',
@@ -208,6 +225,26 @@ describe('efactura:upload --sync', function () {
             ->expectsOutputToContain('87654321: skipped (cooling).')
             ->expectsOutputToContain('Processed 0 upload(s).')
             ->assertExitCode(0);
+    });
+
+    it('fails an upload whose model class no longer exists and still sends the others', function () {
+        Storage::fake('local');
+        Http::fake(['https://api.anaf.ro/test/FCTEL/rest/upload*' => Http::response('<?xml version="1.0"?><header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" ExecutionStatus="0" index_incarcare="5001130257"/>')]);
+        $removed = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\RemovedInvoice',
+            'uploadable_id' => 1,
+            'status' => UploadStatus::Pending,
+            'standard' => 'UBL',
+        ]);
+        $good = makePending(2);
+
+        $this->artisan('efactura:upload', ['--sync' => true])->assertExitCode(0);
+
+        Http::assertSentCount(1);
+        expect($removed->fresh())->status->toBe(UploadStatus::Failed)
+            ->failure_reason->toBe(FailureReason::Validation)
+            ->and($good->fresh()->status)->toBe(UploadStatus::Processing);
     });
 
     it('fails when the CUI has no token', function () {

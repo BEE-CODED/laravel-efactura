@@ -104,6 +104,19 @@ describe('UploadService', function () {
                 ->and($upload->status)->toBe(UploadStatus::Pending);
         });
 
+        // A misspelt flag or one the queue cannot carry would file in another mode.
+        it('refuses an unknown option and stores nothing', function (string $method, string $key) {
+            $this->tokenService->shouldReceive('getToken')->andReturn($this->token);
+
+            expect(fn () => $this->uploadService->{$method}($this->invoice, [$key => true]))
+                ->toThrow(InvalidArgumentException::class, $key);
+
+            expect(EfacturaUpload::count())->toBe(0);
+        })->with([
+            'is_extern' => ['queueUpload', 'is_extern'],
+            'executare' => ['queueB2CUpload', 'executare'],
+        ]);
+
         it('stores the requested standard', function () {
             $this->tokenService->shouldReceive('getToken')
                 ->with('12345678')
@@ -141,7 +154,8 @@ describe('UploadService', function () {
         it('skips non-pending uploads', function () {
             $this->upload->update(['status' => UploadStatus::Processing]);
 
-            // Should not call any mocks
+            $this->tokenService->shouldNotReceive('refreshCooldownSeconds');
+
             $this->uploadService->processUpload($this->upload);
 
             // Verify status unchanged
@@ -348,7 +362,7 @@ describe('UploadService', function () {
 
             // Thrown by the client the operation already holds: the SDK's in-call refresh.
             $client = Mockery::mock(EFacturaClient::class);
-            $client->shouldReceive('uploadDocument')->once()->andThrow(new AuthenticationException('Token refresh lock timeout'));
+            $client->shouldReceive('uploadDocument')->once()->andThrow(new AuthenticationException('Token refresh lock timeout. Another process may be refreshing the token. Please retry.', 0));
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
                 ->andReturnUsing(fn ($token, Closure $operation) => $operation($client));
@@ -359,7 +373,7 @@ describe('UploadService', function () {
             expect($this->upload->status)->toBe(UploadStatus::Pending)
                 ->and($this->upload->failure_reason)->toBeNull()
                 ->and($this->upload->status_failures)->toBe(0)
-                ->and($this->upload->errors)->toBe(['Token refresh lock timeout']);
+                ->and($this->upload->errors)->toBe(['Token refresh lock timeout. Another process may be refreshing the token. Please retry.']);
 
             // Not a terminal outcome: the pipeline will re-drive it.
             Event::assertNotDispatched(InvoiceFailed::class);

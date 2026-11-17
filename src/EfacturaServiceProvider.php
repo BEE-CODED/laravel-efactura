@@ -26,6 +26,7 @@ class EfacturaServiceProvider extends ServiceProvider
     public function register(): void
     {
         $this->mergeConfigFrom(__DIR__.'/../config/efactura.php', 'efactura');
+        $this->normaliseConfig();
 
         $this->app->singleton(TokenService::class);
         $this->app->singleton(UploadService::class);
@@ -45,6 +46,23 @@ class EfacturaServiceProvider extends ServiceProvider
                 (int) config('efactura.anaf_lookup.retry_attempts', 5),
             );
         });
+    }
+
+    /**
+     * A blank env line keeps the default, as in the SDK: once at register, also with a cached
+     * config (which skips mergeConfigFrom). A config()->set() after register() is not normalised.
+     */
+    private function normaliseConfig(): void
+    {
+        foreach (['storage.disk' => 'local', 'storage.path' => 'efactura', 'routes.prefix' => 'efactura', 'routes.success_redirect' => '/', 'routes.error_redirect' => '/'] as $key => $default) {
+            if (!is_string($value = config("efactura.{$key}")) || trim($value) === '') {
+                config(["efactura.{$key}" => $default]);
+            }
+        }
+
+        // A bool (env true/false) is no count either, as the SDK reads its own.
+        $attempts = config('efactura.anaf_lookup.retry_attempts');
+        config(['efactura.anaf_lookup.retry_attempts' => (is_bool($attempts) ? null : filter_var($attempts, FILTER_VALIDATE_INT, FILTER_NULL_ON_FAILURE)) ?? 5]);
     }
 
     public function boot(): void

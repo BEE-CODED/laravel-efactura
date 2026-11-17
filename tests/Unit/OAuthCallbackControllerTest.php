@@ -1,5 +1,6 @@
 <?php
 
+use BeeCoded\EFactura\EfacturaServiceProvider;
 use BeeCoded\EFactura\Events\TokenStored;
 use BeeCoded\EFactura\Http\Controllers\OAuthCallbackController;
 use BeeCoded\EFactura\Models\EfacturaToken;
@@ -240,6 +241,54 @@ describe('OAuthCallbackController', function () {
                 $found = $found || $value === 'secret-auth-code';
             });
             expect($found)->toBeFalse();
+        });
+
+        it('reports the callback error text without control characters', function () {
+            Exceptions::fake();
+            config(['efactura.routes.error_redirect' => '/error']);
+            $this->tokenService->shouldReceive('forgetOAuthState')->once();
+
+            $this->controller->callback(Request::create('/callback', 'GET', [
+                'error' => "x\n[2026-11-17 10:00:00] production.CRITICAL: forged",
+                'error_description' => "a\r\nb",
+            ]));
+
+            $reported = Exceptions::reported();
+            expect($reported)->toHaveCount(1)
+                ->and($reported[0]->getMessage())->not->toContain("\n")
+                ->and($reported[0]->getMessage())->not->toContain("\r")
+                ->and($reported[0]->getMessage())->toContain('x [2026-11-17');
+        });
+
+        it('shows a fixed text, not the transport error, when ANAF cannot be reached', function () {
+            config(['efactura.routes.error_redirect' => '/error']);
+            Http::fake(['logincert.anaf.ro/anaf-oauth2/v1/token' => fn ($request) => Create::rejectionFor(
+                new ConnectException('cURL error 5: Could not resolve proxy: squid.internal', new Psr7Request('POST', $request->url()))
+            )]);
+            $this->tokenService->shouldReceive('validateOAuthState')->once()->andReturn('12345678');
+            $this->tokenService->shouldNotReceive('storeToken');
+
+            $this->controller->callback(Request::create('/callback', 'GET', ['code' => 'auth_code', 'state' => 'valid_state']));
+
+            expect(session('efactura_message'))->toBe('Failed to complete the e-Factura authorization. Please try again.')
+                ->not->toContain('cURL');
+        });
+
+        it('completes a stored authorization when the success redirect env is null', function () {
+            config(['efactura.routes.success_redirect' => null]);
+            (new EfacturaServiceProvider(app()))->register();
+            Http::fake(['logincert.anaf.ro/anaf-oauth2/v1/token' => Http::response([
+                'access_token' => 'new-access',
+                'refresh_token' => 'new-refresh',
+                'expires_in' => 3600,
+            ])]);
+            $this->tokenService->shouldReceive('validateOAuthState')->once()->andReturn('12345678');
+            $this->tokenService->shouldReceive('storeToken')->once()->andReturn(new EfacturaToken);
+
+            $response = $this->controller->callback(Request::create('/callback', 'GET', ['code' => 'auth_code', 'state' => 'valid_state']));
+
+            expect($response->getTargetUrl())->toBe(url('/'))
+                ->and(session('efactura_success'))->toBeTrue();
         });
 
         it('shows a fixed text, never the exception, when storing the grant fails', function () {

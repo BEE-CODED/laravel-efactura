@@ -10,6 +10,7 @@
  */
 
 use BeeCoded\EFactura\Enums\FailureReason;
+use BeeCoded\EFactura\Enums\ResponseVerification;
 use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Exceptions\DuplicateUploadException;
 use BeeCoded\EFactura\Models\EfacturaToken;
@@ -95,6 +96,8 @@ function raceWinnerTest(object $test, Closure $assertions): void
         'created_at' => now(),
         'updated_at' => now(),
     ]);
+    // The request resolves the winner's company too: a row under another company's token is refused.
+    $test->invoice->update(['cui' => '99999999']);
 
     $raced = false;
     EfacturaUpload::creating(function () use (&$raced, $test, $winnerConnection, $winnerTokenId) {
@@ -313,6 +316,49 @@ describe('queueing with different options', function () {
             ->and($first->fresh()->next_poll_at->equalTo($next))->toBeTrue();
     });
 
+    // The company's current token is part of what a re-queue asks for.
+    it('moves a pending upload to the company\'s current token, and refuses a filed one for another company', function () {
+        $other = EfacturaToken::create([
+            'cui' => '87654321',
+            'access_token' => 'test',
+            'refresh_token' => 'test',
+            'expires_at' => now()->addHour(),
+            'is_active' => true,
+        ]);
+        $first = $this->uploadService->queueUpload($this->invoice);
+        $this->invoice->update(['cui' => '87654321']);
+
+        $second = $this->uploadService->queueUpload($this->invoice);
+
+        expect($second->id)->toBe($first->id)
+            ->and($second->efactura_token_id)->toBe($other->id);
+
+        EfacturaUpload::whereKey($first->id)->update(['status' => UploadStatus::Completed, 'efactura_token_id' => $this->token->id]);
+
+        expect(fn () => $this->uploadService->queueUpload($this->invoice))
+            ->toThrow(DuplicateUploadException::class, 'efactura_token_id');
+    });
+
+    // Its job refused the old data while it was queued again: the row is decided again and recycled.
+    it('recycles a pending upload that failed while it was queued again', function () {
+        $first = $this->uploadService->queueUpload($this->invoice);
+        $failed = false;
+        DB::connection()->beforeExecuting(function (string $query, array $bindings) use (&$failed, $first) {
+            if (!$failed && str_starts_with(strtolower($query), 'update') && str_contains($query, 'is_b2c') && in_array('pending', $bindings, true)) {
+                $failed = true;
+                EfacturaUpload::whereKey($first->id)->update(['status' => UploadStatus::Failed, 'failure_reason' => FailureReason::Validation]);
+            }
+        });
+
+        $second = $this->uploadService->queueUpload($this->invoice, ['extern' => true]);
+
+        expect($failed)->toBeTrue()
+            ->and($second->id)->toBe($first->id)
+            ->and($second->status)->toBe(UploadStatus::Pending)
+            ->and($second->is_extern)->toBeTrue()
+            ->and($second->failure_reason)->toBeNull();
+    });
+
     it('refuses an unknown standard at queue time and stores nothing', function (string $method) {
         expect(fn () => $this->uploadService->{$method}($this->invoice, ['standard' => 'ubl']))
             ->toThrow(InvalidArgumentException::class);
@@ -401,6 +447,21 @@ describe('re-uploading after a failure', function () {
         }
     });
 
+    // ANAF assigns digits only: an index kept from an unreadable answer is not offered as --index.
+    it('suggests no unusable index for an indeterminate upload', function () {
+        $first = $this->uploadService->queueUpload($this->invoice);
+        $first->update([
+            'status' => UploadStatus::Failed,
+            'failure_reason' => FailureReason::Indeterminate,
+            'upload_index' => 'ABC-123',
+        ]);
+
+        expect(fn () => $this->uploadService->queueUpload($this->invoice))
+            ->toThrow(fn (DuplicateUploadException $e) => expect($e->getMessage())
+                ->toContain("--filed={$first->id} --index=<index_incarcare as shown in SPV>")
+                ->not->toContain('--index=ABC-123'));
+    });
+
     /**
      * The recycled row kept the old attempt's counters, so its new response was never
      * downloaded (3.x stopped after three response tries); now it would start at the old
@@ -412,6 +473,12 @@ describe('re-uploading after a failure', function () {
             'status' => UploadStatus::Failed,
             'failure_reason' => FailureReason::Validation,
             'download_id' => '9001',
+            'upload_index' => '5001130255',
+            'uploaded_at' => now(),
+            'response_path' => 'efactura/responses/old.zip',
+            'response_verification' => ResponseVerification::Verified,
+            'processed_at' => now(),
+            'next_poll_at' => now()->addHour(),
             'response_attempts' => 3,
             'response_failed_at' => now(),
             'status_failures' => 2,
@@ -421,7 +488,14 @@ describe('re-uploading after a failure', function () {
 
         expect($second->response_attempts)->toBe(0)
             ->and($second->response_failed_at)->toBeNull()
-            ->and($second->status_failures)->toBe(0);
+            ->and($second->status_failures)->toBe(0)
+            ->and($second->download_id)->toBeNull()
+            ->and($second->upload_index)->toBeNull()
+            ->and($second->uploaded_at)->toBeNull()
+            ->and($second->response_path)->toBeNull()
+            ->and($second->response_verification)->toBeNull()
+            ->and($second->processed_at)->toBeNull()
+            ->and($second->next_poll_at)->toBeNull();
     });
 
     /**
@@ -431,7 +505,7 @@ describe('re-uploading after a failure', function () {
      */
     it('does not recycle a failed row another worker re-drove after it was read', function () {
         $first = $this->uploadService->queueUpload($this->invoice);
-        $first->update(['status' => UploadStatus::Failed, 'failure_reason' => FailureReason::Transient]);
+        $first->update(['status' => UploadStatus::Failed, 'failure_reason' => FailureReason::Validation]);
 
         $fired = false;
         EfacturaUpload::retrieved(function (EfacturaUpload $upload) use (&$fired) {

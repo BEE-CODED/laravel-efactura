@@ -54,6 +54,7 @@ class EfacturaMessage extends Model
         'is_downloaded',
         'message_date',
         'download_attempts',
+        'next_download_at',
     ];
 
     protected $casts = [
@@ -114,6 +115,6 @@ class EfacturaMessage extends Model
             ->where('is_downloaded', false)
             ->whereNotNull('download_id')
             ->where(fn (Builder $due) => $due->whereNull('next_download_at')->orWhere('next_download_at', '<=', now()))
-            ->whereRaw('COALESCE(message_date, created_at) >= ?', [now()->subDays(60)]);
+            ->whereRaw('COALESCE(message_date, created_at) >= ?', [now()->subSeconds(60 * 86400)]);
     }
 }

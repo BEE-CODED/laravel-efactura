@@ -20,6 +20,11 @@ use Illuminate\Support\Facades\Schema;
  * efactura_uploads.next_poll_at: when the next status read is due (null = due now), so a
  * status run reads each upload on the SDK's PollSchedule instead of on every run.
  *
+ * An index on (status, efactura_token_id, processed_at) for the response-download reads. Status
+ * leads: one led by the token column could stand in for the foreign key's own index on
+ * MySQL/MariaDB, which would then refuse to drop it. Named: the generated name overruns the
+ * 64-character limit with a table prefix.
+ *
  * Drops two indexes others cover: the plain (uploadable_type, uploadable_id) index from
  * morphs(), covered by the 000006 unique index (only when that index exists), and the plain
  * `status` index, covered by (status, next_poll_at).
@@ -49,6 +54,12 @@ return new class extends Migration
             });
         }
 
+        if (!Schema::hasIndex('efactura_uploads', ['status', 'efactura_token_id', 'processed_at'])) {
+            Schema::table('efactura_uploads', function (Blueprint $table) {
+                $table->index(['status', 'efactura_token_id', 'processed_at'], 'efactura_uploads_response_due_index');
+            });
+        }
+
         // The morphs() index goes only once a unique index covers it: run with --path before 000006
         // (its abort message's route), it stays, and is left in place when 000006 runs later.
         $drop = [['status']];
@@ -74,6 +85,12 @@ return new class extends Migration
         if (Schema::hasIndex('efactura_uploads', ['status', 'next_poll_at'])) {
             Schema::table('efactura_uploads', function (Blueprint $table) {
                 $table->dropIndex(['status', 'next_poll_at']);
+            });
+        }
+
+        if (Schema::hasIndex('efactura_uploads', 'efactura_uploads_response_due_index')) {
+            Schema::table('efactura_uploads', function (Blueprint $table) {
+                $table->dropIndex('efactura_uploads_response_due_index');
             });
         }
 

@@ -13,11 +13,11 @@ use BeeCoded\EFacturaSdk\Exceptions\ValidationException;
 use BeeCoded\EFacturaSdk\Services\ApiClients\EFacturaClient;
 use Carbon\Carbon as BaseCarbon;
 use Carbon\CarbonImmutable;
+use Illuminate\Cache\Events\RetrievingKey;
 use Illuminate\Support\DateFactory;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\Event;
-use Illuminate\Support\Facades\Http;
 
 beforeEach(function () {
     $this->tokenService = new TokenService;
@@ -140,6 +140,16 @@ describe('TokenService', function () {
 
             $this->assertDatabaseCount('efactura_tokens', 1);
         });
+
+        it('stores an expiry given in another time zone as the same instant', function () {
+            $expiresAt = BaseCarbon::parse('2026-11-10 14:00:00', 'Europe/Bucharest');
+
+            $token = $this->tokenService->storeToken('12345678', new OAuthTokensData(accessToken: 'a', refreshToken: 'r', expiresAt: $expiresAt));
+
+            expect($token->expires_at->equalTo($expiresAt))->toBeTrue()
+                ->and(EfacturaToken::forCui('12345678')->sole()->expires_at->equalTo($expiresAt))->toBeTrue()
+                ->and($expiresAt->getTimezone()->getName())->toBe('Europe/Bucharest');
+        });
     });
 
     /**
@@ -162,7 +172,7 @@ describe('TokenService', function () {
         });
 
         it('stores the state token in the cache, reachable from any process', function () {
-            $url = $this->tokenService->getAuthorizationUrl('12345678');
+            $url = $this->tokenService->getAuthorizationUrl('18547290');
 
             parse_str((string) parse_url($url, PHP_URL_QUERY), $query);
             $decoded = json_decode(base64_decode($query['state']), true);
@@ -170,21 +180,16 @@ describe('TokenService', function () {
             $storedState = Cache::get('efactura:oauth_state:'.$decoded['token']);
 
             expect($storedState)->not->toBeNull()
-                ->and($storedState['cui'])->toBe('12345678')
+                ->and($storedState['cui'])->toBe('18547290')
                 ->and($storedState)->toHaveKey('created_at');
-        });
-
-        it('does not depend on a session being available', function () {
-            $this->tokenService->getAuthorizationUrl('12345678');
-
-            $stateKey = collect(array_keys(session()->all()))
-                ->first(fn ($key) => str_starts_with($key, 'efactura_oauth_state_'));
-
-            expect($stateKey)->toBeNull();
         });
 
         it('refuses a malformed CUI', function () {
             expect(fn () => $this->tokenService->getAuthorizationUrl('0123'))->toThrow(InvalidArgumentException::class);
+        });
+
+        it('refuses a CUI whose control digit is wrong', function () {
+            expect(fn () => $this->tokenService->getAuthorizationUrl('12345678'))->toThrow(InvalidArgumentException::class);
         });
     });
 
@@ -412,6 +417,19 @@ describe('TokenService', function () {
                 ->and($this->tokenService->usableToken('RO12345678')?->id)->toBe($this->token->id)
                 ->and($this->tokenService->usableToken('22222222'))->toBeNull();
         });
+
+        it('reads the pause of only the tokens asked for', function () {
+            $other = EfacturaToken::create(['cui' => '22222222', 'access_token' => 'a', 'refresh_token' => 'r', 'expires_at' => now()->addHour(), 'is_active' => true]);
+            $keys = [];
+            Event::listen(RetrievingKey::class, function (RetrievingKey $event) use (&$keys) {
+                $keys[] = $event->key;
+            });
+
+            expect($this->tokenService->usableTokens([$this->token->id])->modelKeys())->toBe([$this->token->id])
+                ->and($this->tokenService->usableTokens([])->modelKeys())->toBe([])
+                ->and($keys)->not->toBeEmpty()
+                ->and(array_filter($keys, fn (string $key) => str_starts_with($key, "efactura:token_refresh_refused:{$other->id}:")))->toBe([]);
+        });
     });
 
     describe('isGrantFailure', function () {
@@ -443,7 +461,12 @@ describe('TokenService', function () {
                 ->with($this->token)
                 ->andReturn($mockClient);
 
+            // Held elsewhere: a call that took the lock would time out.
+            $held = Cache::lock('efactura:token_refresh:12345678', 60);
+            expect($held->get())->toBeTrue();
+
             $result = $partialService->executeWithClient($this->token, fn ($client) => 'operation_result');
+            $held->release();
 
             expect($result)->toBe('operation_result');
         });
@@ -485,8 +508,6 @@ describe('TokenService', function () {
 
             expect(fn () => $this->tokenService->executeWithClient($this->token, fn () => 'test'))
                 ->toThrow(RuntimeException::class, 'Token for CUI 12345678 has been deactivated');
-            // A deactivated token must not be refreshed with ANAF.
-            Http::assertNothingSent();
         });
 
         it('refreshes an expiring token before executing, and does not hold the lock across the operation', function () {

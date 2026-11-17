@@ -58,6 +58,8 @@ class EfacturaSyncCommand extends Command
         $this->info('Syncing messages from ANAF...');
         $synced = 0;
         $failed = false;
+        // Apart from $failed: a download-only failure leaves the count complete.
+        $syncFailed = false;
 
         foreach ($tokens as $token) {
             try {
@@ -66,6 +68,7 @@ class EfacturaSyncCommand extends Command
                 report($e);
                 $this->error("Message sync failed for {$token->cui} (".class_basename($e).'); see the log.');
                 $failed = true;
+                $syncFailed = true;
             }
 
             if (!$download) {
@@ -86,7 +89,7 @@ class EfacturaSyncCommand extends Command
             }
         }
 
-        $this->info("Synced {$synced} message(s).");
+        $this->info("Synced {$synced} message(s)".($syncFailed ? '; a company whose sync failed may have stored more' : '').'.');
 
         if ($failed) {
             return self::FAILURE;

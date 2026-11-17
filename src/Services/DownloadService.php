@@ -36,6 +36,7 @@ use BeeCoded\EFacturaSdk\Exceptions\ValidationException;
 use BeeCoded\EFacturaSdk\Services\ApiClients\EFacturaClient;
 use BeeCoded\EFacturaSdk\Support\ArchiveInspector;
 use BeeCoded\EFacturaSdk\Support\PollSchedule;
+use Illuminate\Contracts\Encryption\DecryptException;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -88,6 +89,10 @@ class DownloadService
             Log::error('EFactura: Upload has no associated token', ['upload_id' => $upload->id]);
 
             return StatusCheckOutcome::NotPollable;
+        }
+
+        if ($this->grantUnusable($upload->token)) {
+            return StatusCheckOutcome::Failed;
         }
 
         try {
@@ -371,6 +376,10 @@ class DownloadService
             return false;
         }
 
+        if ($this->grantUnusable($upload->token)) {
+            return false;
+        }
+
         try {
             return $this->fetchResponse($upload, force: true);
         } catch (StopBatch) {
@@ -418,7 +427,7 @@ class DownloadService
             // row re-queued meanwhile (a new or no download id) must not get this attempt's file.
             $stored = $this->storeThenRecord(
                 fn () => $this->storeResponse($upload, $response->content),
-                fn (string $path) => $this->responseRow($upload)->update(['response_path' => $path, 'response_verification' => $verification]) > 0,
+                fn (string $path) => $this->responseRow($upload)->update(['response_path' => $path, 'response_verification' => $verification, 'response_failed_at' => null]) > 0,
                 fn () => EfacturaUpload::whereKey($upload->id)->value('response_path'),
             );
 
@@ -556,6 +565,10 @@ class DownloadService
             return false;
         }
 
+        if ($this->grantUnusable($message->token)) {
+            return false;
+        }
+
         try {
             return $this->fetchMessage($message, force: true);
         } catch (StopBatch) {
@@ -612,7 +625,8 @@ class DownloadService
                 fn () => EfacturaMessage::whereKey($message->id)->value('xml_path'),
             );
 
-            if ($stored) {
+            // A sent or error message downloaded by hand is stored, but it is no received invoice.
+            if ($stored && $message->isReceived()) {
                 rescue(fn () => event(new InvoiceReceived($message)));
             }
 
@@ -743,8 +757,7 @@ class DownloadService
      */
     private function eachDue(EfacturaToken $token, Builder $due, string $dueColumn, \Closure $try): bool
     {
-        // A paused grant would refuse every row: claim none.
-        if ($this->tokenService->refreshCooldownSeconds($token) > 0) {
+        if ($this->grantUnusable($token)) {
             return false;
         }
 
@@ -770,6 +783,36 @@ class DownloadService
         }
 
         return true;
+    }
+
+    /**
+     * Whether the grant would fail every row before ANAF is asked: a deactivated company, a
+     * refresh token this APP_KEY cannot decrypt, or a paused grant. Such a run claims no row.
+     */
+    private function grantUnusable(EfacturaToken $token): bool
+    {
+        // Null on a model created without it: the column defaults to active.
+        if ($token->is_active === false) {
+            Log::warning('EFactura: the company is deactivated; nothing was read', ['cui' => $token->cui]);
+
+            return true;
+        }
+
+        try {
+            $token->getAttribute('refresh_token');
+        } catch (DecryptException) {
+            Log::warning('EFactura: the token cannot be decrypted; re-authorise the company', ['cui' => $token->cui]);
+
+            return true;
+        }
+
+        if (($seconds = $this->tokenService->refreshCooldownSeconds($token)) > 0) {
+            Log::warning('EFactura: the grant is paused after a failed refresh; nothing was read', ['cui' => $token->cui, 'retry_after_seconds' => $seconds]);
+
+            return true;
+        }
+
+        return false;
     }
 
     /**

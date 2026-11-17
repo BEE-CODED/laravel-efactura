@@ -42,6 +42,16 @@ describe('EfacturaMessage Model', function () {
         expect($this->message->fresh()->is_downloaded)->toBeBool()->toBeFalse();
     });
 
+    it('lets a host make a received invoice due now', function () {
+        $this->message->update(['type' => 'received']);
+        EfacturaMessage::whereKey($this->message->id)->update(['next_download_at' => now()->addHour()]);
+
+        $this->message->refresh()->update(['next_download_at' => null]);
+
+        expect($this->message->fresh()->next_download_at)->toBeNull()
+            ->and(EfacturaMessage::needsDownload()->pluck('id')->all())->toContain($this->message->id);
+    });
+
     it('casts message_date to datetime', function () {
         $this->message->update(['message_date' => now()]);
         expect($this->message->fresh()->message_date)->toBeInstanceOf(Carbon::class);

@@ -40,7 +40,8 @@ trait ReadsEfacturaInput
 
     /**
      * The active tokens the command works for, paused ones included so it can report them:
-     * all of them without --cui, else the one company --cui names.
+     * all of them without --cui, except a row stored under a non-canonical CUI, which is
+     * skipped with a line; else the one company --cui names.
      *
      * @return Collection<int, EfacturaToken>|null Null when --cui names no active company.
      */
@@ -49,7 +50,16 @@ trait ReadsEfacturaInput
         $raw = $this->given('cui');
 
         if ($raw === null) {
-            return EfacturaToken::active()->get();
+            // A legacy row no per-CUI path reaches (TokenService::usableTokens() skips it too).
+            return EfacturaToken::active()->get()->reject(function (EfacturaToken $token): bool {
+                if (VatNumberValidator::canonical($token->cui) === $token->cui) {
+                    return false;
+                }
+
+                $this->line("{$token->cui}: skipped (non-canonical CUI).");
+
+                return true;
+            })->values();
         }
 
         $cui = VatNumberValidator::canonical($raw);

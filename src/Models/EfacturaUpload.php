@@ -181,7 +181,7 @@ class EfacturaUpload extends Model
             ->whereNotNull('download_id')
             ->whereNull('response_path')
             ->where(fn (Builder $due) => $due->whereNull('next_poll_at')->orWhere('next_poll_at', '<=', now()))
-            ->where('processed_at', '>=', now()->subDays(60));
+            ->where('processed_at', '>=', now()->subSeconds(60 * 86400));
     }
 
     public function scopeForToken(Builder $query, EfacturaToken $token): Builder

@@ -77,6 +77,12 @@ describe('EfacturaToken Model', function () {
             $token = new EfacturaToken(['expires_at' => now()->addMinutes(10)]);
             expect($token->isExpiringSoon(300))->toBeFalse();
         });
+
+        it('uses the package refresh buffer by default', function () {
+            $token = new EfacturaToken(['expires_at' => now()->addSeconds(200)]);
+            expect($token->isExpiringSoon())->toBeFalse()
+                ->and($token->isExpiringSoon(300))->toBeTrue();
+        });
     });
 
     describe('toOAuthTokensData', function () {
@@ -141,6 +147,10 @@ describe('EfacturaToken Model', function () {
 
             expect($tokens)->toHaveCount(1);
             expect($tokens->first()->cui)->toBe('12345678');
+        });
+
+        it('forCui finds the canonical row for an RO-prefixed, spaced CUI', function () {
+            expect(EfacturaToken::forCui('RO 1234 5678')->pluck('cui')->all())->toBe(['12345678']);
         });
     });
 

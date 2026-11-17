@@ -53,8 +53,6 @@ abstract class CompanyBatchJob implements ShouldBeUniqueUntilProcessing, ShouldQ
 
     public int $maxExceptions = 3;
 
-    public int $uniqueFor = 3600;
-
     /**
      * @param  string|null  $cui  The company's CUI, in any spelling canonical() reads; null means every company.
      */
@@ -82,6 +80,15 @@ abstract class CompanyBatchJob implements ShouldBeUniqueUntilProcessing, ShouldQ
     }
 
     /**
+     * The 'all' job only dispatches (WithoutOverlapping keeps its copies apart), so a lock a
+     * failed queue push left behind holds the schedule for two minutes, not an hour.
+     */
+    public function uniqueFor(): int
+    {
+        return $this->cui === null ? 120 : 3600;
+    }
+
+    /**
      * A run longer than the schedule interval must not overlap the next one on another
      * worker: both would spend the same rows' daily ANAF quota.
      *
@@ -101,14 +108,7 @@ abstract class CompanyBatchJob implements ShouldBeUniqueUntilProcessing, ShouldQ
         }
 
         if ($this->cui === null) {
-            $usable = $tokens->usableTokens();
-            $due = $this->due();
-
-            if ($due !== null) {
-                $usable = $usable->whereIn('id', $due->distinct()->pluck('efactura_token_id')->all());
-            }
-
-            foreach ($usable as $token) {
+            foreach ($tokens->usableTokens($this->due()?->distinct()->pluck('efactura_token_id')->all()) as $token) {
                 dispatch(new static($token->cui));
             }
 

@@ -23,6 +23,7 @@ use BeeCoded\EFacturaSdk\Facades\EFacturaSdkAuth;
 use BeeCoded\EFacturaSdk\Services\ApiClients\EFacturaClient;
 use BeeCoded\EFacturaSdk\Support\Validators\VatNumberValidator;
 use Illuminate\Contracts\Cache\LockTimeoutException;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -46,7 +47,8 @@ class TokenService
 
     /**
      * How long a grant is paused after the token endpoint answered with any other failure
-     * (429, 5xx, a malformed 2xx). No answer at all (code 0) pauses nothing.
+     * (429, 5xx, a malformed 2xx), or did not answer a refresh made before the call (code 0).
+     * A request with no answer pauses nothing.
      */
     private const FAILED_REFRESH_COOLDOWN_SECONDS = 60;
 
@@ -82,11 +84,12 @@ class TokenService
      * companies a fan-out or a dispatch run works for. A legacy row with a non-canonical
      * CUI is unreachable by every per-CUI path, so it is skipped here too.
      *
+     * @param  list<int>|null  $ids  Only these tokens (null: every active token)
      * @return Collection<int, EfacturaToken>
      */
-    public function usableTokens(): Collection
+    public function usableTokens(?array $ids = null): Collection
     {
-        return EfacturaToken::active()->get()
+        return EfacturaToken::active()->when($ids !== null, fn (Builder $query) => $query->whereKey($ids))->get()
             ->filter(fn (EfacturaToken $token): bool => VatNumberValidator::canonical($token->cui) === $token->cui
                 && $this->refreshCooldownSeconds($token) === 0)
             ->values();
@@ -159,10 +162,14 @@ class TokenService
      * grant under a CUI they chose. The `efactura:auth` command passes neither, so its
      * state stays valid in whichever browser opens the link.
      *
-     * @throws \InvalidArgumentException When the CUI is not a CUI or CNP
+     * @throws \InvalidArgumentException When the CUI is not a valid CUI or CNP (control digit included)
      */
     public function getAuthorizationUrl(string $cui, #[\SensitiveParameter] ?string $sessionNonce = null, int|string|null $userId = null): string
     {
+        if (!VatNumberValidator::isValid($cui)) {
+            throw new \InvalidArgumentException('A CUI is 2 to 10 digits with a valid control digit, or a valid 13-digit CNP, optionally prefixed with RO.');
+        }
+
         $cui = self::requireCui($cui);
 
         // Generate cryptographically secure state token for CSRF protection.
@@ -280,6 +287,7 @@ class TokenService
      * Create an authenticated SDK client for a CUI.
      *
      * @throws \RuntimeException When the CUI has no active token
+     * @throws RefreshCooldownException When the grant is paused (nothing is sent)
      */
     public function createClientForCui(string $cui): EFacturaClient
     {
@@ -288,6 +296,8 @@ class TokenService
         if (!$token) {
             throw new \RuntimeException("No active token found for CUI: {$cui}");
         }
+
+        $this->guardRefreshCooldown($token);
 
         return $this->createClient($token);
     }
@@ -361,8 +371,8 @@ class TokenService
      * Re-read this token's credentials from the primary store, moving $token forward.
      *
      * Model::refresh() reads through the write connection (no replica lag) and the
-     * `encrypted` casts. A deleted row throws, which the SDK logs before keeping its own
-     * tokens.
+     * `encrypted` casts. A deleted row throws, which fails the call with the SDK's
+     * AuthenticationException (code 0) before any refresh.
      */
     protected function reloadTokensFromStore(EfacturaToken $token): ?OAuthTokensData
     {
@@ -393,7 +403,8 @@ class TokenService
      *
      * An AuthenticationException from the refresh or the operation pauses the grant
      * (see refreshCooldownSeconds()): 15 minutes for a 400/401, 60 s for any other
-     * answered code, nothing for code 0.
+     * answered code or a refresh before the call that got no answer, nothing for a request
+     * with no answer (code 0).
      *
      * @template T
      *
@@ -559,8 +570,9 @@ class TokenService
                 try {
                     $this->refreshToken($token);
                 } catch (AuthenticationException $e) {
-                    // Not deactivated: it may be a passing fault.
-                    $this->pauseGrant($token, $e);
+                    // Not deactivated: it may be a passing fault. A refresh ANAF never answered
+                    // pauses 60 s too, so the workers waiting on this lock do not each send one.
+                    $this->pauseGrant($token, $e, self::FAILED_REFRESH_COOLDOWN_SECONDS);
 
                     throw $e;
                 }
@@ -613,12 +625,12 @@ class TokenService
      * Pause the grant after ANAF refused it or its token endpoint failed. Never throws: a
      * cache that cannot store the pause must not replace the refusal.
      */
-    private function pauseGrant(EfacturaToken $token, AuthenticationException $e): void
+    private function pauseGrant(EfacturaToken $token, AuthenticationException $e, int $unanswered = 0): void
     {
         $seconds = match (true) {
             in_array($e->getCode(), [400, 401], true) => self::REFUSED_REFRESH_COOLDOWN_SECONDS,
             $e->getCode() > 0 => self::FAILED_REFRESH_COOLDOWN_SECONDS,
-            default => 0, // no answer from ANAF: nothing was refused
+            default => $unanswered, // no answer from ANAF: nothing was refused
         };
 
         if ($seconds === 0) {
@@ -684,10 +696,13 @@ class TokenService
 
         $values = $this->storedForm($tokens);
 
+        // Laravel re-runs a write whose connection failed after its commit, and the re-run matches
+        // nothing: ANAF rotates refresh tokens, so a row holding this one proves the write landed.
         $written = $this->saving($token->cui, fn (): bool => EfacturaToken::whereKey($token->getKey())
             ->where('is_active', true)
             ->where('refresh_token', $spent)
-            ->update($values) > 0);
+            ->update($values) > 0)
+            || rescue(fn (): bool => EfacturaToken::whereKey($token->getKey())->first()?->refresh_token === $tokens->refreshToken, false, report: false);
 
         if ($written) {
             $token->setRawAttributes(array_merge($token->getAttributes(), $values), true);
@@ -706,12 +721,14 @@ class TokenService
     {
         // On PostgreSQL the stored form carries the offset (EfacturaToken::getDateFormat()):
         // never bind a Carbon for expires_at, the query grammar formats it without an offset
-        // and the session time zone would decide the instant.
+        // and the session time zone would decide the instant. Off PostgreSQL the column is naive
+        // and read in the app zone, so the expiry is moved there first (as
+        // MessageSyncService::parseMessageDate does).
         return (new EfacturaToken)->forceFill([
             'access_token' => $tokens->accessToken,
             'refresh_token' => $tokens->refreshToken,
             // shortcut: ANAF omitted expires_in, refresh hourly instead of on every call
-            'expires_at' => $tokens->expiresAt ?? now()->addHour(),
+            'expires_at' => $tokens->expiresAt?->copy()->setTimezone(date_default_timezone_get()) ?? now()->addHour(),
         ])->getAttributes();
     }
 

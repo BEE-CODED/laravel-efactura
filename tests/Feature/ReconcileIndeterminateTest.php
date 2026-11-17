@@ -11,12 +11,18 @@
 
 use BeeCoded\EFactura\Enums\FailureReason;
 use BeeCoded\EFactura\Enums\UploadStatus;
+use BeeCoded\EFactura\Events\InvoiceUploaded;
 use BeeCoded\EFactura\Exceptions\DuplicateUploadException;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
+use BeeCoded\EFactura\Services\DownloadService;
+use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFactura\Tests\Fixtures\TestInvoice;
+use BeeCoded\EFacturaSdk\Services\RateLimiter;
 use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 
 /**
  * The human resolution path for indeterminate uploads.
@@ -57,6 +63,7 @@ function makeIndeterminateUpload(): EfacturaUpload
 
 describe('resolving an indeterminate upload as FILED', function () {
     it('hands it back to the normal status-check pipeline with the real ANAF index', function () {
+        Event::fake([InvoiceUploaded::class]);
         $upload = makeIndeterminateUpload();
 
         $resolved = $this->uploadService->resolveIndeterminateAsFiled($upload, '5001130255');
@@ -68,6 +75,8 @@ describe('resolving an indeterminate upload as FILED', function () {
             ->and($upload->upload_index)->toBe('5001130255')
             ->and($upload->failure_reason)->toBeNull()
             ->and($upload->uploaded_at)->not->toBeNull();
+        // As for an index ANAF assigned on the upload itself.
+        Event::assertDispatchedTimes(InvoiceUploaded::class, 1);
     });
 
     it('makes the upload visible to the status checker again', function () {
@@ -78,11 +87,13 @@ describe('resolving an indeterminate upload as FILED', function () {
     });
 
     it('refuses to touch an upload that is not indeterminate', function () {
+        Event::fake([InvoiceUploaded::class]);
         $upload = makeIndeterminateUpload();
         $upload->update(['failure_reason' => FailureReason::Validation]);
 
         expect($this->uploadService->resolveIndeterminateAsFiled($upload, '5001130255'))->toBeFalse();
         expect($upload->fresh()->status)->toBe(UploadStatus::Failed);
+        Event::assertNotDispatched(InvoiceUploaded::class);
     });
 });
 
@@ -115,22 +126,16 @@ describe('resolving an indeterminate upload as NOT FILED', function () {
 
     it('refuses to touch an upload that is not indeterminate', function () {
         $upload = makeIndeterminateUpload();
-        $upload->update(['failure_reason' => FailureReason::RateLimited]);
+        $upload->update(['failure_reason' => FailureReason::Validation]);
 
         expect($this->uploadService->resolveIndeterminateAsNotFiled($upload))->toBeFalse();
         expect($upload->fresh()->status)->toBe(UploadStatus::Failed);
     });
 });
 
-it('clears the parked outcome\'s response and attempt counters on either resolution', function (Closure $resolve) {
+it('clears the parked outcome\'s response and attempt counters on either resolution', function (Closure $parked, Closure $resolve) {
     $upload = makeIndeterminateUpload();
-    $upload->update([
-        'download_id' => '3001234567',
-        'response_path' => 'efactura/responses/old.zip',
-        'response_attempts' => 3,
-        'response_failed_at' => now(),
-        'status_failures' => 2,
-    ]);
+    $upload->update(['upload_index' => '5001130255', 'uploaded_at' => now(), 'processed_at' => now(), ...$parked()]);
 
     expect($resolve($this->uploadService, $upload))->toBeTrue();
 
@@ -141,8 +146,11 @@ it('clears the parked outcome\'s response and attempt counters on either resolut
         ->and($upload->response_failed_at)->toBeNull()
         ->and($upload->status_failures)->toBe(0);
 })->with([
+    'parked by a status answer' => [fn () => ['download_id' => '3001234567', 'response_path' => 'efactura/responses/old.zip', 'response_attempts' => 3, 'response_failed_at' => now()]],
+    'parked after exhausted status reads' => [fn () => ['status_failures' => DownloadService::MAX_STATUS_FAILURES]],
+])->with([
     'filed' => [fn (UploadService $service, EfacturaUpload $upload) => $service->resolveIndeterminateAsFiled($upload, '5001130255')],
-    'not filed' => [fn (UploadService $service, EfacturaUpload $upload) => $service->resolveIndeterminateAsNotFiled($upload)],
+    'not filed despite its index' => [fn (UploadService $service, EfacturaUpload $upload) => $service->resolveIndeterminateAsNotFiled($upload, despiteIndex: true)],
 ]);
 
 describe('the efactura:reconcile command', function () {
@@ -172,6 +180,28 @@ describe('the efactura:reconcile command', function () {
             ->and($upload->fresh()->upload_index)->toBe('5001130255');
     });
 
+    // Laravel re-runs a write whose connection failed after its commit; the re-run matches nothing.
+    it('announces a resolution whose write committed before its connection failed', function () {
+        Event::fake([InvoiceUploaded::class]);
+        $upload = makeIndeterminateUpload();
+        $ran = false;
+        DB::connection()->beforeExecuting(function (string $query, array $bindings) use (&$ran) {
+            if (!$ran && str_starts_with(strtolower($query), 'update') && in_array('5001130255', $bindings, true)) {
+                $ran = true;
+                DB::affectingStatement($query, $bindings);
+            }
+        });
+
+        $this->artisan('efactura:reconcile', [
+            '--filed' => (string) $upload->id,
+            '--index' => '5001130255',
+        ])->assertExitCode(0);
+
+        expect($ran)->toBeTrue()
+            ->and($upload->fresh())->status->toBe(UploadStatus::Processing);
+        Event::assertDispatchedTimes(InvoiceUploaded::class, 1);
+    });
+
     it('requires an ANAF index when resolving as filed', function () {
         $upload = makeIndeterminateUpload();
 
@@ -190,12 +220,13 @@ describe('the efactura:reconcile command', function () {
         expect($upload->fresh()->status)->toBe(UploadStatus::Pending);
     });
 
-    it('lists the upload index and upload time of an upload parked after ANAF indexed it', function () {
+    // In Romanian time with its zone, as SPV shows it; Parked at is when it was parked, not its last write.
+    it('lists the upload index, upload time and park time of an upload parked after ANAF indexed it', function () {
         $upload = makeIndeterminateUpload();
-        $upload->update(['upload_index' => '5001130255', 'uploaded_at' => '2026-11-09 10:15:00']);
+        $upload->update(['upload_index' => '5001130255', 'uploaded_at' => '2026-11-09 10:15:00', 'processed_at' => '2026-11-09 10:20:00']);
 
         expect(Artisan::call('efactura:reconcile'))->toBe(0)
-            ->and(Artisan::output())->toContain('Upload index', 'Uploaded at', 'Parked at', '5001130255', '2026-11-09 10:15:00');
+            ->and(Artisan::output())->toContain('Upload index', 'Uploaded at', 'Parked at', '5001130255', '2026-11-09 12:15:00 EET', '2026-11-09 12:20:00 EET');
     });
 
     it('refuses --not-filed for an upload with an upload index and suggests --filed with it', function () {
@@ -231,6 +262,17 @@ describe('the efactura:reconcile command', function () {
         'a zero --filed' => fn () => ['--filed' => '0', '--index' => '1'],
     ]);
 
+    // An index ANAF cannot have assigned (kept from an unreadable answer) is not offered as --index.
+    it('suggests no unusable index with --filed', function () {
+        $upload = makeIndeterminateUpload();
+        $upload->update(['upload_index' => 'ABC-123']);
+
+        $this->artisan('efactura:reconcile', ['--not-filed' => (string) $upload->id])
+            ->expectsOutputToContain("--filed={$upload->id} --index=<index_incarcare as shown in SPV>")
+            ->doesntExpectOutputToContain('--index=ABC-123')
+            ->assertExitCode(1);
+    });
+
     it('leaves an upload parked with another ANAF index than the one given without a confirmation', function () {
         $upload = makeIndeterminateUpload();
         $upload->update(['upload_index' => '5001130255']);
@@ -260,6 +302,23 @@ describe('the efactura:reconcile command', function () {
         $upload->update(['failure_reason' => FailureReason::Validation]);
 
         $this->artisan('efactura:reconcile', ['--not-filed' => (string) $upload->id])
+            ->expectsOutputToContain('status: failed, reason: validation, upload index: none')
+            ->assertExitCode(1);
+    });
+
+    // The resolution landed but its reply was lost, or another writer moved the row first.
+    it('reports the row as it is now when the resolution finds it moved', function () {
+        $upload = makeIndeterminateUpload();
+        $uploadService = Mockery::mock(UploadService::class.'[resolveIndeterminateAsNotFiled]', [app(TokenService::class), app(RateLimiter::class)]);
+        $uploadService->shouldReceive('resolveIndeterminateAsNotFiled')->once()->andReturnUsing(function (EfacturaUpload $upload) {
+            EfacturaUpload::whereKey($upload->id)->update(['status' => UploadStatus::Pending, 'failure_reason' => null]);
+
+            return false;
+        });
+        app()->instance(UploadService::class, $uploadService);
+
+        $this->artisan('efactura:reconcile', ['--not-filed' => (string) $upload->id])
+            ->expectsOutputToContain('status: pending, reason: none')
             ->assertExitCode(1);
     });
 });

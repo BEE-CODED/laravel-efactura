@@ -19,7 +19,7 @@ enum ResponseVerification: string
     /** It holds exactly the uploaded invoice, plus only signatures. */
     case Verified = 'verified';
 
-    /** Only its limits were checked: a rejection report, or the uploaded XML is not stored. */
+    /** Only its limits were checked: the upload is not Completed (a rejection report, or the archive of an indeterminate upload), or its uploaded XML is not stored. */
     case LimitsOnly = 'limits_only';
 
     /** It does not hold the uploaded invoice. Kept as ANAF sent it, and logged. */

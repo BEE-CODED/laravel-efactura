@@ -116,7 +116,10 @@ class EfacturaToken extends Model
         return $this->expires_at->isPast();
     }
 
-    public function isExpiringSoon(int $bufferSeconds = 300): bool
+    /**
+     * Within the package's refresh buffer (120 s, TokenService) by default.
+     */
+    public function isExpiringSoon(int $bufferSeconds = 120): bool
     {
         if (!$this->expires_at) {
             return true;
@@ -141,6 +144,7 @@ class EfacturaToken extends Model
 
     public function scopeForCui(Builder $query, string $cui): Builder
     {
-        return $query->where('cui', $cui);
+        // A malformed argument still matches a malformed legacy row as stored.
+        return $query->where('cui', VatNumberValidator::canonical($cui) ?? $cui);
     }
 }

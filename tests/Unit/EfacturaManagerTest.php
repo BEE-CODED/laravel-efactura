@@ -101,7 +101,7 @@ describe('EfacturaManager', function () {
                 'total' => 200,
             ]);
 
-            $options = ['is_extern' => true];
+            $options = ['extern' => true];
             $upload = new EfacturaUpload(['id' => 2]);
 
             $this->uploadService->shouldReceive('queueUpload')

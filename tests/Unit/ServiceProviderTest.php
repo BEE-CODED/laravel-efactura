@@ -72,21 +72,35 @@ describe('EfacturaServiceProvider', function () {
     });
 
     describe('Configuration', function () {
-        it('merges default config', function () {
-            expect(config('efactura.enabled'))->not->toBeNull();
-            expect(config('efactura.features'))->toBeArray();
-            expect(config('efactura.storage'))->toBeArray();
+        // Only keys the TestCase does not set: those prove mergeConfigFrom ran.
+        it('merges the package defaults under the keys the app does not set', function () {
+            expect(config()->has('efactura.pipeline_tables'))->toBeTrue()
+                ->and(config('efactura.anaf_lookup.retry_attempts'))->not->toBeNull();
+        });
+    });
+
+    describe('the env normaliser', function () {
+        beforeEach(function () {
+            $this->register = fn () => (new EfacturaServiceProvider(app()))->register();
         });
 
-        it('has default feature flags', function () {
-            expect(config('efactura.features.upload_invoices'))->toBeBool();
-            expect(config('efactura.features.download_received'))->toBeBool();
-            expect(config('efactura.features.sync_messages'))->toBeBool();
-        });
+        it('gives blank storage and lookup values their defaults', function (mixed $value) {
+            config(['efactura.storage.disk' => $value, 'efactura.storage.path' => $value, 'efactura.anaf_lookup.retry_attempts' => $value]);
 
-        it('has storage configuration', function () {
-            expect(config('efactura.storage.disk'))->toBeString();
-            expect(config('efactura.storage.path'))->toBeString();
+            ($this->register)();
+
+            expect(config('efactura.storage.disk'))->toBe('local')
+                ->and(config('efactura.storage.path'))->toBe('efactura')
+                ->and(config('efactura.anaf_lookup.retry_attempts'))->toBe(5);
+        })->with(['empty' => [''], 'null' => [null], 'spaces' => ['  '], 'true' => [true]]);
+
+        it('keeps explicit values', function () {
+            config(['efactura.storage.disk' => 's3', 'efactura.anaf_lookup.retry_attempts' => '3']);
+
+            ($this->register)();
+
+            expect(config('efactura.storage.disk'))->toBe('s3')
+                ->and(config('efactura.anaf_lookup.retry_attempts'))->toBe(3);
         });
     });
 
@@ -101,6 +115,18 @@ describe('EfacturaServiceProvider', function () {
             expect(Route::has('efactura.auth'))->toBe($enabled)
                 ->and(Route::has('efactura.callback'))->toBe($enabled);
         })->with(['enabled' => [true], 'disabled' => [false]]);
+
+        it('mounts the OAuth routes under efactura for a blank prefix', function (mixed $prefix) {
+            config(['efactura.routes.prefix' => $prefix, 'efactura.routes.enabled' => true]);
+            (new EfacturaServiceProvider(app()))->register();
+
+            Route::setRoutes(new RouteCollection);
+            (fn () => $this->registerRoutes())->call(app()->getProvider(EfacturaServiceProvider::class));
+            Route::getRoutes()->refreshNameLookups();
+
+            expect(route('efactura.callback', [], false))->toBe('/efactura/callback')
+                ->and(route('efactura.auth', ['cui' => '18547290'], false))->toBe('/efactura/auth/18547290');
+        })->with(['empty' => [''], 'null' => [null], 'false' => [false]]);
     });
 
     describe('Console Commands', function () {

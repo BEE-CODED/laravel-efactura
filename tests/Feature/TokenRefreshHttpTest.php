@@ -254,6 +254,7 @@ describe('token refresh over the real SDK client', function () {
             $token,
             fn ($client) => $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60))
         ))->toThrow(RuntimeException::class, 'has been deactivated');
+        Http::assertNothingSent();
     });
 
     it('takes the fast path when another process already refreshed the token', function () {
@@ -373,16 +374,10 @@ describe('persisting a refresh that raced another worker', function () {
             LIST_MESSAGES_URL => Http::response($this->listMessagesBody),
         ]);
 
-        // 121s of life: OUTSIDE the wrapper's 120s buffer, so executeWithClient
+        // 122s of life: OUTSIDE the wrapper's 120s buffer, so executeWithClient
         // takes its lock-free path and leaves the refresh to the SDK, whose
         // persister saves the grant mid-call.
-        $token = EfacturaToken::create([
-            'cui' => '12345678',
-            'access_token' => 'OLD_ACCESS',
-            'refresh_token' => 'OLD_REFRESH',
-            'expires_at' => now()->addSeconds(121),
-            'is_active' => true,
-        ]);
+        $token = makeTokenTheSdkWillRefresh();
 
         // A sibling worker persists a LATER grant just before our first save of the grant runs.
         $sibling = false;
@@ -434,6 +429,21 @@ function failTokenSaves(): void
 }
 
 /**
+ * Fails only the first token save, the SDK persister's: the save after the call lands.
+ */
+function failFirstTokenSave(): void
+{
+    $failed = false;
+    DB::connection()->beforeExecuting(function (string $query) use (&$failed) {
+        if (!$failed && str_starts_with(strtolower($query), 'update') && str_contains($query, 'refresh_token')) {
+            $failed = true;
+
+            throw new RuntimeException('token save failed');
+        }
+    });
+}
+
+/**
  * Every log record written from here on, as [level, message, context].
  */
 function captureLogs(): ArrayObject
@@ -445,8 +455,9 @@ function captureLogs(): ArrayObject
 }
 
 /**
- * A token just outside the wrapper's 120s buffer: the operation runs unlocked, and the
- * test crosses into the SDK's buffer mid-call so the SDK refreshes in memory.
+ * A token outside the wrapper's 120 s buffer even after the stored expiry drops its fraction
+ * of a second: the operation runs unlocked, and travel(2) inside the call crosses into the
+ * SDK's buffer so the SDK refreshes.
  */
 function makeTokenTheSdkWillRefresh(): EfacturaToken
 {
@@ -454,7 +465,7 @@ function makeTokenTheSdkWillRefresh(): EfacturaToken
         'cui' => '12345678',
         'access_token' => 'OLD_ACCESS',
         'refresh_token' => 'OLD_REFRESH',
-        'expires_at' => now()->addSeconds(121),
+        'expires_at' => now()->addSeconds(122),
         'is_active' => true,
     ]);
 }
@@ -493,6 +504,7 @@ describe('token bookkeeping after an ANAF call', function () {
             OAUTH_TOKEN_URL => Http::response(['access_token' => 'NEW_ACCESS', 'refresh_token' => 'NEW_REFRESH', 'expires_in' => 3600]),
             LIST_MESSAGES_URL => Http::response(['eroare' => 'Bad request'], 400),
         ]);
+        failFirstTokenSave();
 
         $token = makeTokenTheSdkWillRefresh();
 
@@ -513,6 +525,7 @@ describe('token bookkeeping after an ANAF call', function () {
             LIST_MESSAGES_URL => Http::response($this->listMessagesBody),
         ]);
 
+        failFirstTokenSave();
         $token = makeTokenTheSdkWillRefresh();
         $siblingLock = Cache::lock('efactura:token_refresh:12345678', 120);
 
@@ -631,6 +644,52 @@ describe('token bookkeeping after an ANAF call', function () {
             ->and($logs->getArrayCopy())->toContain(['critical', 'EFactura: refreshed token could not be saved; re-authorisation may be needed', ['cui' => '12345678', 'exception' => RuntimeException::class]])
             ->and(json_encode($logs->getArrayCopy()))->not->toContain('SECRET_CIPHERTEXT');
     });
+
+    it('stores no grant the SDK refreshed on a token deactivated during the call', function () {
+        Event::fake([TokenRefreshed::class]);
+        Http::fake([
+            OAUTH_TOKEN_URL => Http::response(['access_token' => 'NEW_ACCESS', 'refresh_token' => 'NEW_REFRESH', 'expires_in' => 3600]),
+            LIST_MESSAGES_URL => Http::response($this->listMessagesBody),
+        ]);
+        $token = makeTokenTheSdkWillRefresh();
+
+        $result = $this->tokenService->executeWithClient($token, function ($client) use ($token) {
+            EfacturaToken::whereKey($token->id)->update(['is_active' => false]);
+            $this->travel(2)->seconds();
+
+            return $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60));
+        });
+
+        expect($result)->toBeInstanceOf(ListMessagesResponseData::class)
+            ->and($token->fresh()->refresh_token)->toBe('OLD_REFRESH')
+            ->and($token->fresh()->access_token)->toBe('OLD_ACCESS');
+        Http::assertSent(fn ($request) => $request->url() === OAUTH_TOKEN_URL);
+        Event::assertNotDispatched(TokenRefreshed::class);
+    });
+
+    // Laravel re-runs a write whose connection failed after its commit, and the re-run matches nothing.
+    it('fires TokenRefreshed for a grant whose save committed but whose re-run matched no row', function () {
+        Event::fake([TokenRefreshed::class]);
+        Http::fake([
+            OAUTH_TOKEN_URL => Http::response(['access_token' => 'NEW_ACCESS', 'refresh_token' => 'NEW_REFRESH', 'expires_in' => 3600]),
+            LIST_MESSAGES_URL => Http::response($this->listMessagesBody),
+        ]);
+        $token = makeExpiringToken();
+        $spent = $token->getRawOriginal('refresh_token');
+        $replayed = false;
+        DB::connection()->beforeExecuting(function (string $query, array $bindings, $connection) use (&$replayed, $spent) {
+            if (!$replayed && str_starts_with(strtolower($query), 'update') && in_array($spent, $bindings, true)) {
+                $replayed = true;
+                $connection->affectingStatement($query, $bindings);
+            }
+        });
+
+        $this->tokenService->executeWithClient($token, fn ($client) => $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60)));
+
+        expect($replayed)->toBeTrue()
+            ->and($token->fresh()->refresh_token)->toBe('NEW_REFRESH');
+        Event::assertDispatchedTimes(TokenRefreshed::class, 1);
+    });
 });
 
 /**
@@ -684,14 +743,7 @@ describe('one writer for a refreshed grant', function () {
     it('keeps a re-authorisation stored after the SDK refreshed during the call', function (bool $persisterFails) {
         $logs = captureLogs();
         if ($persisterFails) {
-            $failed = false;
-            DB::connection()->beforeExecuting(function (string $query) use (&$failed) {
-                if (!$failed && str_starts_with(strtolower($query), 'update') && str_contains($query, 'refresh_token')) {
-                    $failed = true;
-
-                    throw new RuntimeException('token save failed');
-                }
-            });
+            failFirstTokenSave();
         }
 
         $this->tokenService->executeWithClient(makeTokenTheSdkWillRefresh(), function ($client) {
@@ -837,6 +889,15 @@ describe('a paused grant', function () {
         Http::assertSentCount($sent);
     })->with(['429' => [429], '503' => [503]]);
 
+    it('refuses EFactura::client() for a grant the pipeline paused', function () {
+        Http::fake([OAUTH_TOKEN_URL => Http::response(['error' => 'invalid_grant'], 400)]);
+        $token = makeExpiringToken();
+
+        expect(fn () => $this->tokenService->executeWithClient($token, fn () => null))->toThrow(AuthenticationException::class)
+            ->and(fn () => EFactura::client('12345678'))->toThrow(RefreshCooldownException::class);
+        Http::assertSentCount(1);
+    });
+
     it('stores the pause before it releases the refresh lock', function () {
         Http::fake([OAUTH_TOKEN_URL => Http::response(['error' => 'slow down'], 429)]);
         $token = makeExpiringToken();
@@ -948,11 +1009,12 @@ describe('a grant ANAF refuses to refresh', function () {
         $token = makeExpiringToken();
         $list = fn ($client) => $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60));
 
-        // This worker finds no cooldown and waits on the lock; meanwhile another takes it
-        // and is refused.
+        // This worker finds no pause before the lock (its second read) and waits on it;
+        // meanwhile another takes it and is refused.
         $other = true;
-        Event::listen(CacheMissed::class, function (CacheMissed $event) use (&$other, $token, $list) {
-            if ($other && str_starts_with($event->key, 'efactura:token_refresh_refused:')) {
+        $misses = 0;
+        Event::listen(CacheMissed::class, function (CacheMissed $event) use (&$other, &$misses, $token, $list) {
+            if ($other && str_starts_with($event->key, 'efactura:token_refresh_refused:') && ++$misses === 2) {
                 $other = false;
                 expect(fn () => $this->tokenService->executeWithClient(EfacturaToken::find($token->id), $list))
                     ->toThrow(AuthenticationException::class);
@@ -965,12 +1027,18 @@ describe('a grant ANAF refuses to refresh', function () {
         Http::assertSentCount(1);
     });
 
-    // Code 0 is no answer from ANAF (here: missing OAuth configuration): the grant was not
-    // refused, so it must not be shut out for 15 minutes.
-    it('starts no cooldown for a refresh failure ANAF did not answer', function (Closure $breakIt) {
-        Http::fake();
+    // Code 0 is no answer from ANAF: nothing was refused, so a minute, not 15. Without the pause
+    // every worker waiting on the lock would send its own refresh.
+    it('pauses for 60 seconds a refresh before the call that ANAF did not answer', function (Closure $breakIt, bool $sends) {
+        // Counted in the fake: the SDK may resend an unsent request once.
+        $posts = 0;
+        Http::fake([OAUTH_TOKEN_URL => function ($request) use (&$posts) {
+            $posts++;
+
+            return Http::failedConnection('cURL error 28: timed out')($request);
+        }]);
+        $breakIt();
         $token = makeExpiringToken();
-        $breakIt($token);
 
         try {
             $this->tokenService->executeWithClient($token, fn () => null);
@@ -978,14 +1046,18 @@ describe('a grant ANAF refuses to refresh', function () {
         } catch (AuthenticationException $e) {
             expect($e->getCode())->toBe(0);
         }
+        $sent = $posts;
 
-        expect($this->tokenService->refreshCooldownSeconds($token->fresh()))->toBe(0);
-        Http::assertNothingSent();
+        expect($sent > 0)->toBe($sends)
+            ->and($this->tokenService->refreshCooldownSeconds($token->fresh()))->toBeGreaterThanOrEqual(1)->toBeLessThanOrEqual(60)
+            ->and(fn () => $this->tokenService->executeWithClient(EfacturaToken::find($token->id), fn () => null))->toThrow(RefreshCooldownException::class)
+            ->and($posts)->toBe($sent);
     })->with([
         'missing OAuth configuration' => [function () {
             config(['efactura-sdk.oauth.client_id' => '']);
             app()->forgetInstance(AnafAuthenticatorInterface::class);
-        }],
+        }, false],
+        'no answer from the token endpoint' => [fn () => null, true],
     ]);
 
     it('stops a status run at the refused grant, and the next run before any row', function () {

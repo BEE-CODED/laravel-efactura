@@ -60,24 +60,6 @@ describe('EfacturaUploadCommand', function () {
             ->assertExitCode(0);
     });
 
-    it('sends due uploads inline behind --sync', function () {
-        $due = EfacturaUpload::create([
-            'efactura_token_id' => $this->token->id,
-            'uploadable_type' => 'App\\Models\\Invoice',
-            'uploadable_id' => 1,
-            'status' => UploadStatus::Pending,
-        ]);
-
-        $uploadService = Mockery::mock(UploadService::class);
-        $uploadService->shouldReceive('processUpload')->once()->with(Mockery::on(fn ($upload) => $upload->is($due)));
-        $uploadService->shouldNotReceive('dispatchPendingUploads');
-        $this->app->instance(UploadService::class, $uploadService);
-
-        $this->artisan('efactura:upload', ['--sync' => true])
-            ->expectsOutputToContain('Processed 1 upload(s).')
-            ->assertExitCode(0);
-    });
-
     // No per-CUI path reaches a legacy row stored under a non-canonical CUI (no client can be
     // built for it, no status read finds it), so its uploads wait in Pending untouched.
     it('skips a company stored under a non-canonical CUI', function (array $options) {
@@ -191,9 +173,48 @@ describe('EfacturaStatusCommand', function () {
         $this->app->instance(DownloadService::class, $downloadService);
 
         $this->artisan('efactura:status', ['--upload' => $upload->id])
-            ->expectsOutput("Upload #{$upload->id} was not polled: it has no ANAF upload index yet.")
+            ->expectsOutput("Upload #{$upload->id} was not polled: it is already completed.")
             ->expectsOutput('Downloading response...')
             ->doesntExpectOutput('Done.')
+            ->assertExitCode(0);
+    });
+
+    it('downloads nothing for an upload whose response is already stored', function () {
+        Http::fake();
+        $upload = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 1,
+            'status' => UploadStatus::Completed,
+            'upload_index' => '5001130255',
+            'download_id' => '3001130059',
+            'response_path' => 'efactura/responses/x.zip',
+            'standard' => 'UBL',
+        ]);
+
+        $this->artisan('efactura:status', ['--upload' => $upload->id])
+            ->expectsOutput("Upload #{$upload->id} was not polled: it is already completed.")
+            ->doesntExpectOutput('Downloading response...')
+            ->assertExitCode(0);
+
+        Http::assertNothingSent();
+    });
+
+    it('skips a company stored under a non-canonical CUI', function () {
+        EfacturaToken::create([
+            'cui' => '012345678',
+            'access_token' => 'test',
+            'refresh_token' => 'test',
+            'expires_at' => now()->addHour(),
+            'is_active' => true,
+        ]);
+        $downloadService = Mockery::mock(DownloadService::class);
+        $downloadService->shouldReceive('checkAllStatuses')->once()->with(isTestToken())->andReturn(true);
+        $downloadService->shouldReceive('downloadAllResponses')->once()->with(isTestToken())->andReturn(true);
+        $this->app->instance(DownloadService::class, $downloadService);
+
+        $this->artisan('efactura:status')
+            ->expectsOutput('012345678: skipped (non-canonical CUI).')
             ->assertExitCode(0);
     });
 
@@ -346,6 +367,26 @@ describe('EfacturaSyncCommand', function () {
 
         $this->artisan('efactura:sync', ['--download' => true])
             ->expectsOutput('Skipped --download: features.download_received is disabled.')
+            ->assertExitCode(0);
+    });
+
+    it('skips a company stored under a non-canonical CUI', function () {
+        EfacturaToken::create([
+            'cui' => 'RO12345678',
+            'access_token' => 'test',
+            'refresh_token' => 'test',
+            'expires_at' => now()->addHour(),
+            'is_active' => true,
+        ]);
+        $messageSyncService = Mockery::mock(MessageSyncService::class);
+        $messageSyncService->shouldReceive('syncMessages')->once()->with(isTestToken())->andReturn(0);
+        $downloadService = Mockery::mock(DownloadService::class);
+        $downloadService->shouldReceive('downloadAllReceivedInvoices')->once()->with(isTestToken())->andReturn(true);
+        $this->app->instance(MessageSyncService::class, $messageSyncService);
+        $this->app->instance(DownloadService::class, $downloadService);
+
+        $this->artisan('efactura:sync', ['--download' => true])
+            ->expectsOutput('RO12345678: skipped (non-canonical CUI).')
             ->assertExitCode(0);
     });
 });

@@ -14,6 +14,7 @@ namespace BeeCoded\EFactura;
 use BeeCoded\EFactura\Contracts\EFacturaUploadableInterface;
 use BeeCoded\EFactura\Exceptions\DuplicateUploadException;
 use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
+use BeeCoded\EFactura\Exceptions\RefreshCooldownException;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\DownloadService;
@@ -65,6 +66,7 @@ class EfacturaManager
      *     app(TokenService::class)->handleClientTokenRefresh($client, EFactura::getToken($cui));
      *
      * @throws \RuntimeException When the CUI has no active token
+     * @throws RefreshCooldownException When the grant is paused (nothing is sent)
      */
     public function client(string $cui): EFacturaClient
     {
@@ -76,7 +78,8 @@ class EfacturaManager
     /**
      * @throws PipelineTablesDisabledException
      * @throws \RuntimeException When the CUI has no active token
-     * @throws \InvalidArgumentException When $options['standard'] is not a StandardType value
+     * @throws \InvalidArgumentException When $options has a key other than standard, extern or
+     *                                   self_billed, or an unknown standard
      * @throws DuplicateUploadException See UploadService::queueUpload()
      */
     public function queueUpload(EFacturaUploadableInterface $model, ?array $options = null): EfacturaUpload
@@ -87,7 +90,8 @@ class EfacturaManager
     /**
      * @throws PipelineTablesDisabledException
      * @throws \RuntimeException When the CUI has no active token
-     * @throws \InvalidArgumentException When $options['standard'] is not a StandardType value
+     * @throws \InvalidArgumentException When $options has a key other than standard, extern or
+     *                                   self_billed, or an unknown standard
      * @throws DuplicateUploadException See UploadService::queueUpload()
      */
     public function queueB2CUpload(EFacturaUploadableInterface $model, ?array $options = null): EfacturaUpload

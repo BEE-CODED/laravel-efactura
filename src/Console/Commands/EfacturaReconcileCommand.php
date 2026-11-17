@@ -15,6 +15,7 @@ use BeeCoded\EFactura\Console\Concerns\ReadsEfacturaInput;
 use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\UploadService;
+use BeeCoded\EFacturaSdk\Support\DateHelper;
 use Illuminate\Console\Command;
 
 /**
@@ -98,8 +99,9 @@ class EfacturaReconcileCommand extends Command
                 class_basename($upload->uploadable_type),
                 $upload->uploadable_id,
                 $upload->upload_index ?? '—',
-                $upload->uploaded_at?->format('Y-m-d H:i:s') ?? '—',
-                $upload->updated_at->format('Y-m-d H:i:s'),
+                // In Romanian time with its zone, as SPV shows it; processed_at is when it was parked.
+                $upload->uploaded_at?->copy()->setTimezone(DateHelper::ANAF_TIMEZONE)->format('Y-m-d H:i:s T') ?? '—',
+                $upload->processed_at?->copy()->setTimezone(DateHelper::ANAF_TIMEZONE)->format('Y-m-d H:i:s T') ?? '—',
                 $upload->xml_path ?? '—',
             ])->all()
         );
@@ -157,9 +159,7 @@ class EfacturaReconcileCommand extends Command
         }
 
         if (!$resolved) {
-            $this->error("Upload {$upload->id} is not awaiting reconciliation (status: {$upload->status->value}).");
-
-            return self::FAILURE;
+            return $this->notAwaiting($upload);
         }
 
         $this->info("Upload {$upload->id} marked as filed at ANAF with index {$index}.");
@@ -194,7 +194,8 @@ class EfacturaReconcileCommand extends Command
             $this->error($e->getMessage());
             // Resolving as filed returns it to Processing, which is also how its status is checked again.
             $this->line('Resolve it as filed with that index, which also has its ANAF status checked again:');
-            $this->line("  php artisan efactura:reconcile --filed={$upload->id} --index={$upload->upload_index}");
+            $index = preg_match(UploadService::UPLOAD_INDEX_PATTERN, (string) $upload->upload_index) === 1 ? $upload->upload_index : '<index_incarcare as shown in SPV>';
+            $this->line("  php artisan efactura:reconcile --filed={$upload->id} --index={$index}");
             $this->line("  php artisan efactura:status --upload={$upload->id}");
             $this->line('If you checked SPV under that index and the invoice is not there, re-queue it with:');
             $this->line("  php artisan efactura:reconcile --not-filed={$upload->id} --despite-index");
@@ -203,14 +204,23 @@ class EfacturaReconcileCommand extends Command
         }
 
         if (!$resolved) {
-            $this->error("Upload {$upload->id} is not awaiting reconciliation (status: {$upload->status->value}).");
-
-            return self::FAILURE;
+            return $this->notAwaiting($upload);
         }
 
         $this->info("Upload {$upload->id} re-queued for upload.");
 
         return self::SUCCESS;
+    }
+
+    /** The row as it is now: the model was read before the resolution found it moved. */
+    private function notAwaiting(EfacturaUpload $upload): int
+    {
+        $current = $upload->fresh() ?? $upload;
+
+        $this->error("Upload {$upload->id} is not awaiting reconciliation (status: {$current->status->value}, reason: "
+            .($current->failure_reason->value ?? 'none').', upload index: '.($current->upload_index ?? 'none').').');
+
+        return self::FAILURE;
     }
 
     private function findUpload(string $id): ?EfacturaUpload

@@ -362,6 +362,7 @@ describe('efactura:sync command', function () {
         $this->artisan('efactura:sync', ['--download' => true])
             ->expectsOutputToContain('Message sync failed for 12345678 (QueryException); see the log.')
             ->doesntExpectOutputToContain('SECRET-BINDING')
+            ->expectsOutput('Synced 1 message(s); a company whose sync failed may have stored more.')
             ->assertExitCode(1);
 
         expect(EfacturaMessage::forToken($healthy)->count())->toBe(1);

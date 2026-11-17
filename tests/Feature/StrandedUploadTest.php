@@ -17,9 +17,12 @@ use BeeCoded\EFactura\Jobs\SweepStaleUploads;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\UploadService;
+use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Queue\MaxAttemptsExceededException;
 use Illuminate\Queue\TimeoutExceededException;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Queue;
 
 /**
@@ -83,7 +86,45 @@ describe('a job that dies mid-flight', function () {
         $upload = makeUploadingRow();
         (new ProcessSingleUpload($upload))->failed(new TimeoutExceededException('ProcessSingleUpload has timed out.'));
 
-        Event::assertDispatched(InvoiceFailed::class);
+        // With the row's errors, including the warning that ANAF may have received it.
+        Event::assertDispatched(InvoiceFailed::class, fn (InvoiceFailed $e) => $e->errors === $upload->fresh()->errors && count($e->errors) === 2);
+    });
+
+    // Laravel re-runs a write whose connection failed after its commit; the re-run matches nothing.
+    it('announces a park whose write committed before its connection failed', function () {
+        Event::fake([InvoiceFailed::class]);
+        $logged = 0;
+        Log::listen(function (MessageLogged $log) use (&$logged) {
+            $logged += (int) ($log->message === 'EFactura: Upload stranded mid-flight, needs reconciliation');
+        });
+        $upload = makeUploadingRow();
+        $ran = false;
+        DB::connection()->beforeExecuting(function (string $query, array $bindings) use (&$ran) {
+            if (!$ran && str_starts_with(strtolower($query), 'update') && in_array('indeterminate', $bindings, true)) {
+                $ran = true;
+                DB::affectingStatement($query, $bindings);
+            }
+        });
+
+        (new ProcessSingleUpload($upload))->failed(new TimeoutExceededException('ProcessSingleUpload has timed out.'));
+
+        expect($ran)->toBeTrue()
+            ->and($logged)->toBe(1)
+            ->and($upload->fresh())->failure_reason->toBe(FailureReason::Indeterminate);
+        Event::assertDispatchedTimes(InvoiceFailed::class, 1);
+    });
+
+    // An older job's timeout must not park the attempt a newer job's lease claimed.
+    it('leaves an upload another job\'s lease claimed alone', function () {
+        Event::fake([InvoiceFailed::class]);
+        $upload = makeUploadingRow();
+        $upload->update(['next_poll_at' => '2026-11-17 10:05:00']);
+
+        (new ProcessSingleUpload($upload, '2026-11-17 10:00:00'))->failed(new TimeoutExceededException('ProcessSingleUpload has timed out.'));
+
+        expect($upload->fresh())->status->toBe(UploadStatus::Uploading)
+            ->failure_reason->toBeNull();
+        Event::assertNotDispatched(InvoiceFailed::class);
     });
 
     /**
@@ -240,18 +281,6 @@ describe('a job that fails before anything was sent', function () {
         expect($upload->fresh())->status->toBe(UploadStatus::Pending)
             ->status_failures->toBe(0)
             ->and($upload->fresh()->next_poll_at->equalTo($lease))->toBeTrue();
-    });
-
-    /**
-     * The guard still matters in the other direction: a job that dies while the row is
-     * genuinely in flight is indeterminate, not merely abandoned.
-     */
-    it('still parks a genuinely in-flight upload as indeterminate', function () {
-        $upload = makeUploadingRow();
-
-        (new ProcessSingleUpload($upload))->failed(new TimeoutExceededException('ProcessSingleUpload has timed out.'));
-
-        expect($upload->fresh()->failure_reason)->toBe(FailureReason::Indeterminate);
     });
 });
 

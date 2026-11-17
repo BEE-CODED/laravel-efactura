@@ -57,8 +57,10 @@ class OAuthCallbackController extends Controller
         if ($error) {
             $errorDescription = $this->queryString($request, 'error_description') ?? '';
 
+            // Request text: control characters would forge log lines.
             report(new \RuntimeException(
-                'OAuth authorization failed: '.Str::limit($error, 100).' - '.Str::limit($errorDescription, 300)
+                'OAuth authorization failed: '.Str::limit(preg_replace('/[\x00-\x1F\x7F]/', ' ', $error), 100)
+                    .' - '.Str::limit(preg_replace('/[\x00-\x1F\x7F]/', ' ', $errorDescription), 300)
             ));
 
             // Clean up any orphan session state from the state parameter
@@ -99,7 +101,10 @@ class OAuthCallbackController extends Controller
         } catch (AuthenticationException $e) {
             report($e);
 
-            return $this->errorRedirect('Failed to exchange authorization code: '.$e->getMessage());
+            // Code 0: ANAF never answered; the message names the transport or the configuration.
+            return $this->errorRedirect($e->getCode() > 0
+                ? 'Failed to exchange authorization code: '.$e->getMessage()
+                : 'Failed to complete the e-Factura authorization. Please try again.');
         } catch (\Exception $e) {
             // Anything else (a failed save) can carry SQL or ciphertext: never show it.
             report($e);

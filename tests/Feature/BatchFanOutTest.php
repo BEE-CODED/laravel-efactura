@@ -23,6 +23,8 @@ use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\DownloadService;
 use BeeCoded\EFactura\Services\MessageSyncService;
 use BeeCoded\EFactura\Services\UploadService;
+use Illuminate\Cache\Events\RetrievingKey;
+use Illuminate\Queue\Connectors\ConnectorInterface;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -114,12 +116,55 @@ describe('a null-CUI batch job', function () {
         foreach ([$a, $c, $d, $e] as $i => $token) {
             giveDueWork($job, $token, $i + 1);
         }
+        if ($job === ProcessPendingUploads::class) {
+            // Leased or waiting out a limit: not due, so no job.
+            EfacturaUpload::create(['efactura_token_id' => $b->id, 'uploadable_type' => 'App\\Models\\Invoice', 'uploadable_id' => 5, 'status' => UploadStatus::Pending, 'next_poll_at' => now()->addHour()]);
+        }
 
         app()->call([new $job, 'handle']);
 
         expect(Queue::pushed($job)->pluck('cui')->sort()->values()->all())
             ->toBe($job === SyncMessages::class ? ['12345678', '87654321'] : ['12345678']);
     })->with('batch jobs');
+
+    // Reading a pause decrypts the grant and asks the cache: a company with nothing due needs neither.
+    it('reads no pause for a company with nothing due', function (string $job) {
+        Queue::fake();
+        giveDueWork($job, fanOutToken('12345678'), 1);
+        $idle = fanOutToken('87654321');
+        $keys = [];
+        Event::listen(RetrievingKey::class, function (RetrievingKey $event) use (&$keys) {
+            $keys[] = $event->key;
+        });
+
+        app()->call([new $job, 'handle']);
+
+        expect(array_filter($keys, fn (string $key) => str_starts_with($key, "efactura:token_refresh_refused:{$idle->id}:")))->toBe([]);
+        Queue::assertPushed($job, fn ($pushed) => $pushed->cui === '12345678');
+    })->with([CheckUploadStatuses::class, DownloadResponses::class, DownloadReceivedInvoices::class, ProcessPendingUploads::class]);
+
+    it('frees the schedule two minutes after a queue push failed', function () {
+        // An array lock honours travel(); a Redis TTL would not.
+        config(['cache.default' => 'array', 'queue.connections.broken' => ['driver' => 'broken'], 'queue.default' => 'broken']);
+        Queue::extend('broken', fn () => new class implements ConnectorInterface
+        {
+            public function connect(array $config)
+            {
+                throw new RuntimeException('push failed');
+            }
+        });
+
+        try {
+            dispatch(new ProcessPendingUploads);
+        } catch (RuntimeException) {
+        }
+
+        Queue::fake();
+        $this->travel(121)->seconds();
+        dispatch(new ProcessPendingUploads);
+
+        Queue::assertPushed(ProcessPendingUploads::class);
+    });
 
     it('SyncMessages is unique per company', function () {
         Queue::fake();

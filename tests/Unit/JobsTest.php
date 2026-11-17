@@ -7,6 +7,7 @@ use BeeCoded\EFactura\Jobs\DownloadReceivedInvoices;
 use BeeCoded\EFactura\Jobs\DownloadResponses;
 use BeeCoded\EFactura\Jobs\ProcessPendingUploads;
 use BeeCoded\EFactura\Jobs\ProcessSingleUpload;
+use BeeCoded\EFactura\Jobs\SweepStaleUploads;
 use BeeCoded\EFactura\Jobs\SyncMessages;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
@@ -15,6 +16,7 @@ use BeeCoded\EFactura\Services\MessageSyncService;
 use BeeCoded\EFactura\Services\UploadService;
 use Illuminate\Contracts\Queue\ShouldBeUniqueUntilProcessing;
 use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Queue\Connectors\ConnectorInterface;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
@@ -65,8 +67,9 @@ describe('the company batch jobs', function () {
             ->and($instance->timeout)->toBe(120)
             ->and($instance->backoff)->toBe([60, 180, 300])
             ->and($instance->maxExceptions)->toBe(3)
-            ->and($instance->uniqueFor)->toBe(3600)
+            ->and($instance->uniqueFor())->toBe(3600)
             ->and($instance->uniqueId())->toBe('12345678')
+            ->and((new $job)->uniqueFor())->toBe(120)
             ->and((new $job)->uniqueId())->toBe('all');
     })->with('company batch jobs');
 
@@ -391,5 +394,30 @@ describe('Job Queue Configuration', function () {
 
         $job = new ProcessPendingUploads;
         expect($job->queue)->toBeNull();
+    });
+});
+
+describe('SweepStaleUploads Job', function () {
+    it('frees its schedule within one 15-minute tick after a queue push failed', function () {
+        // An array lock honours travel(); a Redis TTL would not.
+        config(['cache.default' => 'array', 'queue.connections.broken' => ['driver' => 'broken'], 'queue.default' => 'broken']);
+        Queue::extend('broken', fn () => new class implements ConnectorInterface
+        {
+            public function connect(array $config)
+            {
+                throw new RuntimeException('push failed');
+            }
+        });
+
+        try {
+            dispatch(new SweepStaleUploads);
+        } catch (RuntimeException) {
+        }
+
+        Queue::fake();
+        $this->travel(601)->seconds();
+        dispatch(new SweepStaleUploads);
+
+        Queue::assertPushed(SweepStaleUploads::class);
     });
 });

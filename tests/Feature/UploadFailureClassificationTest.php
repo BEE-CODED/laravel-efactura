@@ -32,10 +32,13 @@ use Illuminate\Cache\Events\CacheMissed;
 use Illuminate\Contracts\Filesystem\Filesystem;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
+use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Queue\MaxAttemptsExceededException;
+use Illuminate\Queue\TimeoutExceededException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
 
@@ -413,24 +416,6 @@ describe('the atomic claim', function () {
         expect($observed)->toBe(UploadStatus::Pending);
     });
 
-    /**
-     * Moving the claim must not weaken it: it is still the single gate that decides who
-     * transmits.
-     */
-    it('still stops a second worker that claimed the row during preparation', function () {
-        $upload = makePendingUpload();
-
-        makeUblSpy(function () use ($upload) {
-            EfacturaUpload::where('id', $upload->id)->update(['status' => UploadStatus::Uploading]);
-        });
-
-        Http::fake([UPLOAD_URL => Http::response('ok', 200)]);
-
-        $this->uploadService->processUpload($upload);
-
-        Http::assertNothingSent();
-    });
-
     // A lost claim is not a try: nothing is counted.
     it('sends nothing when one option is changed by a re-queue while the document is being prepared', function (string $method, array $options, string $column, mixed $expected) {
         Http::fake([UPLOAD_URL => Http::response('<?xml version="1.0"?><header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" ExecutionStatus="0" index_incarcare="5001130257"/>')]);
@@ -450,6 +435,90 @@ describe('the atomic claim', function () {
         'self_billed' => ['queueUpload', ['self_billed' => true], 'is_self_billed', true],
         'b2c' => ['queueB2CUpload', [], 'is_b2c', true],
     ]);
+
+    it('hands its lease back when a re-queue changed the options while the document was prepared', function () {
+        Queue::fake();
+        Http::fake();
+        $upload = $this->uploadService->queueUpload($this->invoice);
+        $this->uploadService->dispatchPendingUploads($this->token);
+        $job = Queue::pushed(ProcessSingleUpload::class)->first();
+        makeUblSpy(fn () => $this->uploadService->queueB2CUpload($this->invoice));
+
+        app()->call([$job, 'handle']);
+
+        Http::assertNothingSent();
+        expect(EfacturaUpload::awaitingDispatch()->whereKey($upload->id)->exists())->toBeTrue();
+    });
+
+    // The XML is kept, as for any failed read: the row could name it.
+    it('hands its lease back when reading the row to remove the unsent XML fails', function () {
+        Queue::fake();
+        Http::fake();
+        $upload = $this->uploadService->queueUpload($this->invoice);
+        $this->uploadService->dispatchPendingUploads($this->token);
+        $job = Queue::pushed(ProcessSingleUpload::class)->first();
+        makeUblSpy(fn () => $this->uploadService->queueB2CUpload($this->invoice));
+        $thrown = false;
+        // Thrown before the statement runs, so a PostgreSQL test transaction is not aborted.
+        DB::connection()->beforeExecuting(function (string $query, array $bindings) use (&$thrown) {
+            // Quotes stripped: MySQL and MariaDB quote identifiers with backticks.
+            if (!$thrown && str_starts_with(strtolower(str_replace(['"', '`'], '', $query)), 'select xml_path')) {
+                $thrown = true;
+
+                throw new QueryException('testing', $query, $bindings, new PDOException('SQLSTATE[08006]: connection failure'));
+            }
+        });
+
+        app()->call([$job, 'handle']);
+
+        Http::assertNothingSent();
+        expect($thrown)->toBeTrue()
+            ->and(EfacturaUpload::awaitingDispatch()->whereKey($upload->id)->exists())->toBeTrue()
+            ->and($upload->fresh()->status_failures)->toBe(0)
+            ->and(Storage::disk('local')->allFiles())->toHaveCount(1);
+    });
+
+    // The job loaded the old company's token: sending with it would file under that company.
+    it('sends nothing when a re-queue moved the upload to another company while the document was prepared', function () {
+        Http::fake();
+        EfacturaToken::create([
+            'cui' => '87654321',
+            'access_token' => 'OTHER_ACCESS',
+            'refresh_token' => 'OTHER_REFRESH',
+            'expires_at' => now()->addHour(),
+            'is_active' => true,
+        ]);
+        $upload = $this->uploadService->queueUpload($this->invoice);
+        makeUblSpy(function () {
+            $this->invoice->update(['cui' => '87654321']);
+            $this->uploadService->queueUpload($this->invoice);
+        });
+
+        $this->uploadService->processUpload($upload);
+
+        Http::assertNothingSent();
+        expect($upload->fresh())->status->toBe(UploadStatus::Pending)
+            ->xml_path->toBeNull();
+    });
+
+    // Laravel re-runs a claim whose connection failed after its commit; the re-run matches nothing.
+    it('sends a document whose claim committed before its connection failed', function () {
+        Http::fake([UPLOAD_URL => Http::response('<?xml version="1.0"?><header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" ExecutionStatus="0" index_incarcare="5001130257"/>')]);
+        $ran = false;
+        DB::connection()->beforeExecuting(function (string $query, array $bindings) use (&$ran) {
+            if (!$ran && str_starts_with(strtolower($query), 'update') && str_contains($query, 'xml_path') && in_array('uploading', $bindings, true)) {
+                $ran = true;
+                DB::affectingStatement($query, $bindings);
+            }
+        });
+
+        $this->uploadService->processUpload($upload = makePendingUpload());
+
+        expect($ran)->toBeTrue()
+            ->and($upload->fresh())->status->toBe(UploadStatus::Processing)
+            ->upload_index->toBe('5001130257');
+        Http::assertSentCount(1);
+    });
 
     it('sends what the row says on the next attempt after a re-queue changed it', function () {
         Http::fake([UPLOAD_URL => Http::response('<?xml version="1.0"?><header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" ExecutionStatus="0" index_incarcare="5001130257"/>')]);
@@ -800,6 +869,27 @@ describe('an upload answer carrying a usable index', function () {
         Event::assertNotDispatched(InvoiceFailed::class);
     });
 
+    // The log line before the retry must not cost the index.
+    it('records the index when the first write fails and the log channel is down', function () {
+        Http::fake([UPLOAD_URL => Http::response(json_encode(['ExecutionStatus' => '0', 'index_incarcare' => '12345']))]);
+        // A listener that throws is a log handler that fails: it surfaces from Log::critical().
+        Log::listen(fn (MessageLogged $log) => $log->level === 'critical' ? throw new RuntimeException('log channel down') : null);
+        $thrown = false;
+        DB::connection()->beforeExecuting(function (string $query, array $bindings) use (&$thrown) {
+            if (!$thrown && str_starts_with(strtolower($query), 'update') && str_contains($query, 'upload_index') && in_array('processing', $bindings, true)) {
+                $thrown = true;
+
+                throw new QueryException('testing', $query, $bindings, new PDOException('SQLSTATE[40P01]: deadlock detected'));
+            }
+        });
+
+        $this->uploadService->processUpload($upload = makePendingUpload());
+
+        expect($thrown)->toBeTrue()
+            ->and($upload->fresh())->status->toBe(UploadStatus::Processing)
+            ->upload_index->toBe('12345');
+    });
+
     // A lost connection after the write committed: the re-run finds the row already recorded.
     it('takes a write that ran before its error was reported as recorded', function () {
         Event::fake([InvoiceFailed::class, InvoiceUploaded::class]);
@@ -821,6 +911,68 @@ describe('an upload answer carrying a usable index', function () {
             ->upload_index->toBe('12345');
         Event::assertDispatchedTimes(InvoiceUploaded::class, 1);
         Event::assertNotDispatched(InvoiceFailed::class);
+    });
+});
+
+describe('an outcome write that fails or whose acknowledgement is lost', function () {
+    it('records a refusal whose first write fails', function () {
+        Event::fake([InvoiceFailed::class]);
+        Http::fake([UPLOAD_URL => Http::response('Fisierul nu este valid', 400)]);
+        $thrown = false;
+        // Thrown before the statement runs, so a PostgreSQL test transaction is not aborted.
+        DB::connection()->beforeExecuting(function (string $query, array $bindings) use (&$thrown) {
+            if (!$thrown && str_starts_with(strtolower($query), 'update') && in_array('failed', $bindings, true) && in_array('validation', $bindings, true)) {
+                $thrown = true;
+
+                throw new QueryException('testing', $query, $bindings, new PDOException('SQLSTATE[40P01]: deadlock detected'));
+            }
+        });
+
+        $this->uploadService->processUpload($upload = makePendingUpload());
+
+        expect($thrown)->toBeTrue()
+            ->and($upload->fresh())->status->toBe(UploadStatus::Failed)
+            ->failure_reason->toBe(FailureReason::Validation);
+        Event::assertDispatchedTimes(InvoiceFailed::class, 1);
+    });
+
+    // Laravel re-runs a write whose connection failed after its commit; the re-run matches nothing.
+    it('announces an outcome whose write committed before its connection failed', function (Closure $answer, string $reason, string $event) {
+        Event::fake([InvoiceFailed::class, InvoiceRateLimited::class]);
+        Http::fake([UPLOAD_URL => $answer]);
+        $ran = false;
+        DB::connection()->beforeExecuting(function (string $query, array $bindings) use (&$ran, $reason) {
+            if (!$ran && str_starts_with(strtolower($query), 'update') && in_array($reason, $bindings, true)) {
+                $ran = true;
+                DB::affectingStatement($query, $bindings);
+            }
+        });
+
+        $this->uploadService->processUpload($upload = makePendingUpload());
+
+        // A sent document keeps its file; one that was not sent leaves none.
+        expect($ran)->toBeTrue()
+            ->and(Storage::disk('local')->allFiles())->toBe(array_filter([$upload->fresh()->xml_path]));
+        Event::assertDispatchedTimes($event, 1);
+    })->with([
+        'a refusal' => [fn () => Http::response('Fisierul nu este valid', 400), 'validation', InvoiceFailed::class],
+        'a rate limit' => [fn () => Http::response('prea multe apeluri', 429), 'rate_limited', InvoiceRateLimited::class],
+    ]);
+
+    it('logs the error of an upload whose outcome is unknown', function () {
+        $logged = [];
+        Log::listen(function (MessageLogged $log) use (&$logged) {
+            if ($log->message === 'EFactura: Upload outcome is unknown, parked for reconciliation') {
+                $logged[] = $log->context['error'] ?? null;
+            }
+        });
+        // An \Error passes both Guzzle's and the SDK's catch (Exception).
+        Http::fake([UPLOAD_URL => fn () => throw new TypeError('boom')]);
+
+        $this->uploadService->processUpload($upload = makePendingUpload());
+
+        expect($upload->fresh()->failure_reason)->toBe(FailureReason::Indeterminate)
+            ->and($logged)->toContain('boom');
     });
 });
 
@@ -946,6 +1098,8 @@ describe('an upload refused by a paused grant', function () {
         expect($lease)->not->toBeNull()
             ->and($upload->fresh())->status->toBe(UploadStatus::Pending)
             ->next_poll_at->toBeNull()
+            // Only the hand-back before the claim writes no error.
+            ->errors->toBeNull()
             ->and(Storage::disk('local')->allFiles())->toBe([]);
         Http::assertNothingSent();
     });
@@ -989,11 +1143,11 @@ describe('the global quota pre-check', function () {
 });
 
 describe('a model read before the row was reset for a retry', function () {
-    // Claimed in memory without syncing originals, the next write skipped status (equal to
-    // the stale one), leaving a never-sent row in Uploading.
+    // The run must work from the claimed row's values, not the stale Failed copy: the guarded
+    // hand-back (uploadingRow) matches on the xml_path this claim wrote.
     it('records the outcome of its own run', function () {
         $upload = makePendingUpload();
-        $upload->update(['status' => UploadStatus::Failed, 'failure_reason' => FailureReason::Transient, 'errors' => ['earlier']]);
+        $upload->update(['status' => UploadStatus::Failed, 'failure_reason' => FailureReason::Validation, 'errors' => ['earlier']]);
         $stale = EfacturaUpload::find($upload->id);
 
         // Another job resets the row for a retry; this run still holds the Failed copy.
@@ -1103,7 +1257,6 @@ describe('the dispatchers during a refresh cooldown', function () {
             'status' => UploadStatus::Pending,
             'standard' => 'UBL',
         ]);
-        $this->travel(91)->seconds();
         coolDownGrant($this->token, 600);
     });
 
@@ -1137,6 +1290,27 @@ describe('dispatching pending uploads', function () {
         $job = Queue::pushed(ProcessSingleUpload::class)->first();
         expect($job->upload->is($upload))->toBeTrue()
             ->and($upload->fresh()->next_poll_at->toDateTimeString())->toBe($job->lease);
+    });
+
+    // A row past the quota would only be leased, queued and handed back.
+    it('queues no more rows than the global quota has left', function () {
+        config(['efactura-sdk.rate_limits.enabled' => true, 'efactura-sdk.rate_limits.global_per_minute' => 2]);
+        app()->forgetInstance(RateLimiter::class);
+        app()->forgetInstance(UploadService::class);
+        Queue::fake();
+        foreach (range(1, 5) as $n) {
+            EfacturaUpload::create([
+                'efactura_token_id' => $this->token->id,
+                'uploadable_type' => TestInvoice::class,
+                'uploadable_id' => TestInvoice::create(['number' => "INV-Q{$n}", 'cui' => '12345678', 'total' => 100])->id,
+                'status' => UploadStatus::Pending,
+                'standard' => 'UBL',
+            ]);
+        }
+
+        expect(app(UploadService::class)->dispatchPendingUploads($this->token))->toBe(2)
+            ->and(EfacturaUpload::whereNull('next_poll_at')->count())->toBe(3);
+        Queue::assertPushed(ProcessSingleUpload::class, 2);
     });
 
     // efactura:upload --sync (no lease) sent the row between the dispatcher's read and its lease.
@@ -1206,6 +1380,26 @@ describe('the upload job', function () {
         Http::assertNothingSent();
     });
 
+    // The worker's timeout fires while the document is on the wire.
+    it('parks the row its own lease claimed when it times out mid-send', function () {
+        Event::fake([InvoiceFailed::class]);
+        Queue::fake();
+        $upload = makePendingUpload();
+        $this->uploadService->dispatchPendingUploads($this->token);
+        $job = Queue::pushed(ProcessSingleUpload::class)->first();
+        Http::fake([UPLOAD_URL => function () use ($job) {
+            $job->failed(new TimeoutExceededException('ProcessSingleUpload has timed out.'));
+
+            return Http::response('prea multe apeluri', 429);
+        }]);
+
+        app()->call([$job, 'handle']);
+
+        expect($upload->fresh())->status->toBe(UploadStatus::Failed)
+            ->failure_reason->toBe(FailureReason::Indeterminate);
+        Event::assertDispatchedTimes(InvoiceFailed::class, 1);
+    });
+
     // The queue redelivered a copy of a job that already ran; the row belongs to that run.
     it('leaves the row alone when the queue gives up on a redelivered copy', function () {
         Event::fake([InvoiceFailed::class]);
@@ -1237,11 +1431,9 @@ describe('the upload job', function () {
 });
 
 // Only reachable when another worker is refused between this upload's checks and its call.
-describe('a cooldown that starts after the row was claimed', function () {
+describe('a pause that starts after processUpload\'s own check', function () {
     it('hands the claim back to Pending without spending an attempt or sending anything', function () {
         Http::fake();
-        // Expiring, so the call takes the refresh path that re-checks the cooldown.
-        $this->token->update(['expires_at' => now()->addSeconds(60)]);
         $upload = makePendingUpload();
 
         // processUpload()'s own check finds no cooldown; another worker is refused right after.

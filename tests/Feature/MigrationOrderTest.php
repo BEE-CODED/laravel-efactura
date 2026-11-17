@@ -298,7 +298,8 @@ describe('v4 redundant upload indexes', function () {
         expect($plain(['uploadable_type', 'uploadable_id']))->toBeFalse()
             ->and($plain(['status']))->toBeFalse()
             ->and(Schema::hasIndex('efactura_uploads', 'efactura_uploads_uploadable_unique'))->toBeTrue()
-            ->and(Schema::hasIndex('efactura_uploads', ['status', 'next_poll_at']))->toBeTrue();
+            ->and(Schema::hasIndex('efactura_uploads', ['status', 'next_poll_at']))->toBeTrue()
+            ->and(Schema::hasIndex('efactura_uploads', ['status', 'efactura_token_id', 'processed_at']))->toBeTrue();
 
         // An interrupt before the drop committed.
         Schema::table('efactura_uploads', fn (Blueprint $table) => $table->index('status'));
@@ -307,9 +308,11 @@ describe('v4 redundant upload indexes', function () {
 
         $migration->down();
         expect($plain(['status']))->toBeTrue()
-            ->and($plain(['uploadable_type', 'uploadable_id']))->toBeTrue();
+            ->and($plain(['uploadable_type', 'uploadable_id']))->toBeTrue()
+            ->and(Schema::hasIndex('efactura_uploads', ['status', 'efactura_token_id', 'processed_at']))->toBeFalse();
 
         $migration->up();
+        expect(Schema::hasIndex('efactura_uploads', ['status', 'efactura_token_id', 'processed_at']))->toBeTrue();
     });
 
     // 000006's abort message sends operators to run the later migrations with --path while

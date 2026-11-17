@@ -55,7 +55,8 @@ class SweepStaleUploads implements ShouldBeUniqueUntilProcessing, ShouldQueue
 
     public int $maxExceptions = 3;
 
-    public int $uniqueFor = 3600;
+    /** Below its 15-minute cadence, so a lock a failed queue push left behind holds one tick at most. */
+    public int $uniqueFor = 600;
 
     /** An upload in Uploading this long had its worker die: far above ProcessSingleUpload's 120 s timeout. */
     public const int STALE_MINUTES = 30;

@@ -149,14 +149,29 @@ it('reads never-read and then the most overdue uploads first, and starts no new 
         'uploaded_at' => now()->subSeconds(20000),
         'standard' => 'UBL',
     ]);
+    // Created last, so the id tiebreak cannot hide a reversed order.
+    EfacturaUpload::create([
+        'efactura_token_id' => $this->token->id,
+        'uploadable_type' => 'App\\Models\\Invoice',
+        'uploadable_id' => 3,
+        'status' => UploadStatus::Processing,
+        'upload_index' => '5001130257',
+        'uploaded_at' => now()->subSeconds(20000),
+        'next_poll_at' => now()->subSeconds(600),
+        'standard' => 'UBL',
+    ]);
     Http::fake([POLL_STATUS_URL => function () {
-        $this->travel(91)->seconds();
+        $this->travel(46)->seconds();
 
         return anafStatus('in prelucrare');
     }]);
 
     app(DownloadService::class)->checkAllStatuses($this->token);
 
-    Http::assertSentCount(1);
-    Http::assertSent(fn ($request) => str_contains($request->url(), 'id_incarcare=5001130256'));
+    // The third read would start at 92 s, past the 90 s deadline.
+    expect(Http::recorded()->map(function (array $pair) {
+        parse_str((string) parse_url($pair[0]->url(), PHP_URL_QUERY), $query);
+
+        return $query['id_incarcare'];
+    })->all())->toBe(['5001130256', '5001130257']);
 });

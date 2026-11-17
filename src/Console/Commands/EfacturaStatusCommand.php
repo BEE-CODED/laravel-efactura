@@ -82,17 +82,17 @@ class EfacturaStatusCommand extends Command
 
             if ($outcome === StatusCheckOutcome::NotPollable) {
                 $this->warn("Upload #{$uploadId} was not polled: ".match (true) {
-                    !$upload->upload_index => 'it has no ANAF upload index yet.',
                     $upload->isTerminal() => "it is already {$upload->status->value}.",
+                    !$upload->upload_index => 'it has no ANAF upload index yet.',
                     default => 'it has no e-Factura token.',
                 });
             }
 
-            if ($upload->download_id) {
+            if ($upload->download_id && !$upload->response_path) {
                 $this->info('Downloading response...');
                 // A skipped or failed download only logs; say so instead of implying it worked.
                 if (!$downloadService->downloadResponse($upload) && $upload->fresh()?->response_path === null) {
-                    $this->warn("The response of upload #{$uploadId} was not downloaded; DownloadResponses retries it at its next scheduled try.");
+                    $this->warn("The response of upload #{$uploadId} was not downloaded; see the log.");
                 }
             }
 

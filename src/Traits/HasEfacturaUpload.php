@@ -181,6 +181,6 @@ trait HasEfacturaUpload
             ->where('status', UploadStatus::Completed)
             ->whereNotNull('download_id')
             ->whereNull('response_path')
-            ->where('processed_at', '>=', now()->subDays(60)));
+            ->where('processed_at', '>=', now()->subSeconds(60 * 86400)));
     }
 }

@@ -17,7 +17,6 @@ use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
-use BeeCoded\EFacturaSdk\Support\Validators\VatNumberValidator;
 use Illuminate\Console\Command;
 
 /**
@@ -27,7 +26,8 @@ use Illuminate\Console\Command;
  * Pending.
  *
  * --sync sends them inline instead, for deployments without a queue worker: one try per
- * due upload, and a company's run stops at its first rate-limited upload.
+ * due upload, and a company's run stops at its first rate-limited upload or once its grant
+ * is paused.
  */
 class EfacturaUploadCommand extends Command
 {
@@ -35,7 +35,7 @@ class EfacturaUploadCommand extends Command
 
     protected $signature = 'efactura:upload
                             {--cui= : Process uploads for specific CUI only}
-                            {--sync : Send the due uploads inline instead of queueing them (stops a company at its first rate limit)}';
+                            {--sync : Send the due uploads inline instead of queueing them (stops a company at its first rate limit or paused grant)}';
 
     protected $description = 'Queue pending e-Factura uploads for processing';
 
@@ -59,13 +59,6 @@ class EfacturaUploadCommand extends Command
         $count = 0;
 
         foreach ($tokens as $token) {
-            // A legacy row no per-CUI path reaches (TokenService::usableTokens() skips it too).
-            if (VatNumberValidator::canonical($token->cui) !== $token->cui) {
-                $this->line("{$token->cui}: skipped (non-canonical CUI).");
-
-                continue;
-            }
-
             if ($tokenService->refreshCooldownSeconds($token) > 0) {
                 $this->line("{$token->cui}: skipped (cooling).");
 
@@ -82,8 +75,9 @@ class EfacturaUploadCommand extends Command
                 $uploadService->processUpload($upload);
                 $count++;
 
-                // No queue to wait in: the company's other uploads wait for a later run.
-                if ($upload->fresh()?->failure_reason === FailureReason::RateLimited) {
+                // No queue to wait in: the company's other uploads wait for a later run. $upload->token
+                // is the instance processUpload() used, so a refresh that rotated it still matches.
+                if ($upload->fresh()?->failure_reason === FailureReason::RateLimited || $tokenService->refreshCooldownSeconds($upload->token ?? $token) > 0) {
                     break;
                 }
             }
