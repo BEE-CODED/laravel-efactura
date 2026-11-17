@@ -15,7 +15,9 @@ return [
     | Enable/Disable e-Factura
     |--------------------------------------------------------------------------
     |
-    | Master switch to enable or disable all e-Factura functionality.
+    | Stops the package's jobs and artisan commands. Token storage (TokenService),
+    | the OAuth routes (see routes.enabled), the services and the raw client are
+    | unaffected.
     |
     */
     'enabled' => env('EFACTURA_ENABLED', true),
@@ -60,38 +62,15 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Rate Limit Handling
-    |--------------------------------------------------------------------------
-    |
-    | Configure how rate-limited uploads are handled. The SDK's RateLimiter
-    | provides client-side pre-flight checks against ANAF quotas.
-    |
-    | retry_window_hours: How long a single upload job can keep retrying
-    |                     before failing permanently (default: 24 hours).
-    |                     RetryRateLimitedUploads re-dispatches a pending
-    |                     rate-limited upload only once it has not changed
-    |                     for this long, and touches it when it does, so a
-    |                     queued re-dispatch is not doubled by later runs.
-    | retry_batch_size:   How many failed rate-limited uploads to reset
-    |                     per RetryRateLimitedUploads run (default: 250).
-    | retry_max_age_days: Don't retry uploads older than this (default: 7 days).
-    |
-    */
-    'rate_limit' => [
-        'retry_window_hours' => env('EFACTURA_RATE_LIMIT_RETRY_HOURS', 24),
-        'retry_batch_size' => env('EFACTURA_RATE_LIMIT_RETRY_BATCH', 250),
-        'retry_max_age_days' => env('EFACTURA_RATE_LIMIT_RETRY_MAX_DAYS', 7),
-    ],
-
-    /*
-    |--------------------------------------------------------------------------
     | ANAF Company Lookup
     |--------------------------------------------------------------------------
     |
     | Synchronous retry policy for the public ANAF company-lookup endpoint
-    | (1 request/second). On a RateLimitExceededException the decorator retries
-    | up to `retry_attempts` TOTAL attempts (1 initial + N-1 retries), sleeping
-    | the exception's retryAfterSeconds (>= 1s) between attempts, then re-throws.
+    | (ANAF: 1 request/second; the SDK counts over 2 seconds). On the SDK's own
+    | limiter refusal (a RateLimitExceededException without fromProvider; ANAF's
+    | 429 is re-thrown at once) the decorator retries up to `retry_attempts`
+    | TOTAL attempts (1 initial + N-1 retries), sleeping the exception's
+    | retryAfterSeconds (>= 1s) between attempts, then re-throws.
     |
     */
     'anaf_lookup' => [
@@ -100,74 +79,15 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Periodic Job Hardening
-    |--------------------------------------------------------------------------
-    |
-    | Protects the periodic batch jobs (CheckUploadStatuses, DownloadResponses,
-    | ProcessPendingUploads, SyncMessages) from a backlog that accumulates while
-    | the queue worker is down and then drains all at once when it recovers.
-    |
-    | max_staleness_seconds: A scheduled batch job that has waited in the queue
-    |                        longer than this self-discards instead of running
-    |                        (the next scheduled run will re-scan). The per-CUI
-    |                        jobs a run without a CUI dispatches are never
-    |                        discarded: they wait behind each other, and each is
-    |                        unique per CUI. Set to 0 to disable. Default 120:
-    |                        shorter than every recommended interval (README,
-    |                        "Recommended schedule"), so a delayed run never
-    |                        overlaps the next.
-    | unique_for_seconds:    Lock TTL for ShouldBeUnique(UntilProcessing) — the
-    |                        ceiling after which a job stuck unprocessed in the
-    |                        queue stops blocking a fresh dispatch. Default 3600.
-    |
-    | transient_retry_delay_seconds:
-    |                        How long ProcessSingleUpload waits before re-driving an
-    |                        upload that failed transiently (auth/pre-flight blip).
-    | max_transient_attempts:
-    |                        How many transient failures a single queued upload job
-    |                        may have before it is declared terminal and InvoiceFailed
-    |                        fires. Counted in the cache for retry_window_hours;
-    |                        rate-limit releases do not count. Stops a durable fault (e.g. a
-    |                        revoked token answering 401) from hammering ANAF for
-    |                        the whole retry window. Set to 0 to disable the cap.
-    | stale_uploading_minutes:
-    |                        An upload left in "uploading" longer than this had its
-    |                        worker die mid-flight. SweepStaleUploads parks it as
-    |                        Failed/indeterminate for human reconciliation — it is
-    |                        never re-submitted, because it may already be filed.
-    |
-    */
-    'jobs' => [
-        'max_staleness_seconds' => env('EFACTURA_JOB_MAX_STALENESS', 120),
-        'unique_for_seconds' => env('EFACTURA_JOB_UNIQUE_FOR', 3600),
-        'transient_retry_delay_seconds' => env('EFACTURA_JOB_TRANSIENT_RETRY_DELAY', 30),
-        'max_transient_attempts' => env('EFACTURA_JOB_MAX_TRANSIENT_ATTEMPTS', 5),
-        'stale_uploading_minutes' => env('EFACTURA_JOB_STALE_UPLOADING_MINUTES', 30),
-    ],
-
-    /*
-    |--------------------------------------------------------------------------
-    | Status Polling
-    |--------------------------------------------------------------------------
-    |
-    | max_status_failures: How many status checks of one upload may fail
-    |                      permanently (a 4xx or unreadable answer, an index the
-    |                      SDK refuses) before the upload is parked as
-    |                      indeterminate for reconciliation. Transient failures
-    |                      (5xx, network, rate limits, token problems) are never
-    |                      counted, and any successful read resets the count.
-    |
-    */
-    'polling' => [
-        'max_status_failures' => env('EFACTURA_POLLING_MAX_STATUS_FAILURES', 5),
-    ],
-
-    /*
-    |--------------------------------------------------------------------------
     | File Storage
     |--------------------------------------------------------------------------
     |
     | Configure where XML and ZIP files are stored.
+    |
+    | Stored rows keep paths without the disk. Before changing storage.disk, copy
+    | the files to the new disk under the same paths; otherwise response
+    | verification for those uploads falls back to limits-only and their cleanup
+    | deletes nothing. Changing storage.path affects only new files.
     |
     */
     'storage' => [

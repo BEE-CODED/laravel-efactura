@@ -12,7 +12,14 @@
 namespace BeeCoded\EFactura\Contracts;
 
 use BeeCoded\EFacturaSdk\Data\Invoice\InvoiceData;
+use Illuminate\Database\Eloquent\Model;
 
+/**
+ * Implemented by an Eloquent model whose rows are uploaded to e-Factura: the upload row
+ * refers to it by morph class and key.
+ *
+ * @phpstan-require-extends Model
+ */
 interface EFacturaUploadableInterface
 {
     /**

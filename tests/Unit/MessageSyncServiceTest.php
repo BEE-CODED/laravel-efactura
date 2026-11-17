@@ -6,7 +6,6 @@ use BeeCoded\EFactura\Services\MessageSyncService;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFacturaSdk\Data\Response\PaginatedMessagesResponseData;
 use BeeCoded\EFacturaSdk\Enums\MessageFilter;
-use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -175,15 +174,19 @@ describe('MessageSyncService', function () {
                 ->toBe('2024-01-15 10:30');
         });
 
-        it('leaves message_date null when ANAF sends an unparseable date', function () {
+        it('leaves message_date null when data_creare names no real minute in Bucharest', function (string $dataCreare) {
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
-                ->andReturn(anafListResponse([anafMessage(['data_creare' => ''])]));
+                ->andReturn(anafListResponse([anafMessage(['data_creare' => $dataCreare])]));
 
             $this->messageSyncService->syncMessages($this->token);
 
             expect(EfacturaMessage::first()->message_date)->toBeNull();
-        });
+        })->with([
+            'blank' => '',
+            '30 February' => '202402301230',
+            'the spring-forward gap' => '202403310330',
+        ]);
 
         it('derives emitent and beneficiar CUIs from detalii', function () {
             $this->tokenService->shouldReceive('executeWithClient')
@@ -280,9 +283,9 @@ describe('MessageSyncService', function () {
          * stayed invisible for months: every sync threw, every throw was logged and
          * dropped, and every run reported success while syncing zero messages.
          *
-         * A single-token sync must be loud. Per-token isolation belongs to the BATCH
-         * caller (syncAllMessages), which still isolates but then refuses to report
-         * success — see tests/Feature/MessageSyncFailureTest.php.
+         * A single-token sync must be loud. Per-company isolation belongs to the callers:
+         * one SyncMessages job per company, and efactura:sync, which carries on with the
+         * other companies and then exits 1 — see tests/Feature/MessageSyncFailureTest.php.
          */
         it('propagates an unexpected error instead of silently syncing nothing', function () {
             $this->tokenService->shouldReceive('executeWithClient')
@@ -293,35 +296,6 @@ describe('MessageSyncService', function () {
                 ->toThrow(Exception::class, 'API Error');
 
             expect(EfacturaMessage::count())->toBe(0);
-        });
-    });
-
-    describe('syncAllMessages', function () {
-        it('syncs messages for all active tokens', function () {
-            $token2 = EfacturaToken::create([
-                'cui' => '87654321',
-                'access_token' => 'test2',
-                'refresh_token' => 'test2',
-                'expires_at' => now()->addHour(),
-                'is_active' => true,
-            ]);
-
-            $this->tokenService->shouldReceive('getActiveTokens')
-                ->once()
-                ->andReturn(new Collection([$this->token, $token2]));
-
-            $this->tokenService->shouldReceive('executeWithClient')
-                ->twice()
-                ->andReturn(
-                    anafListResponse([anafMessage(['id' => '3001130059'])]),
-                    anafListResponse([anafMessage(['id' => '3001130060', 'cif' => '87654321'])]),
-                );
-
-            $this->messageSyncService->syncAllMessages();
-
-            expect(EfacturaMessage::count())->toBe(2);
-            expect(EfacturaMessage::where('efactura_token_id', $this->token->id)->count())->toBe(1);
-            expect(EfacturaMessage::where('efactura_token_id', $token2->id)->count())->toBe(1);
         });
     });
 

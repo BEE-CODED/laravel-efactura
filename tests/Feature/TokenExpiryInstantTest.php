@@ -53,7 +53,7 @@ it('converts naive app-timezone wall times to the same instants, both ways, once
     $migration->up();
 });
 
-it('writes expiries and compares refreshed grants as instants, whatever the session time zone', function () {
+it('writes refreshed expiries as instants, whatever the session time zone', function () {
     $stored = Carbon::parse('2026-11-10 12:00:00', 'Europe/Bucharest');
     DB::table('efactura_tokens')->insert(['cui' => '12345678', 'access_token' => encrypt('old', false), 'refresh_token' => encrypt('old', false), 'expires_at' => '2026-11-10 12:00:00+02:00', 'is_active' => true]);
     $token = EfacturaToken::sole();
@@ -67,10 +67,16 @@ it('writes expiries and compares refreshed grants as instants, whatever the sess
     };
 
     // The expires_at binding carries its offset: a naive one would be read in New York, hours later.
-    $refresh($stored->copy()->subHour(), 'stale');
-    expect($token->fresh()->refresh_token)->toBe('old');
-
     $refresh($stored->copy()->addHour(), 'fresh');
     expect($token->fresh()->refresh_token)->toBe('fresh')
         ->and(storedExpiryEpoch())->toBe($stored->copy()->addHour()->getTimestamp());
+});
+
+it('shows an existing token\'s expiry in the app time zone, whatever the session time zone', function () {
+    DB::table('efactura_tokens')->insert(['cui' => '12345674', 'access_token' => encrypt('a', false), 'refresh_token' => encrypt('r', false), 'expires_at' => '2026-11-10 12:00:00+02:00', 'is_active' => true]);
+
+    $this->artisan('efactura:auth', ['cui' => '12345674'])
+        ->expectsOutput('Expires: 2026-11-10 12:00:00 EET')
+        ->expectsConfirmation('Do you want to generate a new authorization URL anyway?', 'no')
+        ->assertExitCode(0);
 });

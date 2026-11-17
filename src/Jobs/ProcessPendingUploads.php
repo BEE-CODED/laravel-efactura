@@ -13,78 +13,28 @@ declare(strict_types=1);
 
 namespace BeeCoded\EFactura\Jobs;
 
-use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
-use BeeCoded\EFactura\Jobs\Concerns\DiscardsWhenStale;
+use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
-use BeeCoded\EFactura\Services\TokenService;
-use Illuminate\Bus\Queueable;
-use Illuminate\Contracts\Queue\ShouldBeUniqueUntilProcessing;
-use Illuminate\Contracts\Queue\ShouldQueue;
-use Illuminate\Foundation\Bus\Dispatchable;
-use Illuminate\Queue\InteractsWithQueue;
-use Illuminate\Queue\SerializesModels;
-use Illuminate\Support\Facades\Log;
+use BeeCoded\EFactura\Services\UploadService;
+use Illuminate\Database\Eloquent\Builder;
 
-class ProcessPendingUploads implements ShouldBeUniqueUntilProcessing, ShouldQueue
+/**
+ * Queues one ProcessSingleUpload per pending upload of a company whose next try is due.
+ */
+class ProcessPendingUploads extends CompanyBatchJob
 {
-    use DiscardsWhenStale, Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
-
-    public int $tries = 3;
-
-    public int $timeout = 120;
-
-    public array $backoff = [60, 180, 300];
-
-    public int $maxExceptions = 3;
-
-    public int $uniqueFor;
-
-    public function __construct(
-        public ?string $cui = null,
-    ) {
-        $this->onQueue(config('efactura.queue'));
-        $this->markEnqueued();
-        $this->uniqueFor = (int) config('efactura.jobs.unique_for_seconds', 3600);
+    protected function feature(): string
+    {
+        return 'upload_invoices';
     }
 
-    public function uniqueId(): string
+    protected function due(): ?Builder
     {
-        return $this->cui ?? 'all';
+        return EfacturaUpload::awaitingDispatch();
     }
 
-    public function handle(TokenService $tokenService): void
+    public function run(EfacturaToken $token, UploadService $uploadService): void
     {
-        PipelineTablesDisabledException::throwIfDisabled();
-
-        if ($this->isStale()) {
-            return;
-        }
-
-        if (!config('efactura.enabled') || !config('efactura.features.upload_invoices')) {
-            return;
-        }
-
-        // Leaves out rows a job still owns; see UploadService::dispatchPendingUploads().
-        $query = EfacturaUpload::awaitingDispatch();
-
-        if ($this->cui) {
-            $token = $tokenService->getToken($this->cui);
-            if (!$token) {
-                Log::warning('EFactura: No token found for CUI in ProcessPendingUploads', ['cui' => $this->cui]);
-
-                return;
-            }
-            $query->forToken($token);
-        }
-
-        // lazyById, not each(): rows a worker takes leave the scope; see dispatchPendingUploads().
-        foreach ($query->with('token')->lazyById() as $upload) {
-            // Its job, if any, sleeps the cooldown out; a new one would only stack on it.
-            if ($upload->token && $tokenService->refreshCooldownSeconds($upload->token) > 0) {
-                continue;
-            }
-
-            ProcessSingleUpload::dispatch($upload);
-        }
+        $uploadService->dispatchPendingUploads($token);
     }
 }

@@ -66,6 +66,8 @@ abstract class TestCase extends Orchestra
         // never poisons, and a second connection to it is a separate empty
         // database, so the create/constraint race tests skip there.
         // DB_CONNECTION=mariadb or mysql runs it against that engine the same way.
+        // Any engine but sqlite needs a database whose name ends in _test: RefreshDatabase
+        // drops every table, so a developer's DB_DATABASE must never reach it.
         $connection = match (env('DB_CONNECTION')) {
             'pgsql' => [
                 'driver' => 'pgsql',
@@ -98,6 +100,10 @@ abstract class TestCase extends Orchestra
                 'foreign_key_constraints' => true,
             ],
         };
+
+        if ($connection['driver'] !== 'sqlite' && !str_ends_with((string) $connection['database'], '_test')) {
+            throw new \RuntimeException("Refusing to run the suite against '{$connection['database']}': RefreshDatabase drops every table. Use a database whose name ends in _test.");
+        }
 
         // A shared cache store (CACHE_STORE=redis, with REDIS_DB/REDIS_CACHE_DB on a dedicated
         // index) keeps its keys between tests: a per-test prefix isolates them without flushing it.

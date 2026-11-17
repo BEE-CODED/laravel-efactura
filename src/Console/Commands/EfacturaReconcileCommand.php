@@ -11,6 +11,7 @@
 
 namespace BeeCoded\EFactura\Console\Commands;
 
+use BeeCoded\EFactura\Console\Concerns\ReadsEfacturaInput;
 use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\UploadService;
@@ -27,7 +28,8 @@ use Illuminate\Console\Command;
  *
  * A row parked by a status check keeps the index_incarcare ANAF issued, and ANAF
  * decides an upload's outcome under its index: such a row is resolved as filed (its
- * status is then checked again), or as not filed only with --despite-index and an
+ * status is then checked again; under another index only after an interactive
+ * confirmation), or as not filed only with --despite-index and an
  * interactive confirmation that SPV was checked under that index. A row parked before ANAF answered has no index, and ANAF's
  * message listing exposes no invoice number to match on — only id / cif /
  * data_creare / tip / detalii / id_solicitare.
@@ -44,6 +46,8 @@ use Illuminate\Console\Command;
  */
 class EfacturaReconcileCommand extends Command
 {
+    use ReadsEfacturaInput;
+
     protected $signature = 'efactura:reconcile
                             {--filed= : Upload ID confirmed as FILED at ANAF (requires --index)}
                             {--index= : The index_incarcare ANAF assigned to the filed document}
@@ -62,11 +66,11 @@ class EfacturaReconcileCommand extends Command
             return self::FAILURE;
         }
 
-        if ($this->option('filed')) {
+        if ($this->given('filed') !== null) {
             return $this->resolveAsFiled($uploadService);
         }
 
-        if ($this->option('not-filed')) {
+        if ($this->given('not-filed') !== null) {
             return $this->resolveAsNotFiled($uploadService);
         }
 
@@ -127,13 +131,22 @@ class EfacturaReconcileCommand extends Command
             return self::FAILURE;
         }
 
-        $upload = $this->findUpload((string) $this->option('filed'));
+        $upload = $this->findUpload((string) $this->given('filed'));
 
         if (!$upload) {
             return self::FAILURE;
         }
 
         $index = trim((string) $index);
+
+        // A row parked by a status check keeps the index ANAF issued; another one follows a different document.
+        if ($upload->upload_index !== null && $upload->upload_index !== $index && (!$this->input->isInteractive() || !$this->confirm(
+            "Upload {$upload->id} has ANAF upload index {$upload->upload_index}, not {$index}. Did you find this invoice in SPV under {$index}?"
+        ))) {
+            $this->error("Upload {$upload->id} was left as it is.");
+
+            return self::FAILURE;
+        }
 
         try {
             $resolved = $uploadService->resolveIndeterminateAsFiled($upload, $index);
@@ -157,7 +170,7 @@ class EfacturaReconcileCommand extends Command
 
     private function resolveAsNotFiled(UploadService $uploadService): int
     {
-        $upload = $this->findUpload((string) $this->option('not-filed'));
+        $upload = $this->findUpload((string) $this->given('not-filed'));
 
         if (!$upload) {
             return self::FAILURE;
@@ -202,7 +215,7 @@ class EfacturaReconcileCommand extends Command
 
     private function findUpload(string $id): ?EfacturaUpload
     {
-        $upload = EfacturaUpload::find($id);
+        $upload = $this->uploadFor($id);
 
         if (!$upload) {
             $this->error("Upload {$id} not found.");

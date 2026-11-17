@@ -17,26 +17,17 @@ use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFactura\Tests\Fixtures\TestInvoice;
+use BeeCoded\EFacturaSdk\Services\RateLimiter;
 use Illuminate\Support\Facades\Queue;
-use Illuminate\Support\Facades\Schema;
 
 /**
- * `efactura:upload` called UploadService::processPendingUploads() synchronously,
+ * `efactura:upload` used to upload synchronously,
  * bypassing ProcessSingleUpload entirely — so no rate-limit pre-flight, no release,
  * no retry. A backlog past ANAF's quota marked every remaining invoice Failed and
  * fired an InvoiceFailed storm.
  */
 beforeEach(function () {
     config(['efactura.enabled' => true, 'efactura.features.upload_invoices' => true]);
-
-    if (!Schema::hasTable('test_invoices')) {
-        Schema::create('test_invoices', function ($table) {
-            $table->id();
-            $table->string('number');
-            $table->string('cui');
-            $table->decimal('total', 10, 2)->nullable();
-        });
-    }
 
     $this->token = EfacturaToken::create([
         'cui' => '12345678',
@@ -94,7 +85,7 @@ describe('efactura:upload by default', function () {
         expect($upload->fresh()->status)->toBe(UploadStatus::Pending);
     });
 
-    it('says how many pending rows it left out and why', function () {
+    it('skips a paused company with one line and queues the others', function () {
         Queue::fake();
 
         $cooling = EfacturaToken::create([
@@ -104,19 +95,17 @@ describe('efactura:upload by default', function () {
             'expires_at' => now()->addHour(),
             'is_active' => true,
         ]);
-        makePending(1);
+        $mine = makePending(1);
         makePending(2, $cooling);
-        makePending(3, $cooling);
-        $this->travel(91)->seconds();
-        makePending(4); // fresh: its own job may still be queued
         coolDownGrant($cooling, 600);
 
         $this->artisan('efactura:upload')
+            ->expectsOutputToContain('87654321: skipped (cooling).')
             ->expectsOutputToContain('Queued 1 pending upload(s)')
-            ->expectsOutputToContain('Left out 3 pending upload(s): 1 recently queued or rate-limited (a later run takes '
-                .'the recent ones once they are idle; rate-limited ones are retried by their own job or the rate-limit retry), '
-                .'2 on a company whose token refresh ANAF refused recently')
             ->assertExitCode(0);
+
+        Queue::assertPushed(ProcessSingleUpload::class, 1);
+        Queue::assertPushed(ProcessSingleUpload::class, fn ($job) => $job->upload->is($mine));
     });
 
     it('filters by CUI', function () {
@@ -150,51 +139,56 @@ describe('efactura:upload by default', function () {
 });
 
 describe('efactura:upload --sync', function () {
-    it('still processes inline for users without a queue worker', function () {
+    it('sends each due upload inline, without a lease, for users without a queue worker', function () {
         Queue::fake();
+        $due = makePending(1);
 
         $uploadService = Mockery::mock(UploadService::class);
-        $uploadService->shouldReceive('processPendingUploads')->once()->with(null)->andReturn(1);
-        $uploadService->shouldReceive('pendingLeftOut')->andReturn(['owned' => 0, 'cooling' => 0]);
+        $uploadService->shouldReceive('processUpload')->once()
+            ->withArgs(fn (...$args) => count($args) === 1 && $args[0]->is($due));
         app()->instance(UploadService::class, $uploadService);
 
-        $this->artisan('efactura:upload', ['--sync' => true])->assertExitCode(0);
+        $this->artisan('efactura:upload', ['--sync' => true])
+            ->expectsOutputToContain('Processed 1 upload(s).')
+            ->assertExitCode(0);
 
         Queue::assertNothingPushed();
     });
 
     /**
-     * The synchronous path has no queue to release into, so the only safe response to
-     * exhausting ANAF's quota is to stop. Previously it ploughed on and marked the
-     * whole remaining backlog Failed.
+     * The synchronous path has no queue to wait in, so it stops a company's run at its first
+     * rate-limited upload; the rest keep waiting, due, for a later run.
      */
     it('stops at the first rate-limited upload instead of failing the whole backlog', function () {
-        $first = makePending(1);
+        makePending(1);
         $second = makePending(2);
         $third = makePending(3);
-        $this->travel(91)->seconds();
 
-        $uploadService = Mockery::mock(UploadService::class.'[processUpload]', [app(TokenService::class)]);
+        $uploadService = Mockery::mock(UploadService::class.'[processUpload]', [app(TokenService::class), app(RateLimiter::class)]);
         $uploadService->shouldReceive('processUpload')
             ->once()
             ->andReturnUsing(function (EfacturaUpload $upload) {
                 $upload->update([
-                    'status' => UploadStatus::Failed,
+                    'status' => UploadStatus::Pending,
                     'failure_reason' => FailureReason::RateLimited,
+                    'next_poll_at' => now()->addMinute(),
                     'errors' => ['quota exhausted'],
                 ]);
             });
+        app()->instance(UploadService::class, $uploadService);
 
-        $processed = $uploadService->processPendingUploads();
+        $this->artisan('efactura:upload', ['--sync' => true])
+            ->expectsOutputToContain('Processed 1 upload(s).')
+            ->assertExitCode(0);
 
-        expect($processed)->toBe(1);
-
-        // The rest are untouched, still queued for a later run.
+        // The rest are untouched, still due for a later run.
         expect($second->fresh()->status)->toBe(UploadStatus::Pending)
-            ->and($third->fresh()->status)->toBe(UploadStatus::Pending);
+            ->and($second->fresh()->next_poll_at)->toBeNull()
+            ->and($third->fresh()->status)->toBe(UploadStatus::Pending)
+            ->and($third->fresh()->next_poll_at)->toBeNull();
     });
 
-    it('prints the rows of a cooling grant as skipped, not processed', function () {
+    it('prints a paused company as skipped, not processed', function () {
         $cooling = EfacturaToken::create([
             'cui' => '87654321',
             'access_token' => 'test',
@@ -206,9 +200,19 @@ describe('efactura:upload --sync', function () {
         makePending(2, $cooling);
         coolDownGrant($cooling, 600);
 
-        $this->artisan('efactura:upload', ['--sync' => true])
+        $uploadService = Mockery::mock(UploadService::class);
+        $uploadService->shouldNotReceive('processUpload');
+        app()->instance(UploadService::class, $uploadService);
+
+        $this->artisan('efactura:upload', ['--sync' => true, '--cui' => '87654321'])
+            ->expectsOutputToContain('87654321: skipped (cooling).')
             ->expectsOutputToContain('Processed 0 upload(s).')
-            ->expectsOutputToContain('Skipped 2 upload(s) of a company whose token refresh ANAF refused recently')
             ->assertExitCode(0);
+    });
+
+    it('fails when the CUI has no token', function () {
+        $this->artisan('efactura:upload', ['--sync' => true, '--cui' => '99999999'])
+            ->expectsOutput('No active token found for CUI: 99999999')
+            ->assertExitCode(1);
     });
 });

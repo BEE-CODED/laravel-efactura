@@ -1,6 +1,8 @@
 <?php
 
 use BeeCoded\EFactura\Models\EfacturaToken;
+use BeeCoded\EFactura\Services\TokenService;
+use BeeCoded\EFacturaSdk\Data\Auth\OAuthTokensData;
 use Illuminate\Contracts\Encryption\DecryptException;
 use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\DB;
@@ -124,6 +126,18 @@ describe('EfacturaToken encryption at rest', function () {
 
         expect($token->toArray())->not->toHaveKey('access_token')
             ->and($token->toArray())->not->toHaveKey('refresh_token');
+    });
+
+    it('re-authorises over credentials the current APP_KEY cannot read', function () {
+        withRotatedAppKey(function () use (&$id) {
+            $id = EfacturaToken::create(['cui' => '12345678', 'access_token' => 'OLD_ACCESS', 'refresh_token' => 'OLD_REFRESH', 'expires_at' => now()->addHour(), 'is_active' => true])->id;
+        });
+
+        $token = app(TokenService::class)->storeToken('RO12345678', new OAuthTokensData(accessToken: 'NEW_ACCESS', refreshToken: 'NEW_REFRESH', expiresAt: now()->addHour()));
+
+        expect($token->id)->toBe($id)
+            ->and(EfacturaToken::sole()->access_token)->toBe('NEW_ACCESS')
+            ->and(EfacturaToken::sole()->refresh_token)->toBe('NEW_REFRESH');
     });
 
     it('fails loudly when reading a plaintext row that was never migrated', function () {

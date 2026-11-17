@@ -12,17 +12,22 @@
 use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Events\TokenRefreshed;
 use BeeCoded\EFactura\Exceptions\RefreshCooldownException;
+use BeeCoded\EFactura\Facades\EFactura;
 use BeeCoded\EFactura\Models\EfacturaMessage;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\DownloadService;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFacturaSdk\Contracts\AnafAuthenticatorInterface;
+use BeeCoded\EFacturaSdk\Data\Auth\OAuthTokensData;
 use BeeCoded\EFacturaSdk\Data\Invoice\ListMessagesParamsData;
 use BeeCoded\EFacturaSdk\Data\Response\ListMessagesResponseData;
 use BeeCoded\EFacturaSdk\Exceptions\ApiException;
 use BeeCoded\EFacturaSdk\Exceptions\AuthenticationException;
+use Illuminate\Cache\ArrayLock;
+use Illuminate\Cache\ArrayStore;
 use Illuminate\Cache\Events\CacheMissed;
+use Illuminate\Database\QueryException;
 use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -348,11 +353,12 @@ describe('persisting a refresh that raced another worker', function () {
     /**
      * The mirror image of the reloader case, on the write side.
      *
-     * Our client refreshed in memory, but we only persist AFTER the operation
-     * returns. In that window another worker can refresh and persist a NEWER
-     * grant. Blindly writing our copy over theirs resurrects a refresh token
-     * ANAF already invalidated when it minted theirs, leaving the DB holding a
-     * dead grant that nothing can recover without a fresh OAuth flow.
+     * Our client refreshed, and between ANAF minting our grant and our save another
+     * worker refreshed and persisted a NEWER grant. Writing our copy over theirs
+     * resurrects a refresh token ANAF already invalidated when it minted theirs,
+     * leaving the DB holding a dead grant that nothing can recover without a fresh
+     * OAuth flow. Both saves (the SDK persister's and the one after the call) must
+     * fail their compare-and-set on the spent refresh token.
      *
      * Asserted on the stored row, which is the thing that actually matters.
      */
@@ -368,9 +374,8 @@ describe('persisting a refresh that raced another worker', function () {
         ]);
 
         // 121s of life: OUTSIDE the wrapper's 120s buffer, so executeWithClient
-        // takes its lock-free path and leaves the refresh to the SDK. This is the
-        // only way to reach the post-call save — the locked path refreshes
-        // BEFORE the operation, so the SDK never has to.
+        // takes its lock-free path and leaves the refresh to the SDK, whose
+        // persister saves the grant mid-call.
         $token = EfacturaToken::create([
             'cui' => '12345678',
             'access_token' => 'OLD_ACCESS',
@@ -378,78 +383,35 @@ describe('persisting a refresh that raced another worker', function () {
             'expires_at' => now()->addSeconds(121),
             'is_active' => true,
         ]);
+
+        // A sibling worker persists a LATER grant just before our first save of the grant runs.
+        $sibling = false;
+        DB::beforeExecuting(function (string $query) use (&$sibling) {
+            // Unquoted names: MySQL and MariaDB quote identifiers with backticks.
+            if ($sibling || !str_starts_with($query, 'update') || !str_contains($query, 'efactura_tokens') || !str_contains($query, 'refresh_token')) {
+                return;
+            }
+            $sibling = true;
+            EfacturaToken::where('cui', '12345678')->first()->update([
+                'access_token' => 'THEIRS_ACCESS',
+                'refresh_token' => 'THEIRS_REFRESH',
+                'expires_at' => now()->addSeconds(3600),
+            ]);
+        });
 
         $this->tokenService->executeWithClient($token, function ($client) {
             // Cross into the SDK's own 120s buffer mid-operation, so it refreshes.
             $this->travel(2)->seconds();
 
-            // Our client refreshes here, minting OURS_* (expires in 1800s).
-            $result = $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60));
-
-            // Meanwhile a sibling worker refreshes and persists a LATER grant.
-            EfacturaToken::where('cui', '12345678')->first()->update([
-                'access_token' => 'THEIRS_ACCESS',
-                'refresh_token' => 'THEIRS_REFRESH',
-                'expires_at' => now()->addSeconds(3600),
-            ]);
-
-            return $result;
+            // Our client refreshes here, minting OURS_*.
+            return $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60));
         });
 
-        // Ours expires sooner, so theirs must survive.
+        // Our saves name OLD_REFRESH as the spent token; the row holds THEIRS, so it survives.
         $token->refresh();
-        expect($token->refresh_token)->toBe('THEIRS_REFRESH')
+        expect($sibling)->toBeTrue()
+            ->and($token->refresh_token)->toBe('THEIRS_REFRESH')
             ->and($token->access_token)->toBe('THEIRS_ACCESS');
-    });
-});
-
-describe('token freshness at second precision', function () {
-    /**
-     * The stored expiry is a `timestamp` column, truncated to whole seconds.
-     * An in-memory Carbon carries microseconds. So a naive comparison makes our
-     * copy look strictly newer than a sibling's whenever both land in the SAME
-     * second — the tie that is supposed to protect the sibling never happens,
-     * and the guard silently does nothing in the narrow window it exists for.
-     *
-     * Both grants expire in the same second here: ours must NOT win.
-     */
-    it('does not treat sub-second precision as being fresher than a stored tie', function () {
-        Http::fake([
-            OAUTH_TOKEN_URL => Http::response([
-                'access_token' => 'OURS_ACCESS',
-                'refresh_token' => 'OURS_REFRESH',
-                'expires_in' => 3600,
-                'token_type' => 'Bearer',
-            ]),
-            LIST_MESSAGES_URL => Http::response($this->listMessagesBody),
-        ]);
-
-        $token = EfacturaToken::create([
-            'cui' => '12345678',
-            'access_token' => 'OLD_ACCESS',
-            'refresh_token' => 'OLD_REFRESH',
-            'expires_at' => now()->addSeconds(121),
-            'is_active' => true,
-        ]);
-
-        $this->tokenService->executeWithClient($token, function ($client) {
-            $this->travel(2)->seconds();
-
-            $result = $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60));
-
-            // Sibling's grant expires in the SAME second as ours, and the column
-            // truncates its microseconds away.
-            EfacturaToken::where('cui', '12345678')->first()->update([
-                'access_token' => 'THEIRS_ACCESS',
-                'refresh_token' => 'THEIRS_REFRESH',
-                'expires_at' => now()->addSeconds(3600),
-            ]);
-
-            return $result;
-        });
-
-        $token->refresh();
-        expect($token->refresh_token)->toBe('THEIRS_REFRESH');
     });
 });
 
@@ -639,23 +601,273 @@ describe('token bookkeeping after an ANAF call', function () {
             ->and(array_column($logs->getArrayCopy(), 0))->not->toContain('critical');
     });
 
-    it('logs critical and rethrows, sending nothing, when an explicit refresh cannot be saved', function () {
+    it('throws a message naming only the CUI, sending nothing, when an explicit refresh cannot be saved', function () {
         $logs = captureLogs();
         Http::fake([
             OAUTH_TOKEN_URL => Http::response(['access_token' => 'NEW_ACCESS', 'refresh_token' => 'NEW_REFRESH', 'expires_in' => 3600]),
             LIST_MESSAGES_URL => Http::response($this->listMessagesBody),
         ]);
-        failTokenSaves();
+        DB::connection()->beforeExecuting(function (string $query) {
+            if (str_starts_with(strtolower($query), 'update') && str_contains($query, 'refresh_token') && str_contains($query, 'is_active')) {
+                throw new QueryException('testing', $query, ['SECRET_CIPHERTEXT'], new RuntimeException('SQLSTATE[HY000]: database is locked', 5));
+            }
+        });
 
         $ran = false;
 
-        expect(fn () => $this->tokenService->executeWithClient(makeExpiringToken(), function () use (&$ran) {
-            $ran = true;
-        }))->toThrow(RuntimeException::class, 'token save failed');
+        try {
+            $this->tokenService->executeWithClient(makeExpiringToken(), function () use (&$ran) {
+                $ran = true;
+            });
+            $this->fail('Expected the save failure');
+        } catch (RuntimeException $e) {
+            expect($e->getMessage())->toBe('EFactura: the token for CUI 12345678 could not be saved')
+                ->and($e->getPrevious())->toBeNull();
+        }
 
         expect($ran)->toBeFalse();
         Http::assertNotSent(fn ($request) => str_contains($request->url(), 'listaMesajeFactura'));
-        expect($logs->getArrayCopy())->toContain(['critical', 'EFactura: refreshed token could not be saved; re-authorisation may be needed', ['cui' => '12345678', 'exception' => RuntimeException::class]]);
+        expect($logs->getArrayCopy())->toContain(['warning', 'EFactura: the token for CUI could not be saved', ['cui' => '12345678', 'exception' => QueryException::class, 'code' => 5]])
+            ->and($logs->getArrayCopy())->toContain(['critical', 'EFactura: refreshed token could not be saved; re-authorisation may be needed', ['cui' => '12345678', 'exception' => RuntimeException::class]])
+            ->and(json_encode($logs->getArrayCopy()))->not->toContain('SECRET_CIPHERTEXT');
+    });
+});
+
+/**
+ * A cache store whose locks call $onRelease with their name before releasing (or instead,
+ * when it throws), the default store until the test ends.
+ */
+function useLockReleaseProbe(Closure $onRelease): void
+{
+    Cache::extend('lock-probe', fn () => Cache::repository(new class($onRelease) extends ArrayStore
+    {
+        public function __construct(private Closure $onRelease)
+        {
+            parent::__construct();
+        }
+
+        public function lock($name, $seconds = 0, $owner = null)
+        {
+            return new class($this, $name, $seconds, $owner, $this->onRelease) extends ArrayLock
+            {
+                public function __construct($store, $name, $seconds, $owner, private Closure $onRelease)
+                {
+                    parent::__construct($store, $name, $seconds, $owner);
+                }
+
+                public function release()
+                {
+                    ($this->onRelease)($this->name);
+
+                    return parent::release();
+                }
+            };
+        }
+    }));
+    config(['cache.stores.lock-probe' => ['driver' => 'lock-probe'], 'cache.default' => 'lock-probe']);
+}
+
+function reauthorisedGrant(): OAuthTokensData
+{
+    return new OAuthTokensData(accessToken: 'REAUTH_ACCESS', refreshToken: 'REAUTH_REFRESH', expiresAt: now()->addMinutes(30));
+}
+
+describe('one writer for a refreshed grant', function () {
+    beforeEach(function () {
+        config(['efactura-sdk.http.retry_times' => 1, 'efactura-sdk.http.retry_delay' => 0]);
+        Http::fake([
+            OAUTH_TOKEN_URL => Http::response(['access_token' => 'NEW_ACCESS', 'refresh_token' => 'NEW_REFRESH', 'expires_in' => 3600]),
+            LIST_MESSAGES_URL => Http::response($this->listMessagesBody),
+        ]);
+    });
+
+    it('keeps a re-authorisation stored after the SDK refreshed during the call', function (bool $persisterFails) {
+        $logs = captureLogs();
+        if ($persisterFails) {
+            $failed = false;
+            DB::connection()->beforeExecuting(function (string $query) use (&$failed) {
+                if (!$failed && str_starts_with(strtolower($query), 'update') && str_contains($query, 'refresh_token')) {
+                    $failed = true;
+
+                    throw new RuntimeException('token save failed');
+                }
+            });
+        }
+
+        $this->tokenService->executeWithClient(makeTokenTheSdkWillRefresh(), function ($client) {
+            $this->travel(2)->seconds();
+            $result = $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60));
+            $this->tokenService->storeToken('12345678', reauthorisedGrant());
+
+            return $result;
+        });
+
+        expect(EfacturaToken::sole()->refresh_token)->toBe('REAUTH_REFRESH')
+            ->and(array_column($logs->getArrayCopy(), 0))->not->toContain('critical');
+    })->with(['the persister stored the refresh' => [false], 'the persister failed' => [true]]);
+
+    it('keeps a re-authorisation a hand-driven client finds when saving its refresh', function () {
+        Event::fake([TokenRefreshed::class]);
+
+        $client = $this->tokenService->createClient(makeTokenTheSdkWillRefresh());
+        $this->travel(2)->seconds();
+        $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60));
+        $this->tokenService->storeToken('12345678', reauthorisedGrant());
+
+        $this->tokenService->handleClientTokenRefresh($client, EFactura::getToken('12345678'));
+
+        expect(EfacturaToken::sole()->refresh_token)->toBe('REAUTH_REFRESH');
+        Event::assertDispatchedTimes(TokenRefreshed::class, 1);
+    });
+
+    it('writes a grant the SDK refreshed during a call once', function () {
+        Event::fake([TokenRefreshed::class]);
+        $writes = 0;
+        DB::listen(function ($query) use (&$writes) {
+            if (str_starts_with(strtolower($query->sql), 'update') && str_contains($query->sql, 'refresh_token')) {
+                $writes++;
+            }
+        });
+
+        $this->tokenService->executeWithClient(makeTokenTheSdkWillRefresh(), function ($client) {
+            $this->travel(2)->seconds();
+
+            return $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60));
+        });
+
+        expect($writes)->toBe(1);
+        Event::assertDispatchedTimes(TokenRefreshed::class, 1);
+    });
+
+    it('reads the token no more after storing the grant the SDK refreshed', function () {
+        Event::fake([TokenRefreshed::class]);
+        $armed = true;
+        $saved = false;
+        DB::connection()->beforeExecuting(function (string $query) use (&$armed, &$saved) {
+            $sql = strtolower($query);
+            if ($armed && $saved && str_starts_with($sql, 'select') && str_contains($sql, 'efactura_tokens')) {
+                throw new RuntimeException('token re-read');
+            }
+            $saved = $saved || (str_starts_with($sql, 'update') && str_contains($sql, 'refresh_token'));
+        });
+
+        $result = $this->tokenService->executeWithClient(makeTokenTheSdkWillRefresh(), function ($client) {
+            $this->travel(2)->seconds();
+
+            return $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60));
+        });
+        $armed = false;
+
+        expect($saved)->toBeTrue()
+            ->and($result)->toBeInstanceOf(ListMessagesResponseData::class);
+        Event::assertDispatchedTimes(TokenRefreshed::class, 1);
+    });
+
+    it('refreshes a grant ANAF gave without expires_in hourly, not on every call', function () {
+        Http::fake([
+            OAUTH_TOKEN_URL => Http::response(['access_token' => 'NEW_ACCESS', 'refresh_token' => 'NEW_REFRESH']),
+            LIST_MESSAGES_URL => Http::response($this->listMessagesBody),
+        ]);
+        $token = makeExpiringToken();
+        $list = fn ($client) => $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60));
+
+        $this->tokenService->executeWithClient($token, $list);
+        $this->tokenService->executeWithClient($token, $list);
+
+        Http::assertSentCount(3);
+        expect($token->fresh()->expires_at->diffInSeconds(now()->addHour(), true))->toBeLessThan(5);
+    });
+
+    it('runs the operation and stores the grant when releasing the refresh lock fails', function () {
+        useLockReleaseProbe(fn () => throw new RuntimeException('lock store down'));
+        $token = makeExpiringToken();
+
+        $result = $this->tokenService->executeWithClient($token, fn ($client) => $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60)));
+
+        expect($result)->toBeInstanceOf(ListMessagesResponseData::class)
+            ->and($token->fresh()->refresh_token)->toBe('NEW_REFRESH');
+    });
+});
+
+describe('a paused grant', function () {
+    beforeEach(function () {
+        config(['efactura-sdk.http.retry_times' => 1, 'efactura-sdk.http.retry_delay' => 0]);
+    });
+
+    it('is paused for 15 minutes after ANAF refuses a request with 401', function () {
+        Http::fake([LIST_MESSAGES_URL => Http::response(['eroare' => 'Unauthorized'], 401)]);
+        $token = makeFreshToken();
+        $list = fn ($client) => $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60));
+
+        expect(fn () => $this->tokenService->executeWithClient($token, $list))
+            ->toThrow(fn (AuthenticationException $e) => expect($e)->not->toBeInstanceOf(RefreshCooldownException::class)->and($e->getCode())->toBe(401));
+        expect($this->tokenService->refreshCooldownSeconds($token))->toBeGreaterThanOrEqual(890)->toBeLessThanOrEqual(900);
+
+        expect(fn () => $this->tokenService->executeWithClient($token, $list))
+            ->toThrow(RefreshCooldownException::class, 'is paused for');
+        Http::assertSentCount(1);
+    });
+
+    it('is paused for 15 minutes after the token endpoint refuses the refresh with 400', function () {
+        Http::fake([OAUTH_TOKEN_URL => Http::response(['error' => 'invalid_grant'], 400)]);
+        $token = makeExpiringToken();
+        $list = fn ($client) => $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60));
+
+        expect(fn () => $this->tokenService->executeWithClient($token, $list))
+            ->toThrow(fn (AuthenticationException $e) => expect($e)->not->toBeInstanceOf(RefreshCooldownException::class)->and($e->getCode())->toBe(400));
+        expect($this->tokenService->refreshCooldownSeconds($token))->toBeGreaterThanOrEqual(890)->toBeLessThanOrEqual(900);
+
+        // Past a one-minute pause, still inside the 15-minute one.
+        $this->travel(61)->seconds();
+        expect(fn () => $this->tokenService->executeWithClient($token, $list))
+            ->toThrow(RefreshCooldownException::class, 'is paused for');
+        Http::assertSentCount(1);
+    });
+
+    it('is paused for a minute after the token endpoint fails', function (int $status) {
+        Http::fake([OAUTH_TOKEN_URL => Http::response(['error' => 'unavailable'], $status)]);
+        $token = makeExpiringToken();
+        $list = fn ($client) => $client->getMessages(new ListMessagesParamsData(cif: '12345678', days: 60));
+
+        expect(fn () => $this->tokenService->executeWithClient($token, $list))->toThrow(AuthenticationException::class);
+        $sent = count(Http::recorded());
+        expect($this->tokenService->refreshCooldownSeconds($token))->toBeGreaterThanOrEqual(1)->toBeLessThanOrEqual(60);
+
+        expect(fn () => $this->tokenService->executeWithClient($token, $list))->toThrow(RefreshCooldownException::class);
+        Http::assertSentCount($sent);
+    })->with(['429' => [429], '503' => [503]]);
+
+    it('stores the pause before it releases the refresh lock', function () {
+        Http::fake([OAUTH_TOKEN_URL => Http::response(['error' => 'slow down'], 429)]);
+        $token = makeExpiringToken();
+        $pauseKey = "efactura:token_refresh_refused:{$token->id}:".sha1('OLD_REFRESH');
+        $atRelease = [];
+        useLockReleaseProbe(function (string $name) use (&$atRelease, $pauseKey) {
+            $atRelease[$name] = Cache::get($pauseKey);
+        });
+
+        expect(fn () => $this->tokenService->executeWithClient($token, fn () => null))->toThrow(AuthenticationException::class);
+
+        expect($atRelease['efactura:token_refresh:12345678'] ?? null)->not->toBeNull();
+    });
+
+    it('keeps the refusal when the pause cannot be stored', function () {
+        Cache::extend('pause-fails', fn () => Cache::repository(new class extends ArrayStore
+        {
+            public function put($key, $value, $seconds)
+            {
+                if (str_starts_with($key, 'efactura:token_refresh_refused:')) {
+                    throw new RuntimeException('cache down');
+                }
+
+                return parent::put($key, $value, $seconds);
+            }
+        }));
+        config(['cache.stores.pause-fails' => ['driver' => 'pause-fails'], 'cache.default' => 'pause-fails']);
+        Http::fake([OAUTH_TOKEN_URL => Http::response(['error' => 'invalid_grant'], 400)]);
+
+        expect(fn () => $this->tokenService->executeWithClient(makeExpiringToken(), fn () => null))
+            ->toThrow(fn (AuthenticationException $e) => expect($e->getCode())->toBe(400));
     });
 });
 
@@ -723,7 +935,7 @@ describe('a grant ANAF refuses to refresh', function () {
             ]);
         }
 
-        app(DownloadService::class)->checkAllStatuses();
+        app(DownloadService::class)->checkAllStatuses($token);
 
         Http::assertSentCount(1);
         Http::assertSent(fn ($request) => $request->url() === OAUTH_TOKEN_URL);
@@ -776,7 +988,7 @@ describe('a grant ANAF refuses to refresh', function () {
         }],
     ]);
 
-    it('logs the cooldown once per grant in a status run, not once per row', function () {
+    it('stops a status run at the refused grant, and the next run before any row', function () {
         Http::fake([OAUTH_TOKEN_URL => Http::response(['error' => 'invalid_grant'], 400)]);
         $token = makeExpiringToken();
         foreach (['5001130255', '5001130256', '5001130257'] as $i => $index) {
@@ -788,34 +1000,32 @@ describe('a grant ANAF refuses to refresh', function () {
                 'upload_index' => $index,
             ]);
         }
-        app(DownloadService::class)->checkAllStatuses(); // refused: the cooldown starts
+        // Refused: the pause starts.
+        expect(app(DownloadService::class)->checkAllStatuses($token))->toBeFalse();
 
         Log::spy();
-        app(DownloadService::class)->checkAllStatuses();
+        expect(app(DownloadService::class)->checkAllStatuses($token))->toBeFalse();
 
         Log::shouldNotHaveReceived('error');
-        Log::shouldHaveReceived('warning')
-            ->with('EFactura: Token refresh is cooling down, status checks wait', Mockery::any())
-            ->once();
         Http::assertSentCount(1);
     });
 
-    it('logs the cooldown once per grant in a download run, not once per row', function () {
+    it('stops download runs at a paused grant before any row', function () {
         Http::fake();
         $token = makeExpiringToken();
         foreach (['3001130051', '3001130052'] as $i => $id) {
-            EfacturaUpload::create(['efactura_token_id' => $token->id, 'uploadable_type' => 'App\\Models\\Invoice', 'uploadable_id' => $i + 1, 'status' => UploadStatus::Completed, 'download_id' => $id]);
+            EfacturaUpload::create(['efactura_token_id' => $token->id, 'uploadable_type' => 'App\\Models\\Invoice', 'uploadable_id' => $i + 1, 'status' => UploadStatus::Completed, 'download_id' => $id, 'processed_at' => now()]);
             EfacturaMessage::create(['efactura_token_id' => $token->id, 'message_id' => "400113000{$i}", 'type' => 'received', 'download_id' => "400113000{$i}", 'is_downloaded' => false]);
         }
         coolDownGrant($token, 600);
 
         Log::spy();
-        app(DownloadService::class)->downloadAllResponses();
-        app(DownloadService::class)->downloadAllReceivedInvoices();
+        expect(app(DownloadService::class)->downloadAllResponses($token))->toBeFalse()
+            ->and(app(DownloadService::class)->downloadAllReceivedInvoices($token))->toBeFalse()
+            ->and(EfacturaUpload::whereNotNull('next_poll_at')->count())->toBe(0)
+            ->and(EfacturaMessage::whereNotNull('next_download_at')->count())->toBe(0);
 
         Log::shouldNotHaveReceived('error');
-        Log::shouldHaveReceived('warning')->with('EFactura: Token refresh is cooling down, response downloads wait', Mockery::any())->once();
-        Log::shouldHaveReceived('warning')->with('EFactura: Token refresh is cooling down, received invoice downloads wait', Mockery::any())->once();
         Http::assertNothingSent();
     });
 

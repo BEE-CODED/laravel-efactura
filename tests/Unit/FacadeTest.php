@@ -9,14 +9,4 @@ describe('EFactura Facade', function () {
 
         expect($resolved)->toBeInstanceOf(EfacturaManager::class);
     });
-
-    it('returns correct facade accessor', function () {
-        $reflection = new ReflectionClass(EFactura::class);
-        $method = $reflection->getMethod('getFacadeAccessor');
-        $method->setAccessible(true);
-
-        $accessor = $method->invoke(null);
-
-        expect($accessor)->toBe(EfacturaManager::class);
-    });
 });

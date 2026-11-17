@@ -9,10 +9,9 @@ use Illuminate\Support\Arr;
 /**
  * Docs-drift guard: every symbol the documentation names must really exist.
  *
- * This complements the MCP suite rather than duplicating it. Those tests assert
- * documentation *contains* a string, which cannot fail when a symbol is deleted
- * — the docs are both subject and oracle. These tests fail for the right reason:
- * they ask PHP.
+ * The sources are README.md and CHANGELOG.md. A test that asserts documentation
+ * *contains* a string cannot fail when a symbol is deleted — the docs are both
+ * subject and oracle. These tests fail for the right reason: they ask PHP.
  *
  * Honest scope note: this catches symbols that vanish or get renamed. It cannot
  * catch documentation that is merely *wrong* (correct symbol, misleading prose).
@@ -23,8 +22,8 @@ use Illuminate\Support\Arr;
  * The canary that makes every other test in this file mean something.
  *
  * Every assertion here is of the form "nothing extracted was broken", which is
- * trivially true when nothing is extracted at all. Rename README.md, move the
- * MCP content, or land a regex typo, and the whole file would go green while
+ * trivially true when nothing is extracted at all. Rename README.md or
+ * CHANGELOG.md, or land a regex typo, and the whole file would go green while
  * checking precisely nothing.
  *
  * The floors are deliberately far below current counts — this is a smoke alarm
@@ -33,7 +32,7 @@ use Illuminate\Support\Arr;
 it('still extracts symbols from every documentation source', function () {
     $sources = DocumentedSymbols::sources();
 
-    expect($sources)->toHaveCount(7);
+    expect(array_keys($sources))->toBe(['README.md', 'CHANGELOG.md']);
 
     foreach ($sources as $label => $text) {
         expect(strlen($text))->toBeGreaterThan(500, "{$label} is empty or unreadable");
@@ -42,14 +41,14 @@ it('still extracts symbols from every documentation source', function () {
     $total = fn (array $perSource): int => array_sum(array_map('count', $perSource));
 
     expect(count(DocumentedSymbols::realSymbols()))->toBeGreaterThan(50)
-        ->and($total(DocumentedSymbols::fullyQualifiedClassNames()))->toBeGreaterThan(30)
+        ->and($total(DocumentedSymbols::fullyQualifiedClassNames()))->toBeGreaterThan(20)
         ->and($total(DocumentedSymbols::enumCaseReferences()))->toBeGreaterThan(3)
-        ->and($total(DocumentedSymbols::configPaths()))->toBeGreaterThan(15)
+        ->and($total(DocumentedSymbols::configPaths()))->toBeGreaterThan(5)
         ->and($total(DocumentedSymbols::envVarReferences()))->toBeGreaterThan(15)
         ->and($total(DocumentedSymbols::staticMethodReferences()))->toBeGreaterThan(5)
         ->and($total(DocumentedSymbols::artisanInvocations()))->toBeGreaterThan(10)
-        ->and($total(DocumentedSymbols::documentedCadences()))->toBeGreaterThan(20)
-        ->and($total(DocumentedSymbols::classConstantReferences()))->toBeGreaterThan(3);
+        ->and($total(DocumentedSymbols::documentedCadences()))->toBeGreaterThan(10)
+        ->and($total(DocumentedSymbols::classConstantReferences()))->toBeGreaterThan(1);
 });
 
 it('names only classes, interfaces, traits and enums that exist', function () {
@@ -58,7 +57,7 @@ it('names only classes, interfaces, traits and enums that exist', function () {
 
     foreach (DocumentedSymbols::fullyQualifiedClassNames() as $label => $names) {
         foreach ($names as $name) {
-            if (!DocumentedSymbols::resolves($name, $real)) {
+            if (!DocumentedSymbols::resolves($name, $real) && !DocumentedSymbols::isDocumentedAsRemoved($label, 'class', $name)) {
                 $missing[] = "{$label}: {$name}";
             }
         }
@@ -90,7 +89,7 @@ it('names only config keys that exist', function () {
 
     foreach (DocumentedSymbols::configPaths() as $label => $paths) {
         foreach ($paths as $path) {
-            if (!Arr::has($config, $path)) {
+            if (!Arr::has($config, $path) && !DocumentedSymbols::isDocumentedAsRemoved($label, 'config', $path)) {
                 $missing[] = "{$label}: efactura.{$path}";
             }
         }
@@ -105,7 +104,7 @@ it('names only env vars the config actually reads', function () {
 
     foreach (DocumentedSymbols::envVarReferences() as $label => $vars) {
         foreach ($vars as $var) {
-            if (!in_array($var, $real, true)) {
+            if (!in_array($var, $real, true) && !DocumentedSymbols::isDocumentedAsRemoved($label, 'env', $var)) {
                 $missing[] = "{$label}: {$var}";
             }
         }
@@ -119,7 +118,7 @@ it('names only Class::method() references that resolve', function () {
 
     foreach (DocumentedSymbols::staticMethodReferences() as $label => $refs) {
         foreach ($refs as $ref) {
-            if (DocumentedSymbols::isDocumentedAsRemoved($ref['class'], $ref['method'])) {
+            if (DocumentedSymbols::isDocumentedAsRemoved($label, 'method', $ref['class'].'::'.$ref['method'])) {
                 continue;
             }
 
@@ -151,7 +150,8 @@ it('names only Class::CONSTANT references that resolve', function () {
 
     foreach (DocumentedSymbols::classConstantReferences() as $label => $refs) {
         foreach ($refs as $ref) {
-            if (!(new ReflectionClass($ref['class']))->hasConstant($ref['constant'])) {
+            if (!(new ReflectionClass($ref['class']))->hasConstant($ref['constant'])
+                && !DocumentedSymbols::isDocumentedAsRemoved($label, 'constant', $ref['class'].'::'.$ref['constant'])) {
                 $missing[] = "{$label}: {$ref['ref']}";
             }
         }
@@ -179,7 +179,7 @@ it('states one recommended cadence per scheduled job, the same everywhere', func
     expect($wrong)->toBe([], 'Documented cadences disagree with the recommended schedule: '.implode(', ', $wrong));
 });
 
-it('keeps a complete cadence table in the README and the MCP job reference', function (string $label) {
+it('keeps a complete cadence table in the README', function (string $label) {
     $tabled = collect(DocumentedSymbols::documentedCadences()[$label])
         ->filter(fn (array $ref): bool => str_starts_with($ref['ref'], '|'))
         ->pluck('job')
@@ -189,16 +189,69 @@ it('keeps a complete cadence table in the README and the MCP job reference', fun
         ->all();
 
     expect($tabled)->toBe(collect(DocumentedSymbols::RECOMMENDED_CADENCES)->keys()->sort()->values()->all());
-})->with(['README.md', 'mcp/src/content/job-reference.ts']);
+})->with(['README.md']);
 
-it('keeps symbols the migration guide says were removed actually removed', function () {
-    foreach (DocumentedSymbols::documentedAsRemoved() as $removed) {
-        expect(method_exists($removed['class'], $removed['method']))->toBeFalse(
-            "{$removed['class']}::{$removed['method']}() exists again, but the migration guide tells users it was removed."
-        );
+it('accepts a removed symbol only in CHANGELOG.md', function () {
+    foreach (DocumentedSymbols::documentedAsRemoved() as $kind => $symbols) {
+        foreach ($symbols as $symbol) {
+            expect(DocumentedSymbols::isDocumentedAsRemoved('CHANGELOG.md', $kind, $symbol))->toBeTrue("{$kind} {$symbol}")
+                ->and(DocumentedSymbols::isDocumentedAsRemoved('README.md', $kind, $symbol))->toBeFalse("{$kind} {$symbol}");
+        }
     }
 })->skip(
-    DocumentedSymbols::documentedAsRemoved() === [],
+    array_merge(...array_values(DocumentedSymbols::documentedAsRemoved())) === [],
+    'Nothing is currently documented as removed.'
+);
+
+it('keeps symbols the CHANGELOG says were removed actually removed', function () {
+    $removed = DocumentedSymbols::documentedAsRemoved();
+    $config = DocumentedSymbols::realConfig();
+    $env = DocumentedSymbols::realEnvVars();
+    $commands = app(Kernel::class)->all();
+    $back = [];
+
+    foreach ($removed['method'] as $entry) {
+        [$class, $method] = explode('::', $entry);
+        if (method_exists($class, $method)) {
+            $back[] = "method {$entry}";
+        }
+    }
+
+    foreach ($removed['class'] as $class) {
+        if (class_exists($class) || interface_exists($class) || trait_exists($class) || enum_exists($class)) {
+            $back[] = "class {$class}";
+        }
+    }
+
+    foreach ($removed['constant'] as $constant) {
+        if (defined($constant)) {
+            $back[] = "constant {$constant}";
+        }
+    }
+
+    foreach ($removed['config'] as $path) {
+        if (Arr::has($config, $path)) {
+            $back[] = "config {$path}";
+        }
+    }
+
+    foreach ($removed['env'] as $var) {
+        if (in_array($var, $env, true)) {
+            $back[] = "env {$var}";
+        }
+    }
+
+    foreach ($removed['option'] as $entry) {
+        [$name, $option] = array_pad(explode(' --', $entry, 2), 2, null);
+        $command = $commands[$name] ?? null;
+        if ($command !== null && ($option === null || $command->getDefinition()->hasOption($option))) {
+            $back[] = "option {$entry}";
+        }
+    }
+
+    expect($back)->toBe([], 'The CHANGELOG says these were removed, but they exist again: '.implode(', ', $back));
+})->skip(
+    array_merge(...array_values(DocumentedSymbols::documentedAsRemoved())) === [],
     'Nothing is currently documented as removed.'
 );
 
@@ -211,6 +264,10 @@ it('shows only artisan commands and options that exist', function () {
             $name = $call['command'];
 
             if (!isset($commands[$name])) {
+                if (DocumentedSymbols::isDocumentedAsRemoved($label, 'option', $name)) {
+                    continue;
+                }
+
                 $problems[] = "{$label}: command {$name} is not registered";
 
                 continue;
@@ -219,7 +276,7 @@ it('shows only artisan commands and options that exist', function () {
             $definition = $commands[$name]->getDefinition();
 
             foreach ($call['options'] as $option) {
-                if (!$definition->hasOption($option)) {
+                if (!$definition->hasOption($option) && !DocumentedSymbols::isDocumentedAsRemoved($label, 'option', "{$name} --{$option}")) {
                     $problems[] = "{$label}: {$name} has no --{$option} option";
                 }
             }
@@ -227,4 +284,42 @@ it('shows only artisan commands and options that exist', function () {
     }
 
     expect($problems)->toBe([], 'Documentation shows artisan usage that does not work: '.implode(', ', $problems));
+});
+
+/**
+ * The reverse direction: every event, job and command the package ships has a place in the README.
+ * A new one that lands without a heading, a table row or a `php artisan` line fails here.
+ */
+it('documents every event, job and command in the README', function () {
+    $readme = DocumentedSymbols::sources()['README.md'];
+    $root = DocumentedSymbols::packageRoot();
+    $undocumented = [];
+
+    $classes = [
+        ...array_map(fn (string $path): string => 'BeeCoded\\EFactura\\Events\\'.basename($path, '.php'), glob($root.'/src/Events/*.php') ?: []),
+        ...array_map(fn (string $path): string => 'BeeCoded\\EFactura\\Jobs\\'.basename($path, '.php'), glob($root.'/src/Jobs/*.php') ?: []),
+    ];
+
+    foreach ($classes as $class) {
+        // An abstract base (a later CompanyBatchJob) is not something an app dispatches or listens for.
+        if (!(new ReflectionClass($class))->isInstantiable()) {
+            continue;
+        }
+
+        $name = preg_quote(class_basename($class), '/');
+
+        if (preg_match("/^#{2,4} .*\\b{$name}\\b/m", $readme) !== 1 && preg_match("/^\\|\\s*`{$name}`\\s*\\|/m", $readme) !== 1) {
+            $undocumented[] = $class;
+        }
+    }
+
+    $shown = array_column(DocumentedSymbols::artisanInvocations()['README.md'], 'command');
+
+    foreach (array_keys(app(Kernel::class)->all()) as $command) {
+        if (str_starts_with($command, 'efactura:') && !in_array($command, $shown, true)) {
+            $undocumented[] = $command;
+        }
+    }
+
+    expect($undocumented)->toBe([], 'The README has no heading, table row or `php artisan` line for: '.implode(', ', $undocumented));
 });

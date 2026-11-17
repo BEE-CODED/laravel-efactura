@@ -11,7 +11,6 @@ use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\DownloadService;
 use BeeCoded\EFactura\Services\TokenService;
-use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFacturaSdk\Data\Response\DownloadResponseData;
 use BeeCoded\EFacturaSdk\Data\Response\StatusResponseData;
 use Illuminate\Support\Facades\Event;
@@ -27,11 +26,11 @@ beforeEach(function () {
         'is_active' => true,
     ]);
 
-    $this->tokenService = Mockery::mock(TokenService::class);
+    // Partial, so DownloadService reads failures through the real isGrantFailure().
+    $this->tokenService = Mockery::mock(TokenService::class)->makePartial();
     // No grant is in its refresh cooldown unless a test says so.
     $this->tokenService->shouldReceive('refreshCooldownSeconds')->andReturn(0)->byDefault();
-    $this->uploadService = Mockery::mock(UploadService::class);
-    $this->downloadService = new DownloadService($this->tokenService, $this->uploadService);
+    $this->downloadService = new DownloadService($this->tokenService);
 });
 
 describe('DownloadService', function () {
@@ -207,11 +206,11 @@ describe('DownloadService', function () {
                 ->once()
                 ->andThrow(new Exception('API Error'));
 
-            // Should not throw
-            $this->downloadService->checkStatus($upload);
+            // Should not throw, and a failure before the request says nothing about the row.
+            expect($this->downloadService->checkStatus($upload))->toBe(StatusCheckOutcome::Failed);
 
-            // Status unchanged
-            expect($upload->fresh()->status)->toBe(UploadStatus::Processing);
+            expect($upload->fresh()->status)->toBe(UploadStatus::Processing)
+                ->and($upload->fresh()->status_failures)->toBe(0);
         });
     });
 
@@ -310,10 +309,11 @@ describe('DownloadService', function () {
                 ->andThrow(new Exception('Download failed'));
 
             // Should not throw
-            $this->downloadService->downloadResponse($upload);
+            expect($this->downloadService->downloadResponse($upload))->toBeFalse();
 
-            // No response_path set
-            expect($upload->fresh()->response_path)->toBeNull();
+            // No response_path set, and no failure recorded against it
+            expect($upload->fresh()->response_path)->toBeNull()
+                ->and($upload->fresh()->response_failed_at)->toBeNull();
         });
     });
 
@@ -364,7 +364,7 @@ describe('DownloadService', function () {
 
             Log::spy();
             $this->downloadService->downloadMessage($message);
-            Log::shouldHaveReceived('error')->with('EFactura: Message has no associated token', ['message_id' => $message->id])->once();
+            Log::shouldHaveReceived('error')->with('EFactura: Message has no associated token', ['id' => $message->id, 'message_id' => 'MSG123'])->once();
         });
 
         it('downloads message and fires event', function () {
@@ -406,7 +406,7 @@ describe('DownloadService', function () {
                 ->andThrow(new Exception('Download failed'));
 
             // Should not throw
-            $this->downloadService->downloadMessage($message);
+            expect($this->downloadService->downloadMessage($message))->toBeFalse();
 
             // Still not downloaded
             expect($message->fresh()->is_downloaded)->toBeFalse();
@@ -461,20 +461,7 @@ describe('DownloadService', function () {
                 ->once()
                 ->andReturn(StatusResponseData::fromAnafResponse(['stare' => 'in prelucrare']));
 
-            $this->downloadService->checkAllStatuses();
-
-            expect(true)->toBeTrue();
-        });
-
-        it('returns early when CUI token not found', function () {
-            $this->tokenService->shouldReceive('getToken')
-                ->with('99999999')
-                ->once()
-                ->andReturn(null);
-
-            $this->downloadService->checkAllStatuses('99999999');
-
-            expect(true)->toBeTrue();
+            expect($this->downloadService->checkAllStatuses($this->token))->toBeTrue();
         });
     });
 
@@ -491,13 +478,14 @@ describe('DownloadService', function () {
                 'download_id' => 'DL123',
                 'response_path' => null,
                 'standard' => 'UBL',
+                'processed_at' => now(),
             ]);
 
             $this->tokenService->shouldReceive('executeWithClient')
                 ->once()
                 ->andReturn(new DownloadResponseData(content: responseZip(), contentType: 'application/zip'));
 
-            $this->downloadService->downloadAllResponses();
+            expect($this->downloadService->downloadAllResponses($this->token))->toBeTrue();
 
             expect($upload->fresh()->response_path)->not->toBeNull();
         });
@@ -520,7 +508,7 @@ describe('DownloadService', function () {
                 ->once()
                 ->andReturn(new DownloadResponseData(content: responseZip(), contentType: 'application/zip'));
 
-            $this->downloadService->downloadAllReceivedInvoices();
+            expect($this->downloadService->downloadAllReceivedInvoices($this->token))->toBeTrue();
 
             expect($message->fresh()->is_downloaded)->toBeTrue();
         });

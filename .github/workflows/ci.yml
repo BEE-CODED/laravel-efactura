@@ -57,7 +57,7 @@ jobs:
           # prefer-lowest resolves the oldest framework patches we allow, which can carry
           # one. Unblock them for CI only (never shipped).
           composer config --global policy.advisories.block false
-          composer require "illuminate/support:${{ matrix.laravel }}" "orchestra/testbench:${{ matrix.testbench }}" --no-interaction --no-update
+          composer require "laravel/framework:${{ matrix.laravel }}" "orchestra/testbench:${{ matrix.testbench }}" --no-interaction --no-update
           composer update --${{ matrix.dependency-version }} --prefer-dist --no-interaction
 
       # The suite runs against sqlite :memory:, hardcoded in tests/TestCase.php and
@@ -237,8 +237,10 @@ jobs:
         working-directory: mcp
       - run: npx vitest run
         working-directory: mcp
+      - run: npm run typecheck
+        working-directory: mcp
       # dist/index.js is committed and shipped to consumers. If it drifts from
-      # src/, users get documentation that does not match this release.
+      # src/, users run a reader that does not match this release.
       - name: Verify committed bundle matches src
         working-directory: mcp
         run: |

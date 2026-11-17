@@ -1,16 +1,17 @@
 {
   "name": "efactura-mcp",
   "version": "1.0.0",
-  "description": "MCP server for Laravel e-Factura wrapper documentation",
+  "description": "MCP server that reads the Laravel e-Factura wrapper README, CHANGELOG and config",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsup",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.27.0",
     "zod": "^3.25.0"
   },
   "devDependencies": {

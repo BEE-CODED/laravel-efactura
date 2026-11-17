@@ -1,7 +1,9 @@
 <?php
 
 use BeeCoded\EFactura\Models\EfacturaToken;
+use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Tests\TestCase;
+use BeeCoded\EFacturaSdk\Exceptions\AuthenticationException;
 use GuzzleHttp\Promise\PromiseInterface;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
@@ -19,6 +21,15 @@ function coolDownGrant(EfacturaToken $token, int $seconds): void
         (string) now()->addSeconds($seconds)->getTimestamp(),
         $seconds,
     );
+}
+
+/**
+ * Pause a grant the way TokenService does when ANAF refuses it (400/401: 15 minutes; any
+ * other answered code: 60 s), through the service's own pause writer.
+ */
+function refuseGrant(EfacturaToken $token, int $code = 400): void
+{
+    (fn () => $this->pauseGrant($token, new AuthenticationException('refused', $code)))->call(app(TokenService::class));
 }
 
 /**

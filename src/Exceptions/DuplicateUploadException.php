@@ -14,10 +14,16 @@ namespace BeeCoded\EFactura\Exceptions;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 
 /**
- * Thrown when queueing an upload would risk filing the same document at ANAF twice.
+ * Thrown when queueing an upload would risk filing the same document at ANAF twice, or in
+ * a mode other than the one asked for.
  *
- * Raised only where silently returning the existing record would be wrong — i.e. when
- * the existing upload's delivery is indeterminate and a human must reconcile it first.
+ * Raised only where silently returning the existing record would be wrong:
+ *
+ *  - its delivery is indeterminate: a human must reconcile it first (efactura:reconcile);
+ *  - it is Uploading, Processing or Completed and is re-queued with different options,
+ *    which would describe a filing other than the one made;
+ *  - it failed and kept changing while it was being re-queued: queue it again.
+ *
  * Ordinary duplicate calls (double-click, application retry) are idempotent and return
  * the existing record instead of throwing.
  */

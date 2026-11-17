@@ -27,14 +27,13 @@ use Illuminate\Support\Facades\Log;
  * Rescues uploads stranded in the "uploading" state.
  *
  * processUpload() atomically claims a row into Uploading immediately before sending
- * it to ANAF. If the worker then dies hard (job timeout, SIGKILL, OOM, deploy), the
- * row stays in Uploading forever: nothing in the pipeline transitions out of it, and
- * the queue's own retry of that job re-runs processUpload(), whose claim
- * (WHERE status = pending) matches zero rows and silently returns "success".
+ * it to ANAF. If the worker then dies hard (SIGKILL, OOM, deploy), the row stays in
+ * Uploading forever: nothing in the pipeline transitions out of it, and the queue's
+ * redelivered copy of that job changes nothing.
  *
- * ProcessSingleUpload::failed() catches the cases the queue actually reports. This
- * job is the safety net for the ones it never does — a SIGKILL'd worker never gets
- * to run failed() at all.
+ * ProcessSingleUpload::failed() parks the row when the job throws or times out. A dead
+ * worker is parked by this job alone: it never runs failed(), and the redelivered copy's
+ * MaxAttemptsExceededException is ignored.
  *
  * Stranded rows are parked as Failed/Indeterminate, NOT returned to Pending: the
  * crash may have happened after the POST reached ANAF, and re-submitting would
@@ -56,12 +55,14 @@ class SweepStaleUploads implements ShouldBeUniqueUntilProcessing, ShouldQueue
 
     public int $maxExceptions = 3;
 
-    public int $uniqueFor;
+    public int $uniqueFor = 3600;
+
+    /** An upload in Uploading this long had its worker die: far above ProcessSingleUpload's 120 s timeout. */
+    public const int STALE_MINUTES = 30;
 
     public function __construct()
     {
         $this->onQueue(config('efactura.queue'));
-        $this->uniqueFor = (int) config('efactura.jobs.unique_for_seconds', 3600);
     }
 
     public function handle(UploadService $uploadService): void
@@ -72,18 +73,12 @@ class SweepStaleUploads implements ShouldBeUniqueUntilProcessing, ShouldQueue
             return;
         }
 
-        $staleAfterMinutes = (int) config('efactura.jobs.stale_uploading_minutes', 30);
-
-        if ($staleAfterMinutes <= 0) {
-            return;
-        }
-
-        $swept = $uploadService->sweepStaleUploads($staleAfterMinutes);
+        $swept = $uploadService->sweepStaleUploads(self::STALE_MINUTES);
 
         if ($swept > 0) {
             Log::warning('EFactura: Parked stranded uploads for reconciliation', [
                 'count' => $swept,
-                'stale_after_minutes' => $staleAfterMinutes,
+                'stale_after_minutes' => self::STALE_MINUTES,
             ]);
         }
     }

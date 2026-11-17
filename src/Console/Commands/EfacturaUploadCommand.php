@@ -11,34 +11,35 @@
 
 namespace BeeCoded\EFactura\Console\Commands;
 
+use BeeCoded\EFactura\Console\Concerns\ReadsEfacturaInput;
+use BeeCoded\EFactura\Enums\FailureReason;
 use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
+use BeeCoded\EFactura\Models\EfacturaUpload;
+use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFacturaSdk\Support\Validators\VatNumberValidator;
 use Illuminate\Console\Command;
 
 /**
- * Queues pending uploads onto the rate-limit-aware pipeline.
+ * Queues each company's due pending uploads (UploadService::dispatchPendingUploads()): each
+ * then gets the rate-limit pre-flight and its row's retry schedule. A company whose grant is
+ * paused, or whose stored CUI is not canonical, is skipped with one line; its uploads wait in
+ * Pending.
  *
- * This used to call UploadService::processPendingUploads() synchronously, which
- * bypasses ProcessSingleUpload entirely: no quota pre-flight, no release-and-retry.
- * Running it against a backlog larger than ANAF's remaining quota marked every
- * invoice past the limit permanently Failed and fired an InvoiceFailed storm — for a
- * condition that is purely transient.
- *
- * Dispatching per row instead means each upload gets the pre-flight check and, when
- * the quota is gone, is released back to the queue rather than failed. --sync keeps
- * the old inline behaviour for deployments without a queue worker, but now stops at
- * the first rate limit instead of burning down the backlog.
+ * --sync sends them inline instead, for deployments without a queue worker: one try per
+ * due upload, and a company's run stops at its first rate-limited upload.
  */
 class EfacturaUploadCommand extends Command
 {
+    use ReadsEfacturaInput;
+
     protected $signature = 'efactura:upload
                             {--cui= : Process uploads for specific CUI only}
-                            {--sync : Process inline instead of queueing (no rate-limit retry; stops at the first rate limit)}';
+                            {--sync : Send the due uploads inline instead of queueing them (stops a company at its first rate limit)}';
 
     protected $description = 'Queue pending e-Factura uploads for processing';
 
-    public function handle(UploadService $uploadService): int
+    public function handle(UploadService $uploadService, TokenService $tokenService): int
     {
         PipelineTablesDisabledException::throwIfDisabled();
 
@@ -48,56 +49,57 @@ class EfacturaUploadCommand extends Command
             return self::FAILURE;
         }
 
-        $cui = $this->option('cui');
-        if ($cui) {
-            $cui = VatNumberValidator::stripPrefix($cui);
-        }
+        $tokens = $this->tokensFor();
 
-        if ($this->option('sync')) {
-            return $this->processInline($uploadService, $cui);
-        }
-
-        $dispatched = $uploadService->dispatchPendingUploads($cui);
-
-        if ($dispatched === null) {
-            $this->error("No active token found for CUI: {$cui}");
-
+        if ($tokens === null) {
             return self::FAILURE;
         }
 
-        $this->info("Queued {$dispatched} pending upload(s) for processing.");
+        $sync = (bool) $this->option('sync');
+        $count = 0;
 
-        $leftOut = $uploadService->pendingLeftOut($cui) ?? ['owned' => 0, 'cooling' => 0];
-        if ($leftOut['owned'] + $leftOut['cooling'] > 0) {
-            $this->comment(sprintf(
-                'Left out %d pending upload(s): %d recently queued or rate-limited (a later run takes the recent ones once '
-                    .'they are idle; rate-limited ones are retried by their own job or the rate-limit retry), '
-                    .'%d on a company whose token refresh ANAF refused recently (taken after the cooldown).',
-                $leftOut['owned'] + $leftOut['cooling'],
-                $leftOut['owned'],
-                $leftOut['cooling'],
-            ));
+        foreach ($tokens as $token) {
+            // A legacy row no per-CUI path reaches (TokenService::usableTokens() skips it too).
+            if (VatNumberValidator::canonical($token->cui) !== $token->cui) {
+                $this->line("{$token->cui}: skipped (non-canonical CUI).");
+
+                continue;
+            }
+
+            if ($tokenService->refreshCooldownSeconds($token) > 0) {
+                $this->line("{$token->cui}: skipped (cooling).");
+
+                continue;
+            }
+
+            if (!$sync) {
+                $count += $uploadService->dispatchPendingUploads($token);
+
+                continue;
+            }
+
+            foreach (EfacturaUpload::awaitingDispatch()->forToken($token)->lazyById() as $upload) {
+                $uploadService->processUpload($upload);
+                $count++;
+
+                // No queue to wait in: the company's other uploads wait for a later run.
+                if ($upload->fresh()?->failure_reason === FailureReason::RateLimited) {
+                    break;
+                }
+            }
         }
 
-        if ($dispatched > 0) {
+        if ($sync) {
+            $this->info("Processed {$count} upload(s).");
+
+            return self::SUCCESS;
+        }
+
+        $this->info("Queued {$count} pending upload(s) for processing.");
+
+        if ($count > 0) {
             $this->comment('Ensure a queue worker is running on the "'
-                .(config('efactura.queue') ?? 'default').'" queue.');
-        }
-
-        return self::SUCCESS;
-    }
-
-    private function processInline(UploadService $uploadService, ?string $cui): int
-    {
-        $this->warn('Running inline: no rate-limit retry. Uploads stop at the first rate limit.');
-
-        $processed = $uploadService->processPendingUploads($cui);
-
-        $this->info("Processed {$processed} upload(s).");
-
-        $cooling = $uploadService->pendingLeftOut($cui)['cooling'] ?? 0;
-        if ($cooling > 0) {
-            $this->comment("Skipped {$cooling} upload(s) of a company whose token refresh ANAF refused recently; a later run takes them after the cooldown.");
+                .(config('efactura.queue') ?: config('queue.connections.'.config('queue.default').'.queue', 'default')).'" queue.');
         }
 
         return self::SUCCESS;

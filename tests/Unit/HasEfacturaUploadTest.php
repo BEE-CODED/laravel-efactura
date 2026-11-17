@@ -8,19 +8,8 @@ use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFactura\Tests\Fixtures\TestInvoice;
 use Illuminate\Database\Eloquent\Relations\MorphOne;
 use Illuminate\Database\Eloquent\Relations\Relation;
-use Illuminate\Support\Facades\Schema;
 
 beforeEach(function () {
-    // Create test_invoices table for the TestInvoice model
-    if (!Schema::hasTable('test_invoices')) {
-        Schema::create('test_invoices', function ($table) {
-            $table->id();
-            $table->string('number');
-            $table->string('cui');
-            $table->decimal('total', 10, 2)->nullable();
-        });
-    }
-
     $this->token = EfacturaToken::create([
         'cui' => '12345678',
         'access_token' => 'test',
@@ -295,6 +284,7 @@ describe('HasEfacturaUpload Trait', function () {
                 'standard' => 'UBL',
                 'download_id' => 'DL456',
                 'response_path' => null,
+                'processed_at' => now(),
             ]);
         });
 
@@ -350,9 +340,11 @@ describe('HasEfacturaUpload Trait', function () {
             expect($invoices->first()->id)->toBe($this->awaitingInvoice->id);
         });
 
-        it('efacturaAwaitingResponse leaves out a response that is no longer downloaded', function () {
-            $this->awaitingInvoice->efacturaUpload->update(['response_attempts' => EfacturaUpload::MAX_RESPONSE_ATTEMPTS]);
+        it('efacturaAwaitingResponse leaves out a response ANAF no longer keeps', function () {
+            $this->awaitingInvoice->efacturaUpload->update(['processed_at' => now()->subDays(59), 'response_attempts' => 9]);
+            expect(TestInvoice::efacturaAwaitingResponse()->get())->toHaveCount(1);
 
+            $this->awaitingInvoice->efacturaUpload->update(['processed_at' => now()->subDays(61)]);
             expect(TestInvoice::efacturaAwaitingResponse()->get())->toHaveCount(0);
         });
     });
@@ -393,5 +385,23 @@ describe('an app with a morph map', function () {
         expect($upload->id)->toBe($stored->id)
             ->and(EfacturaUpload::count())->toBe(1)
             ->and($upload->fresh()->status)->toBe(UploadStatus::Pending);
+    });
+
+    it('makes a completed row stored under the class name visible when the invoice is queued again', function () {
+        $stored = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => TestInvoice::class,
+            'uploadable_id' => $this->invoice->id,
+            'status' => UploadStatus::Completed,
+            'upload_index' => '1',
+        ]);
+        Relation::morphMap(['test-invoice' => TestInvoice::class]);
+
+        $upload = app(UploadService::class)->queueUpload($this->invoice);
+
+        expect($upload->id)->toBe($stored->id)
+            ->and(EfacturaUpload::count())->toBe(1)
+            ->and($upload->fresh()->uploadable_type)->toBe('test-invoice')
+            ->and($this->invoice->isUploadedToEfactura())->toBeTrue();
     });
 });

@@ -5,8 +5,14 @@ use BeeCoded\EFactura\Http\Controllers\OAuthCallbackController;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFacturaSdk\Data\Auth\OAuthTokensData;
+use BeeCoded\EFacturaSdk\Exceptions\AuthenticationException;
+use GuzzleHttp\Exception\ConnectException;
+use GuzzleHttp\Promise\Create;
+use GuzzleHttp\Psr7\Request as Psr7Request;
+use Illuminate\Database\QueryException;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Http;
 
 beforeEach(function () {
@@ -57,6 +63,15 @@ describe('OAuthCallbackController', function () {
 
             expect($response->getTargetUrl())->toContain('/error');
             expect(session('efactura_error'))->toBeTrue();
+        });
+
+        it('refuses a CUI with a leading zero', function () {
+            $this->tokenService->shouldNotReceive('getAuthorizationUrl');
+
+            $response = $this->controller->redirect(Request::create('/efactura/auth/0014399840'), '0014399840');
+
+            expect($response->getTargetUrl())->toContain('/error')
+                ->and(session('efactura_message'))->toContain('Invalid CUI format');
         });
     });
 
@@ -195,6 +210,57 @@ describe('OAuthCallbackController', function () {
                     'Failed to exchange authorization code: Token exchange failed: invalid_grant: Authorization code expired'
                 );
             Http::assertSentCount(1);
+        });
+
+        it('keeps the authorization code out of the reported exception\'s trace', function () {
+            config(['efactura.routes.error_redirect' => '/error']);
+            Exceptions::fake();
+            Http::fake(['logincert.anaf.ro/anaf-oauth2/v1/token' => fn ($request) => Create::rejectionFor(
+                new ConnectException('cURL error 7: Failed to connect', new Psr7Request('POST', $request->url()))
+            )]);
+            $this->tokenService->shouldReceive('validateOAuthState')->once()->andReturn('12345678');
+            $old = ini_set('zend.exception_ignore_args', '0');
+
+            try {
+                $this->controller->callback(Request::create('/callback', 'GET', [
+                    'code' => 'secret-auth-code',
+                    'state' => 'valid_state',
+                ]));
+            } finally {
+                ini_set('zend.exception_ignore_args', (string) $old);
+            }
+
+            $reported = Exceptions::reported();
+            expect($reported)->toHaveCount(1)
+                ->and($reported[0])->toBeInstanceOf(AuthenticationException::class);
+            // Only the reported exception's own trace: a chained ConnectionException's frames hold the form data.
+            $found = false;
+            $trace = $reported[0]->getTrace();
+            array_walk_recursive($trace, function (mixed $value) use (&$found) {
+                $found = $found || $value === 'secret-auth-code';
+            });
+            expect($found)->toBeFalse();
+        });
+
+        it('shows a fixed text, never the exception, when storing the grant fails', function () {
+            Http::fake(['logincert.anaf.ro/anaf-oauth2/v1/token' => Http::response([
+                'access_token' => 'new-access',
+                'refresh_token' => 'new-refresh',
+                'expires_in' => 3600,
+            ])]);
+            $this->tokenService->shouldReceive('validateOAuthState')->once()->andReturn('12345678');
+            $this->tokenService->shouldReceive('storeToken')->once()->andThrow(new QueryException(
+                'testing',
+                'insert into "efactura_tokens" ("access_token") values (?)',
+                ['SECRET_CIPHERTEXT'],
+                new RuntimeException('SQLSTATE[HY000]: database is locked'),
+            ));
+
+            $this->controller->callback(Request::create('/callback', 'GET', ['code' => 'auth_code', 'state' => 'valid_state']));
+
+            expect(session('efactura_message'))->toBe('Failed to complete the e-Factura authorization. Please try again.')
+                ->not->toContain('SECRET_CIPHERTEXT')
+                ->not->toContain('efactura_tokens');
         });
     });
 

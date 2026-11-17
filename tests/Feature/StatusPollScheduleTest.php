@@ -12,8 +12,10 @@ use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFactura\Tests\Fixtures\TestInvoice;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Facades\Storage;
 
 const POLL_STATUS_URL = 'https://api.anaf.ro/test/FCTEL/rest/stareMesaj*';
+const POLL_UPLOAD_URL = 'https://api.anaf.ro/test/FCTEL/rest/upload*';
 
 beforeEach(function () {
     config(['efactura-sdk.http.retry_times' => 1, 'efactura-sdk.http.retry_delay' => 0]);
@@ -34,18 +36,18 @@ it('reads an in-progress upload again on the SDK schedule, and fans out only whe
     $this->freezeSecond();
     $upload = ($this->processing)($ageSeconds);
 
-    CheckUploadStatuses::dispatchSync('12345678');
+    app(DownloadService::class)->checkAllStatuses($this->token);
     expect($upload->fresh()->next_poll_at->getTimestamp())->toBe(now()->getTimestamp() + max($interval - 60, 60));
 
-    CheckUploadStatuses::dispatchSync('12345678');
+    app(DownloadService::class)->checkAllStatuses($this->token);
     Http::assertSentCount(1);
 
     Queue::fake();
-    (new CheckUploadStatuses)->handle(app(DownloadService::class));
+    app()->call([new CheckUploadStatuses, 'handle']);
     Queue::assertNothingPushed();
 
     $this->travel($interval)->seconds();
-    (new CheckUploadStatuses)->handle(app(DownloadService::class));
+    app()->call([new CheckUploadStatuses, 'handle']);
     Queue::assertPushed(CheckUploadStatuses::class, fn (CheckUploadStatuses $job) => $job->cui === '12345678');
 })->with([
     'first ten minutes' => [120, 60],
@@ -78,15 +80,23 @@ it('makes an upload due again at every transition that resets its status failure
         expect(app(UploadService::class)->queueUpload($invoice)->is($upload))->toBeTrue();
     }],
     'uploaded again' => [function (EfacturaUpload $upload) {
-        $upload->update(['status' => UploadStatus::Uploading]);
-        app(UploadService::class)->markUploadAsProcessing($upload, '5001130256');
+        Storage::fake('local');
+        Http::fake([POLL_UPLOAD_URL => Http::response('<?xml version="1.0"?><header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" ExecutionStatus="0" index_incarcare="5001130256"/>')]);
+        $invoice = TestInvoice::create(['number' => 'INV-1', 'cui' => '12345678']);
+        $lease = now()->addSeconds(300)->toDateTimeString();
+        $upload->update(['status' => UploadStatus::Pending, 'upload_index' => null, 'next_poll_at' => $lease, 'uploadable_type' => $invoice->getMorphClass(), 'uploadable_id' => $invoice->id]);
+
+        app(UploadService::class)->processUpload($upload, $lease);
+
+        expect([$upload->fresh()->status, $upload->fresh()->upload_index])->toBe([UploadStatus::Processing, '5001130256']);
     }],
 ]);
 
-it('sets no next read on an upload that finished while it was being read', function () {
+it('leaves the schedule of an upload another run finished while this one read it', function () {
     $upload = ($this->processing)(60);
     Http::fake([POLL_STATUS_URL => function () use ($upload) {
-        EfacturaUpload::whereKey($upload->id)->update(['status' => UploadStatus::Completed]);
+        // As recordVerdict() writes it: the response download is due at once.
+        EfacturaUpload::whereKey($upload->id)->update(['status' => UploadStatus::Completed, 'next_poll_at' => null]);
 
         return anafStatus('in prelucrare');
     }]);
@@ -94,4 +104,59 @@ it('sets no next read on an upload that finished while it was being read', funct
     app(DownloadService::class)->checkStatus($upload);
 
     expect($upload->fresh()->next_poll_at)->toBeNull();
+});
+
+it('does not read an upload again before its slot after a read that failed after sending', function () {
+    Http::fake([POLL_STATUS_URL => Http::response('Bad Gateway', 502)]);
+    $this->freezeSecond();
+    $upload = ($this->processing)(20000);
+
+    app(DownloadService::class)->checkAllStatuses($this->token);
+
+    expect($upload->fresh()->next_poll_at?->getTimestamp())->toBe(now()->getTimestamp() + 3540)
+        ->and($upload->fresh()->status_failures)->toBe(0);
+
+    app(DownloadService::class)->checkAllStatuses($this->token);
+    Http::assertSentCount(1);
+});
+
+it('reads an upload once when a second run starts while the first one reads it', function () {
+    ($this->processing)(60);
+    $nested = true;
+    Http::fake([POLL_STATUS_URL => function () use (&$nested) {
+        if ($nested) {
+            $nested = false;
+            app(DownloadService::class)->checkAllStatuses($this->token);
+        }
+
+        return anafStatus('in prelucrare');
+    }]);
+
+    app(DownloadService::class)->checkAllStatuses($this->token);
+
+    Http::assertSentCount(1);
+});
+
+it('reads never-read and then the most overdue uploads first, and starts no new read after 90 seconds', function () {
+    $overdue = ($this->processing)(20000);
+    $overdue->update(['next_poll_at' => now()->subSeconds(60)]);
+    EfacturaUpload::create([
+        'efactura_token_id' => $this->token->id,
+        'uploadable_type' => 'App\\Models\\Invoice',
+        'uploadable_id' => 2,
+        'status' => UploadStatus::Processing,
+        'upload_index' => '5001130256',
+        'uploaded_at' => now()->subSeconds(20000),
+        'standard' => 'UBL',
+    ]);
+    Http::fake([POLL_STATUS_URL => function () {
+        $this->travel(91)->seconds();
+
+        return anafStatus('in prelucrare');
+    }]);
+
+    app(DownloadService::class)->checkAllStatuses($this->token);
+
+    Http::assertSentCount(1);
+    Http::assertSent(fn ($request) => str_contains($request->url(), 'id_incarcare=5001130256'));
 });

@@ -63,7 +63,7 @@ class EfacturaToken extends Model
      *
      * The credentials are now only as safe as APP_KEY: rotating it without
      * APP_PREVIOUS_KEYS orphans every token and forces a fresh OAuth flow per
-     * company. See the v3 upgrade notes in the README.
+     * company. See 'Credentials and APP_KEY' in the README.
      */
     protected $casts = [
         'access_token' => 'encrypted',
@@ -98,9 +98,13 @@ class EfacturaToken extends Model
         return $this->getConnection()->getDriverName() === 'pgsql' ? 'Y-m-d H:i:sP' : parent::getDateFormat();
     }
 
+    /**
+     * The canonical CUI, the one the SDK client and its refresh lock key on. A legacy
+     * malformed CUI comes back only prefix-stripped, and the SDK client refuses it.
+     */
     public function getVatNumber(): string
     {
-        return VatNumberValidator::stripPrefix($this->cui);
+        return VatNumberValidator::canonical($this->cui) ?? VatNumberValidator::stripPrefix($this->cui);
     }
 
     public function isExpired(): bool

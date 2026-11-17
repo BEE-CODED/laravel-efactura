@@ -9,7 +9,5 @@ parameters:
         # Trait analysis (expected)
         -
             identifier: trait.unused
-        # Interface method from Model
-        - '#Call to an undefined method BeeCoded\\EFactura\\Contracts\\EFacturaUploadableInterface::getKey#'
     excludePaths:
         - vendor

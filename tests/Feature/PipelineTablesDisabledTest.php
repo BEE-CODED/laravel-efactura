@@ -55,6 +55,8 @@ it('refuses B2C queueing and a container-resolved service, but keeps tokens', fu
     expect(fn () => EFactura::queueB2CUpload($invoice))->toThrow(PipelineTablesDisabledException::class)
         ->and(fn () => app(MessageSyncService::class)->syncMessages($token))->toThrow(PipelineTablesDisabledException::class)
         ->and(fn () => EFactura::downloadService())->toThrow(PipelineTablesDisabledException::class)
+        ->and(fn () => EFactura::uploadService())->toThrow(PipelineTablesDisabledException::class)
+        ->and(fn () => EFactura::messageSyncService())->toThrow(PipelineTablesDisabledException::class)
         ->and(EFactura::getToken('12345678')?->is($token))->toBeTrue()
         ->and(EFactura::getAuthorizationUrl('12345678'))->toStartWith('https://');
     Http::assertNothingSent();

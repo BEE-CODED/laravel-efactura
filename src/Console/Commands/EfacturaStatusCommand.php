@@ -11,15 +11,21 @@
 
 namespace BeeCoded\EFactura\Console\Commands;
 
+use BeeCoded\EFactura\Console\Concerns\ReadsEfacturaInput;
 use BeeCoded\EFactura\Enums\StatusCheckOutcome;
 use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
-use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\DownloadService;
-use BeeCoded\EFacturaSdk\Support\Validators\VatNumberValidator;
 use Illuminate\Console\Command;
 
+/**
+ * Exits 1 when the given --cui or --upload names nothing, when the status check of --upload
+ * hit a rate limit or failed, or when the run of any company stopped (a rate limit or an
+ * unavailable token).
+ */
 class EfacturaStatusCommand extends Command
 {
+    use ReadsEfacturaInput;
+
     protected $signature = 'efactura:status
                             {--cui= : Check statuses for specific CUI only}
                             {--upload= : Check status for specific upload ID}';
@@ -36,14 +42,16 @@ class EfacturaStatusCommand extends Command
             return self::FAILURE;
         }
 
-        $uploadId = $this->option('upload');
-        $cui = $this->option('cui');
-        if ($cui) {
-            $cui = VatNumberValidator::stripPrefix($cui);
+        $tokens = $this->tokensFor();
+
+        if ($tokens === null) {
+            return self::FAILURE;
         }
 
-        if ($uploadId) {
-            $upload = EfacturaUpload::find($uploadId);
+        $uploadId = $this->given('upload');
+
+        if ($uploadId !== null) {
+            $upload = $this->uploadFor($uploadId, $this->given('cui') !== null ? $tokens->first() : null);
             if (!$upload) {
                 $this->error("Upload #{$uploadId} not found.");
 
@@ -54,7 +62,7 @@ class EfacturaStatusCommand extends Command
             $outcome = $downloadService->checkStatus($upload);
 
             if ($outcome === StatusCheckOutcome::RateLimited) {
-                $this->warn("Skipped: the per-message status limit of upload #{$uploadId} is reached, try again later.");
+                $this->warn("Upload #{$uploadId}: ANAF rate limit reached, try again later.");
 
                 return self::FAILURE;
             }
@@ -82,16 +90,9 @@ class EfacturaStatusCommand extends Command
 
             if ($upload->download_id) {
                 $this->info('Downloading response...');
-                $downloadService->downloadResponse($upload);
-
                 // A skipped or failed download only logs; say so instead of implying it worked.
-                $after = $upload->fresh();
-                if ($after !== null && $after->response_path === null) {
-                    $this->warn("The response of upload #{$uploadId} was not downloaded (limit reached or error; see the log). ".(
-                        $after->response_attempts < EfacturaUpload::MAX_RESPONSE_ATTEMPTS
-                            ? 'DownloadResponses retries it.'
-                            : "It failed {$after->response_attempts} times and is no longer downloaded automatically."
-                    ));
+                if (!$downloadService->downloadResponse($upload) && $upload->fresh()?->response_path === null) {
+                    $this->warn("The response of upload #{$uploadId} was not downloaded; DownloadResponses retries it at its next scheduled try.");
                 }
             }
 
@@ -103,10 +104,19 @@ class EfacturaStatusCommand extends Command
         }
 
         $this->info('Checking all upload statuses...');
-        $downloadService->checkAllStatuses($cui);
+        $failed = false;
 
-        $this->info('Downloading pending responses...');
-        $downloadService->downloadAllResponses($cui);
+        foreach ($tokens as $token) {
+            // A stopped status run skips that company's responses: they wait for the next run.
+            if (!$downloadService->checkAllStatuses($token) || !$downloadService->downloadAllResponses($token)) {
+                $this->warn("Stopped for {$token->cui} (rate limit or token unavailable); see the log.");
+                $failed = true;
+            }
+        }
+
+        if ($failed) {
+            return self::FAILURE;
+        }
 
         $this->info('Done.');
 

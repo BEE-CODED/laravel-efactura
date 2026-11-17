@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 /*
  * This file is part of the Laravel e-Factura package.
  *
@@ -11,81 +13,28 @@
 
 namespace BeeCoded\EFactura\Jobs;
 
-use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
-use BeeCoded\EFactura\Jobs\Concerns\DiscardsWhenStale;
+use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Services\MessageSyncService;
-use BeeCoded\EFactura\Services\TokenService;
-use Illuminate\Bus\Queueable;
-use Illuminate\Contracts\Queue\ShouldBeUnique;
-use Illuminate\Contracts\Queue\ShouldQueue;
-use Illuminate\Foundation\Bus\Dispatchable;
-use Illuminate\Queue\InteractsWithQueue;
-use Illuminate\Queue\SerializesModels;
-use Illuminate\Support\Facades\Log;
+use Illuminate\Database\Eloquent\Builder;
 
 /**
- * Syncs the ANAF message list of one CUI.
- *
- * Without a CUI it only dispatches one job per active token: each CUI gets its own
- * timeout and its own retries, so one slow or broken CUI neither uses up the others'
- * budget nor makes the queue list the healthy ones again. Unique per CUI.
+ * Syncs the ANAF message list of a company. Every usable company is due.
  */
-class SyncMessages implements ShouldBeUnique, ShouldQueue
+class SyncMessages extends CompanyBatchJob
 {
-    use DiscardsWhenStale, Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
-
-    public int $tries = 3;
-
-    public int $timeout = 120;
-
-    public array $backoff = [60, 180, 300];
-
-    public int $maxExceptions = 3;
-
-    public int $uniqueFor;
-
-    public function __construct(
-        public ?string $cui = null,
-    ) {
-        $this->onQueue(config('efactura.queue'));
-        $this->markEnqueued();
-        $this->uniqueFor = (int) config('efactura.jobs.unique_for_seconds', 3600);
+    protected function feature(): string
+    {
+        return 'sync_messages';
     }
 
-    public function uniqueId(): string
+    protected function due(): ?Builder
     {
-        return $this->cui ?? 'all';
+        return null;
     }
 
-    public function handle(MessageSyncService $messageSyncService, TokenService $tokenService): void
+    public function run(EfacturaToken $token, MessageSyncService $messageSyncService): void
     {
-        PipelineTablesDisabledException::throwIfDisabled();
-
-        if ($this->isStale()) {
-            return;
-        }
-
-        if (!config('efactura.enabled') || !config('efactura.features.sync_messages')) {
-            return;
-        }
-
-        if ($this->cui === null) {
-            foreach ($tokenService->getActiveTokens() as $token) {
-                dispatch((new self($token->cui))->asFanOutChild());
-            }
-
-            return;
-        }
-
-        $token = $tokenService->getToken($this->cui);
-
-        if (!$token) {
-            Log::warning('EFactura: No token found for CUI', ['cui' => $this->cui]);
-
-            return;
-        }
-
-        // Errors bubble, so the queue retries this CUI alone.
+        // Errors bubble, so the queue retries this company alone.
         $messageSyncService->syncMessages($token);
     }
 }

@@ -149,3 +149,29 @@ it('ignores a malformed cached verdict and replaces it with a fresh one', functi
 it('refuses a CUI that is not 2 to 10 digits', function () {
     $this->lookup->resolve('RO12AB');
 })->throws(InvalidArgumentException::class);
+
+it('refuses a bad control digit or a CNP without asking ANAF', function (string $cui) {
+    Http::fake();
+
+    expect(fn () => $this->lookup->resolve($cui))->toThrow(InvalidArgumentException::class);
+    Http::assertNothingSent();
+})->with(['bad control digit' => ['12345679'], 'CNP' => ['1900101123457']]);
+
+it('reads a spaced, prefixed CUI from the entry its canonical form cached', function () {
+    Http::fake([AnafDetailsClient::getBaseUrl() => fn () => Http::response(registryFound('34567892'))]);
+    $found = $this->lookup->resolve('34567892');
+
+    expect($this->lookup->cachedRead(' RO 3456 7892 '))->toEqual($found);
+    Http::assertSentCount(1);
+});
+
+it('resolves from the container with a strict client', function () {
+    $body = registryFound('34567892');
+    unset($body['found'][0]['stare_inactiv']['statusInactivi']);
+    Http::fake([AnafDetailsClient::getBaseUrl() => Http::response($body)]);
+
+    $lookup = app(CachedAnafLookup::class);
+
+    expect($lookup->resolve('34567892')->status)->toBe(AnafLookupStatus::Unavailable)
+        ->and($lookup->cachedRead('34567892'))->toBeNull();
+});

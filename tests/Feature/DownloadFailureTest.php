@@ -10,21 +10,18 @@
  */
 
 use BeeCoded\EFactura\Enums\FailureReason;
+use BeeCoded\EFactura\Enums\StatusCheckOutcome;
 use BeeCoded\EFactura\Enums\UploadStatus;
 use BeeCoded\EFactura\Events\InvoiceFailed;
 use BeeCoded\EFactura\Events\InvoiceProcessed;
 use BeeCoded\EFactura\Events\InvoiceReceived;
-use BeeCoded\EFactura\Jobs\CheckUploadStatuses;
-use BeeCoded\EFactura\Jobs\DownloadReceivedInvoices;
-use BeeCoded\EFactura\Jobs\DownloadResponses;
 use BeeCoded\EFactura\Models\EfacturaMessage;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\DownloadService;
-use BeeCoded\EFacturaSdk\Exceptions\ApiException;
-use BeeCoded\EFacturaSdk\Exceptions\RateLimitExceededException;
 use BeeCoded\EFacturaSdk\Services\RateLimiter;
 use Illuminate\Contracts\Filesystem\Filesystem;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
@@ -92,20 +89,48 @@ function makeCompletedUpload(EfacturaToken $token): EfacturaUpload
         'status' => UploadStatus::Completed,
         'download_id' => '3001130059',
         'standard' => 'UBL',
+        'processed_at' => now(),
     ]);
 }
 
+function makeReceivedMessage(EfacturaToken $token, string $id = '4001130001'): EfacturaMessage
+{
+    return EfacturaMessage::create([
+        'efactura_token_id' => $token->id,
+        'message_id' => $id,
+        'type' => 'received',
+        'download_id' => $id,
+        'is_downloaded' => false,
+    ]);
+}
+
+/** A response archive whose only member is encrypted, which ANAF never sends. */
+function encryptedZip(): string
+{
+    $path = tempnam(sys_get_temp_dir(), 'efactura-zip');
+    $zip = new ZipArchive;
+    $zip->open($path, ZipArchive::OVERWRITE);
+    $zip->addFromString('raport.xml', '<Raport/>');
+    $zip->setEncryptionName('raport.xml', ZipArchive::EM_AES_256, 'secret');
+    $zip->close();
+    $bytes = file_get_contents($path);
+    unlink($path);
+
+    return $bytes;
+}
+
 describe('checkStatus', function () {
-    it('stops the batch instead of walking the backlog when ANAF rate limits us', function () {
+    it('reports ANAF rate limiting a check, without throwing or counting it', function () {
         // A real ANAF 429 arrives as ApiException(429) — the SDK's isRetryable()
         // deliberately excludes 429, so it throws rather than retrying.
         Http::fake([STATUS_URL => Http::response(
             ['eroare' => 'S-au facut deja 100 de apeluri in ultimele 24 ore'],
             429
         )]);
+        $upload = makeProcessingUpload($this->token);
 
-        expect(fn () => $this->downloadService->checkStatus(makeProcessingUpload($this->token)))
-            ->toThrow(ApiException::class);
+        expect($this->downloadService->checkStatus($upload))->toBe(StatusCheckOutcome::RateLimited)
+            ->and($upload->fresh()->status_failures)->toBe(0);
     });
 
     it('refuses to poll an unknown upload forever in silence', function () {
@@ -171,7 +196,7 @@ describe('checkStatus', function () {
         $upload = makeProcessingUpload($this->token);
         Http::fake([STATUS_URL => function () use ($upload, $answer) {
             // Failed, re-queued and sent again under a new index while ANAF answered.
-            EfacturaUpload::whereKey($upload->id)->update(['upload_index' => '5001130256']);
+            EfacturaUpload::whereKey($upload->id)->update(['upload_index' => '5001130256', 'next_poll_at' => null]);
 
             return $answer();
         }]);
@@ -190,14 +215,15 @@ describe('checkStatus', function () {
 });
 
 describe('downloadResponse', function () {
-    it('stops the batch instead of walking the backlog when ANAF rate limits us', function () {
+    it('reports ANAF rate limiting a download, without throwing or recording a failure', function () {
         Http::fake([DOWNLOAD_URL => Http::response(
             ['eroare' => 'S-au facut deja 100 de apeluri in ultimele 24 ore'],
             429
         )]);
+        $upload = makeCompletedUpload($this->token);
 
-        expect(fn () => $this->downloadService->downloadResponse(makeCompletedUpload($this->token)))
-            ->toThrow(ApiException::class);
+        expect($this->downloadService->downloadResponse($upload))->toBeFalse()
+            ->and($upload->fresh()->response_failed_at)->toBeNull();
     });
 
     it('records a poisoned download loudly instead of swallowing it', function () {
@@ -205,10 +231,6 @@ describe('downloadResponse', function () {
         // a ZIP. Swallowing it into a log line left response_path null, so
         // needsResponseDownload() re-selected this row on EVERY scheduled
         // DownloadResponses run, forever, with nothing recorded against the upload.
-        //
-        // NOTE: this records and escalates the failure; it does not yet EXCLUDE the row
-        // from needsResponseDownload(), which would need a column/scope change in files
-        // outside this change's ownership.
         Storage::fake('local');
 
         Http::fake([DOWNLOAD_URL => Http::response(
@@ -227,6 +249,7 @@ describe('downloadResponse', function () {
         expect($upload->status)->toBe(UploadStatus::Completed);
         // But the permanent failure must be recorded rather than silently retried.
         expect($upload->errors)->not->toBeNull();
+        expect($upload->response_failed_at)->not->toBeNull();
         expect($upload->response_path)->toBeNull();
     });
 
@@ -248,10 +271,10 @@ describe('downloadResponse', function () {
 
     /**
      * put() returning false was ignored, so response_path pointed at a file that was
-     * never written. A storage problem is ours, not ANAF's: it must not use up the
-     * download attempts either.
+     * never written. A storage problem is ours, not ANAF's: it is not recorded as a failed
+     * download either.
      */
-    it('records neither a path nor an attempt when the file cannot be stored', function () {
+    it('records neither a path nor a failure when the file cannot be stored', function () {
         $disk = Mockery::mock(Filesystem::class);
         $disk->shouldReceive('put')->andReturn(false);
         Storage::set('local', $disk);
@@ -263,10 +286,10 @@ describe('downloadResponse', function () {
         $this->downloadService->downloadResponse($upload);
 
         expect($upload->fresh()->response_path)->toBeNull()
-            ->and($upload->fresh()->response_attempts)->toBe(0);
+            ->and($upload->fresh()->response_failed_at)->toBeNull();
     });
 
-    it('neither marks a received invoice downloaded nor counts an attempt when it cannot be stored', function () {
+    it('does not mark a received invoice downloaded when it cannot be stored', function () {
         Event::fake([InvoiceReceived::class]);
         $disk = Mockery::mock(Filesystem::class);
         $disk->shouldReceive('put')->andReturn(false);
@@ -285,76 +308,73 @@ describe('downloadResponse', function () {
 
         $message->refresh();
         expect($message->is_downloaded)->toBeFalse()
-            ->and($message->xml_path)->toBeNull()
-            ->and($message->download_attempts)->toBe(0);
+            ->and($message->xml_path)->toBeNull();
         Event::assertNotDispatched(InvoiceReceived::class);
     });
 });
 
-describe('a poisoned response must not be re-downloaded forever', function () {
-    /**
-     * ANAF answers 2xx but the body is not a ZIP, so guardDownloadBody() throws
-     * and response_path stays null. needsResponseDownload() keys on
-     * `whereNull('response_path')`, so the row is re-selected on EVERY scheduled
-     * DownloadResponses run — one wasted /descarcare call per row per run,
-     * forever, against a 100/day-per-message quota.
-     *
-     * A fake response_path would be a lie (no such file), and encoding "we gave
-     * up" into the free-text `errors` payload is exactly the stringly-typed
-     * classification v3 removed. So the attempt count gets its own column.
-     *
-     * Bounded rather than immediate: a junk body may be a transient ANAF glitch,
-     * so it is worth a few tries before a human is involved.
-     */
-    it('stops selecting the row once the attempt cap is reached', function () {
+/**
+ * Every read claims its row by writing its next try before it asks ANAF, so whatever the
+ * outcome, the next run does not spend the row's daily quota again before that slot.
+ */
+describe('a read that fails is not repeated before its slot', function () {
+    it('waits out a failed download instead of reading it again on every run', function (string $kind) {
+        config(['efactura-sdk.http.retry_times' => 3, 'efactura-sdk.http.retry_delay' => 0]);
         Storage::fake('local');
+        $this->freezeSecond();
+        // Still valid after the hour this test travels.
+        $this->token->update(['expires_at' => now()->addDay()]);
+        Http::fake([DOWNLOAD_URL => Http::sequence()
+            ->push('Service Unavailable', 503)
+            ->push('Service Unavailable', 503)
+            ->push('Service Unavailable', 503)
+            ->push(responseZip(), 200, ['Content-Type' => 'application/zip'])]);
+        [$row, $run, $attempts, $due, $stored] = match ($kind) {
+            'response' => [makeCompletedUpload($this->token), fn () => $this->downloadService->downloadAllResponses($this->token), 'response_attempts', 'next_poll_at', 'response_path'],
+            'received invoice' => [makeReceivedMessage($this->token), fn () => $this->downloadService->downloadAllReceivedInvoices($this->token), 'download_attempts', 'next_download_at', 'xml_path'],
+        };
 
-        Http::fake([DOWNLOAD_URL => Http::response(
-            ['eroare' => 'Nu exista niciun mesaj cu id-ul=3001130059'],
-            200,
-            ['Content-Type' => 'application/json']
-        )]);
+        // The row is reached a few seconds into its scheduled run; the retry still lands on
+        // the run an hour later, not the one after it.
+        $tick = now()->getTimestamp();
+        $this->travel(10)->seconds();
+        $run();
+        Http::assertSentCount(3);
+        expect($row->fresh()->{$attempts})->toBe(1)
+            ->and($row->fresh()->{$due}?->getTimestamp())->toBe($tick + 10 + 3600 - 60);
 
-        $upload = makeCompletedUpload($this->token);
+        $run();
+        Http::assertSentCount(3);
 
-        // Every scheduled run re-attempts it while it is still under the cap.
-        for ($run = 1; $run <= 3; $run++) {
-            expect(EfacturaUpload::needsResponseDownload()->pluck('id')->all())
-                ->toContain($upload->id);
+        $this->travelTo(Carbon\Carbon::createFromTimestamp($tick + 3601, config('app.timezone')));
+        $run();
+        expect($row->fresh()->{$stored})->not->toBeNull()
+            ->and($row->fresh()->{$attempts})->toBe(2);
+        Http::assertSentCount(4);
+    })->with(['response', 'received invoice']);
+});
 
-            $this->downloadService->downloadResponse($upload->refresh());
-        }
+/** ANAF keeps an archive downloadable for 60 days; past that no run asks for it. */
+describe('the 60-day horizon', function () {
+    it('selects responses and received invoices for download only within 60 days', function () {
+        $old = makeCompletedUpload($this->token);
+        $old->update(['processed_at' => now()->subDays(61)]);
+        $recent = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 3,
+            'status' => UploadStatus::Completed,
+            'download_id' => '3001130060',
+            'standard' => 'UBL',
+            'processed_at' => now()->subDays(59),
+        ]);
+        $oldMessage = makeReceivedMessage($this->token, '4001130001');
+        $recentMessage = makeReceivedMessage($this->token, '4001130002');
+        EfacturaMessage::whereKey($oldMessage->id)->update(['created_at' => now()->subDays(61)]);
+        EfacturaMessage::whereKey($recentMessage->id)->update(['created_at' => now()->subDays(59)]);
 
-        // Having burned the cap, it must drop out of the query instead of
-        // hammering ANAF for the rest of time.
-        expect(EfacturaUpload::needsResponseDownload()->pluck('id')->all())
-            ->not->toContain($upload->id);
-
-        $upload->refresh();
-        expect($upload->response_attempts)->toBe(3)
-            ->and($upload->response_failed_at)->not->toBeNull()
-            // ANAF accepted the invoice; only the receipt is missing.
-            ->and($upload->status)->toBe(UploadStatus::Completed)
-            ->and($upload->response_path)->toBeNull();
-    });
-
-    it('does not count a successful download against the cap', function () {
-        Storage::fake('local');
-
-        Http::fake([DOWNLOAD_URL => Http::response(
-            responseZip(),
-            200,
-            ['Content-Type' => 'application/zip']
-        )]);
-
-        $upload = makeCompletedUpload($this->token);
-
-        $this->downloadService->downloadResponse($upload);
-
-        $upload->refresh();
-        expect($upload->response_attempts)->toBe(0)
-            ->and($upload->response_failed_at)->toBeNull()
-            ->and($upload->response_path)->not->toBeNull();
+        expect(EfacturaUpload::needsResponseDownload()->pluck('id')->all())->toBe([$recent->id])
+            ->and(EfacturaMessage::needsDownload()->pluck('id')->all())->toBe([$recentMessage->id]);
     });
 });
 
@@ -471,6 +491,7 @@ describe('overlapping runs on one upload', function () {
                 'failure_reason' => null,
                 'download_id' => '3001130060',
                 'response_path' => null,
+                'next_poll_at' => null,
             ]);
 
             return Http::response(responseZip(), 200, ['Content-Type' => 'application/zip']);
@@ -483,6 +504,39 @@ describe('overlapping runs on one upload', function () {
             ->and(Storage::disk('local')->allFiles())->toBe([]);
         Event::assertNotDispatched(InvoiceProcessed::class);
     });
+
+    it('does not mark a response another run stored as failed', function () {
+        Http::fake([DOWNLOAD_URL => Http::response(['eroare' => 'Nu exista niciun mesaj cu id-ul=3001130059'], 200, ['Content-Type' => 'application/json'])]);
+        $upload = makeCompletedUpload($this->token);
+        // The other run stored it after this one loaded the row.
+        EfacturaUpload::whereKey($upload->id)->update(['response_path' => 'efactura/responses/12345678/x.zip']);
+
+        $downloaded = $this->downloadService->downloadResponse($upload);
+
+        Http::assertNothingSent();
+        $upload->refresh();
+        expect([$upload->response_attempts, $upload->response_failed_at, $upload->errors])->toBe([0, null, null])
+            ->and($downloaded)->toBeFalse();
+    });
+
+    it('removes the file it stored when recording it fails', function (string $kind) {
+        Storage::fake('local');
+        Http::fake([DOWNLOAD_URL => Http::response(responseZip(), 200, ['Content-Type' => 'application/zip'])]);
+        [$row, $download, $columns, $path] = match ($kind) {
+            'response' => [$upload = makeCompletedUpload($this->token), fn () => $this->downloadService->downloadResponse($upload), ['response_path', 'response_verification'], 'response_path'],
+            'received invoice' => [$message = makeReceivedMessage($this->token), fn () => $this->downloadService->downloadMessage($message), ['is_downloaded', 'xml_path'], 'xml_path'],
+        };
+        DB::beforeExecuting(function (string $query) use ($columns) {
+            if (str_starts_with($query, 'update') && str_contains($query, $columns[0]) && str_contains($query, $columns[1])) {
+                throw new RuntimeException('database write failed');
+            }
+        });
+
+        $download();
+
+        expect(Storage::disk('local')->allFiles())->toBe([])
+            ->and($row->fresh()->{$path})->toBeNull();
+    })->with(['response', 'received invoice']);
 
     it('does not count an old permanent download failure against a row re-queued meanwhile', function () {
         $upload = makeCompletedUpload($this->token);
@@ -521,7 +575,7 @@ describe('status answers without a download id', function () {
 
         $upload = makeProcessingUpload($this->token);
 
-        (new CheckUploadStatuses)->handle($this->downloadService);
+        $this->downloadService->checkAllStatuses($this->token);
 
         $upload->refresh();
         expect($upload->status)->toBe(UploadStatus::Completed)
@@ -529,7 +583,7 @@ describe('status answers without a download id', function () {
             ->and($upload->failure_reason)->toBeNull()
             ->and($upload->errors)->toBe([__('efactura::messages.completed_without_download_id')]);
 
-        (new DownloadResponses)->handle($this->downloadService);
+        $this->downloadService->downloadAllResponses($this->token);
 
         Http::assertNotSent(fn ($request) => str_contains($request->url(), '/descarcare'));
         expect($upload->fresh()->response_path)->toBeNull();
@@ -590,57 +644,52 @@ describe('status answers without a download id', function () {
 });
 
 describe('permanent status-check failures', function () {
-    it('parks an upload after the configured number of permanent failures, not before', function () {
-        config(['efactura.polling.max_status_failures' => 3]);
+    it('parks an upload after DownloadService::MAX_STATUS_FAILURES refusals, not before', function () {
         Event::fake([InvoiceFailed::class]);
         Http::fake([STATUS_URL => Http::response(['eroare' => 'Bad request'], 400)]);
 
         $upload = makeProcessingUpload($this->token);
 
-        for ($run = 1; $run <= 2; $run++) {
-            (new CheckUploadStatuses)->handle($this->downloadService);
+        for ($run = 1; $run < DownloadService::MAX_STATUS_FAILURES; $run++) {
+            $this->downloadService->checkStatus($upload->refresh());
         }
 
         $upload->refresh();
         expect($upload->status)->toBe(UploadStatus::Processing)
-            ->and($upload->status_failures)->toBe(2);
+            ->and($upload->status_failures)->toBe(DownloadService::MAX_STATUS_FAILURES - 1);
         Event::assertNotDispatched(InvoiceFailed::class);
 
-        (new CheckUploadStatuses)->handle($this->downloadService);
+        $this->downloadService->checkStatus($upload->refresh());
 
         $upload->refresh();
         expect($upload->status)->toBe(UploadStatus::Failed)
             ->and($upload->failure_reason)->toBe(FailureReason::Indeterminate)
             ->and($upload->upload_index)->toBe('5001130255')
-            ->and($upload->errors[0])->toBe(__('efactura::messages.status_poll_failures_exhausted', ['index' => '5001130255', 'count' => 3]));
+            ->and($upload->errors[0])->toBe(__('efactura::messages.status_poll_failures_exhausted', ['index' => '5001130255', 'count' => DownloadService::MAX_STATUS_FAILURES]));
         Event::assertDispatchedTimes(InvoiceFailed::class, 1);
 
         // A parked row leaves the polling query.
-        (new CheckUploadStatuses)->handle($this->downloadService);
-        Http::assertSentCount(3);
+        $this->travel(1)->day();
+        $this->downloadService->checkAllStatuses($this->token);
+        Http::assertSentCount(DownloadService::MAX_STATUS_FAILURES);
     });
 
-    it('defaults the bound to five permanent failures', function () {
-        Http::fake([STATUS_URL => Http::response(['eroare' => 'Bad request'], 400)]);
-
+    it('resets a failure count another run added while this read was in flight', function () {
+        Http::fake([STATUS_URL => anafStatus('in prelucrare')]);
         $upload = makeProcessingUpload($this->token);
+        EfacturaUpload::whereKey($upload->id)->update(['status_failures' => 1]);
 
-        for ($run = 1; $run <= 4; $run++) {
-            $this->downloadService->checkStatus($upload->refresh());
-        }
-        expect($upload->refresh()->status)->toBe(UploadStatus::Processing);
+        $this->downloadService->checkStatus($upload);
 
-        $this->downloadService->checkStatus($upload->refresh());
-        expect($upload->refresh()->failure_reason)->toBe(FailureReason::Indeterminate);
+        expect($upload->fresh()->status_failures)->toBe(0);
     });
 
     it('never parks an upload for ANAF or transport outages', function (int $status) {
-        config(['efactura.polling.max_status_failures' => 2]);
         Http::fake([STATUS_URL => Http::response('Service Unavailable', $status)]);
 
         $upload = makeProcessingUpload($this->token);
 
-        for ($run = 1; $run <= 4; $run++) {
+        for ($run = 1; $run <= DownloadService::MAX_STATUS_FAILURES + 1; $run++) {
             $this->downloadService->checkStatus($upload->refresh());
         }
 
@@ -651,13 +700,14 @@ describe('permanent status-check failures', function () {
     })->with([503, 408]);
 
     it('parks an upload whose stored index the SDK refuses', function () {
-        config(['efactura.polling.max_status_failures' => 2]);
         Http::fake();
 
         $upload = makeProcessingUpload($this->token);
         $upload->update(['upload_index' => 'INDEX123']);
 
-        $this->downloadService->checkStatus($upload->refresh());
+        for ($run = 1; $run < DownloadService::MAX_STATUS_FAILURES; $run++) {
+            $this->downloadService->checkStatus($upload->refresh());
+        }
         expect($upload->refresh()->status)->toBe(UploadStatus::Processing);
 
         $this->downloadService->checkStatus($upload->refresh());
@@ -670,7 +720,6 @@ describe('permanent status-check failures', function () {
     });
 
     it('resets the count on any successful read', function () {
-        config(['efactura.polling.max_status_failures' => 3]);
         Http::fake([STATUS_URL => Http::sequence()
             ->push(['eroare' => 'Bad request'], 400)
             ->push(['eroare' => 'Bad request'], 400)
@@ -696,7 +745,6 @@ describe('permanent status-check failures', function () {
     });
 
     it('leaves the count of a row sent again meanwhile', function (Closure $answer) {
-        config(['efactura.polling.max_status_failures' => 2]);
         $upload = makeProcessingUpload($this->token);
         $upload->update(['status_failures' => 1]);
         Http::fake([STATUS_URL => function () use ($upload, $answer) {
@@ -718,23 +766,38 @@ describe('permanent status-check failures', function () {
 });
 
 describe('permanent download failures', function () {
-    it('counts a 4xx response download against the attempt cap', function () {
+    it('records ANAF refusing a response download, and reads it again only at its next slot', function () {
         Storage::fake('local');
         Http::fake([DOWNLOAD_URL => Http::response(['eroare' => 'Forbidden'], 403)]);
 
         $upload = makeCompletedUpload($this->token);
 
-        for ($run = 1; $run <= EfacturaUpload::MAX_RESPONSE_ATTEMPTS; $run++) {
-            (new DownloadResponses)->handle($this->downloadService);
-        }
+        $this->downloadService->downloadAllResponses($this->token);
+        $this->downloadService->downloadAllResponses($this->token);
 
-        expect($upload->refresh()->response_attempts)->toBe(EfacturaUpload::MAX_RESPONSE_ATTEMPTS);
-
-        (new DownloadResponses)->handle($this->downloadService);
-        Http::assertSentCount(EfacturaUpload::MAX_RESPONSE_ATTEMPTS);
+        $upload->refresh();
+        expect($upload->response_failed_at)->not->toBeNull()
+            ->and($upload->response_path)->toBeNull()
+            ->and($upload->response_attempts)->toBe(1);
+        Http::assertSentCount(1);
     });
 
-    it('does not count a 5xx response download', function () {
+    it('records ANAF refusing a response archive', function (Closure $answer) {
+        Storage::fake('local');
+        Http::fake([DOWNLOAD_URL => $answer()]);
+
+        $upload = makeCompletedUpload($this->token);
+
+        $this->downloadService->downloadResponse($upload);
+
+        expect($upload->fresh()->response_failed_at)->not->toBeNull()
+            ->and($upload->fresh()->response_path)->toBeNull();
+    })->with([
+        'a JSON error with 200' => [fn () => Http::response(['eroare' => 'Nu exista niciun mesaj cu id-ul=3001130059'], 200, ['Content-Type' => 'application/json'])],
+        'an encrypted archive' => [fn () => Http::response(encryptedZip(), 200, ['Content-Type' => 'application/zip'])],
+    ]);
+
+    it('does not record a 5xx response download as a failure', function () {
         Storage::fake('local');
         Http::fake([DOWNLOAD_URL => Http::response('Service Unavailable', 503)]);
 
@@ -742,28 +805,92 @@ describe('permanent download failures', function () {
 
         $this->downloadService->downloadResponse($upload);
 
-        expect($upload->refresh()->response_attempts)->toBe(0);
+        expect($upload->refresh()->response_failed_at)->toBeNull();
     });
 
-    it('stops re-downloading a received invoice that fails permanently', function () {
+    it('reads a received invoice ANAF refused again only at its next slot', function () {
         Storage::fake('local');
         Http::fake([DOWNLOAD_URL => Http::response(['eroare' => 'Not found'], 404)]);
 
-        $message = EfacturaMessage::create([
-            'efactura_token_id' => $this->token->id,
-            'message_id' => '4001130001',
-            'type' => 'received',
-            'download_id' => '4001130001',
-            'is_downloaded' => false,
-        ]);
+        $message = makeReceivedMessage($this->token);
 
-        for ($run = 1; $run <= EfacturaMessage::MAX_DOWNLOAD_ATTEMPTS + 1; $run++) {
-            (new DownloadReceivedInvoices)->handle($this->downloadService);
-        }
+        $this->downloadService->downloadAllReceivedInvoices($this->token);
+        $this->downloadService->downloadAllReceivedInvoices($this->token);
 
-        expect($message->refresh()->download_attempts)->toBe(EfacturaMessage::MAX_DOWNLOAD_ATTEMPTS)
+        expect($message->refresh()->download_attempts)->toBe(1)
             ->and($message->is_downloaded)->toBeFalse();
-        Http::assertSentCount(EfacturaMessage::MAX_DOWNLOAD_ATTEMPTS);
+        Http::assertSentCount(1);
+    });
+});
+
+/**
+ * Only ANAF refusing the row is recorded against it. Our own database, cache or
+ * configuration failing after the request says nothing about the row (#64).
+ */
+describe('a local failure after the request', function () {
+    beforeEach(function () {
+        config(['cache.limiter' => 'missing']);
+        app()->forgetInstance(Illuminate\Cache\RateLimiter::class);
+        Illuminate\Support\Facades\RateLimiter::clearResolvedInstance(Illuminate\Cache\RateLimiter::class);
+        Http::fake();
+    });
+
+    it('is not counted as ANAF refusing a status read', function () {
+        $upload = makeProcessingUpload($this->token);
+
+        expect($this->downloadService->checkStatus($upload))->toBe(StatusCheckOutcome::Failed)
+            ->and($upload->fresh()->status_failures)->toBe(0);
+        Http::assertNothingSent();
+    });
+
+    it('is not recorded as a failed response download', function () {
+        $upload = makeCompletedUpload($this->token);
+        $upload->update(['errors' => ['an earlier note']]);
+
+        $this->downloadService->downloadResponse($upload);
+
+        $upload->refresh();
+        expect([$upload->response_failed_at, $upload->errors, $upload->response_attempts])->toBe([null, ['an earlier note'], 1]);
+        Http::assertNothingSent();
+    });
+});
+
+/**
+ * A refused grant, a deactivated or unreadable company, or a pause applies to every row of
+ * the company: the run stops at the first, records nothing against any row and claims no
+ * other one.
+ */
+describe('a failure of the whole grant', function () {
+    it('stops the status run without counting or claiming another row', function (Closure $breakIt, int $requests, bool $claimsFirst) {
+        Http::fake([STATUS_URL => Http::response(['eroare' => 'Unauthorized'], 401)]);
+        $first = makeProcessingUpload($this->token);
+        $second = EfacturaUpload::create([
+            'efactura_token_id' => $this->token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 3,
+            'status' => UploadStatus::Processing,
+            'upload_index' => '5001130256',
+            'standard' => 'UBL',
+        ]);
+        $breakIt($this->token);
+
+        expect($this->downloadService->checkAllStatuses($this->token))->toBeFalse();
+
+        Http::assertSentCount($requests);
+        expect([$first->fresh()->status_failures, $second->fresh()->status_failures])->toBe([0, 0])
+            ->and($second->fresh()->next_poll_at)->toBeNull()
+            ->and($first->fresh()->next_poll_at !== null)->toBe($claimsFirst);
+    })->with([
+        'ANAF refuses the request with 401' => [fn (EfacturaToken $token) => null, 1, true],
+        'a deactivated token' => [fn (EfacturaToken $token) => $token->update(['is_active' => false]), 0, true],
+        'a stored CUI that is not canonical' => [fn (EfacturaToken $token) => EfacturaToken::whereKey($token->id)->update(['cui' => '012345678']), 0, true],
+        'a paused grant' => [fn (EfacturaToken $token) => refuseGrant($token), 0, false],
+    ]);
+
+    it('reports a refused request as a failed check', function () {
+        Http::fake([STATUS_URL => Http::response(['eroare' => 'Unauthorized'], 401)]);
+
+        expect($this->downloadService->checkStatus(makeProcessingUpload($this->token)))->toBe(StatusCheckOutcome::Failed);
     });
 });
 
@@ -795,7 +922,7 @@ describe('SDK rate limits in a batch', function () {
 
         exhaustRateLimit(['status_per_day_message' => 1], fn (RateLimiter $limiter) => $limiter->checkStatusQuery('5001130255'));
 
-        (new CheckUploadStatuses)->handle($this->downloadService);
+        $this->downloadService->checkAllStatuses($this->token);
 
         expect($limited->refresh()->status)->toBe(UploadStatus::Processing)
             ->and($limited->status_failures)->toBe(0)
@@ -817,11 +944,76 @@ describe('SDK rate limits in a batch', function () {
         exhaustRateLimit(['status_per_day_message' => 1], fn (RateLimiter $limiter) => $limiter->checkStatusQuery('5001130255'));
 
         $this->artisan('efactura:status', ['--upload' => $upload->id])
-            ->expectsOutputToContain('Skipped: the per-message status limit')
+            ->expectsOutputToContain('ANAF rate limit reached, try again later')
             ->doesntExpectOutput('Done.')
             ->assertExitCode(1);
 
         expect($upload->refresh()->status)->toBe(UploadStatus::Processing);
+        Http::assertNothingSent();
+    });
+
+    it('makes efactura:status --upload say ANAF rate limits it at the global limit', function () {
+        Http::fake([STATUS_URL => anafStatus('ok', '3001130059')]);
+        $upload = makeProcessingUpload($this->token);
+
+        exhaustRateLimit(['global_per_minute' => 1], fn (RateLimiter $limiter) => $limiter->checkGlobal());
+
+        $this->artisan('efactura:status', ['--upload' => $upload->id])
+            ->expectsOutputToContain('ANAF rate limit reached, try again later')
+            ->assertExitCode(1);
+
+        Http::assertNothingSent();
+    });
+
+    it('makes a bulk efactura:status say it stopped for a company at the global limit', function () {
+        Http::fake([STATUS_URL => anafStatus('ok', '3001130059')]);
+        makeProcessingUpload($this->token);
+
+        exhaustRateLimit(['global_per_minute' => 1], fn (RateLimiter $limiter) => $limiter->checkGlobal());
+
+        $this->artisan('efactura:status', ['--cui' => '12345678'])
+            ->expectsOutputToContain('Stopped for 12345678')
+            ->assertExitCode(1);
+
+        Http::assertNothingSent();
+    });
+
+    it('makes a bulk efactura:status carry on past a paused company and still exit 1', function () {
+        Http::fake([STATUS_URL => anafStatus('in prelucrare')]);
+        $healthy = EfacturaToken::create([
+            'cui' => '87654321',
+            'access_token' => 'ACCESS_H',
+            'refresh_token' => 'REFRESH_H',
+            'expires_at' => now()->addHour(),
+            'is_active' => true,
+        ]);
+        makeProcessingUpload($this->token);
+        $checked = EfacturaUpload::create([
+            'efactura_token_id' => $healthy->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 2,
+            'status' => UploadStatus::Processing,
+            'upload_index' => '5001130256',
+            'standard' => 'UBL',
+        ]);
+        refuseGrant($this->token);
+
+        $this->artisan('efactura:status')
+            ->expectsOutputToContain('Stopped for 12345678 (rate limit or token unavailable); see the log.')
+            ->assertExitCode(1);
+
+        Http::assertSentCount(1);
+        Http::assertSent(fn ($request) => str_contains($request->url(), 'id_incarcare=5001130256'));
+        expect($checked->fresh()->next_poll_at)->not->toBeNull();
+    });
+
+    it('reports the global limit on a single check as a rate limit', function () {
+        Http::fake([STATUS_URL => anafStatus('ok', '3001130059')]);
+        $upload = makeProcessingUpload($this->token);
+
+        exhaustRateLimit(['global_per_minute' => 1], fn (RateLimiter $limiter) => $limiter->checkGlobal());
+
+        expect($this->downloadService->checkStatus($upload))->toBe(StatusCheckOutcome::RateLimited);
         Http::assertNothingSent();
     });
 
@@ -873,6 +1065,7 @@ describe('SDK rate limits in a batch', function () {
             'status' => UploadStatus::Completed,
             'download_id' => '3001130060',
             'standard' => 'UBL',
+            'processed_at' => now(),
         ]);
         $message = fn (string $id) => EfacturaMessage::create([
             'efactura_token_id' => $this->token->id,
@@ -889,14 +1082,16 @@ describe('SDK rate limits in a batch', function () {
             $limiter->checkDownload('4001130001');
         });
 
-        (new DownloadResponses)->handle($this->downloadService);
-        (new DownloadReceivedInvoices)->handle($this->downloadService);
+        $this->downloadService->downloadAllResponses($this->token);
+        $this->downloadService->downloadAllReceivedInvoices($this->token);
 
+        // The limiter's refusal still spends the try the run claimed.
         expect($limitedUpload->refresh()->response_path)->toBeNull()
-            ->and($limitedUpload->response_attempts)->toBe(0)
+            ->and($limitedUpload->response_attempts)->toBe(1)
+            ->and($limitedUpload->response_failed_at)->toBeNull()
             ->and($nextUpload->refresh()->response_path)->not->toBeNull()
             ->and($limitedMessage->refresh()->is_downloaded)->toBeFalse()
-            ->and($limitedMessage->download_attempts)->toBe(0)
+            ->and($limitedMessage->download_attempts)->toBe(1)
             ->and($nextMessage->refresh()->is_downloaded)->toBeTrue();
         Http::assertSentCount(2);
     });
@@ -908,8 +1103,7 @@ describe('SDK rate limits in a batch', function () {
 
         exhaustRateLimit(['global_per_minute' => 1], fn (RateLimiter $limiter) => $limiter->checkGlobal());
 
-        expect(fn () => (new CheckUploadStatuses)->handle($this->downloadService))
-            ->toThrow(RateLimitExceededException::class);
+        expect($this->downloadService->checkAllStatuses($this->token))->toBeFalse();
         expect($upload->refresh()->status)->toBe(UploadStatus::Processing)
             ->and($upload->status_failures)->toBe(0);
         Http::assertNothingSent();
@@ -952,7 +1146,7 @@ describe('a throwing listener after a recorded download state', function () {
 
         $upload->refresh();
         expect($upload->response_path)->not->toBeNull()
-            ->and($upload->response_attempts)->toBe(0)
+            ->and($upload->response_failed_at)->toBeNull()
             ->and($upload->errors)->toBeNull();
     });
 
@@ -972,12 +1166,12 @@ describe('a throwing listener after a recorded download state', function () {
 
         $message->refresh();
         expect($message->is_downloaded)->toBeTrue()
-            ->and($message->download_attempts)->toBe(0);
+            ->and($message->xml_path)->not->toBeNull();
     });
 });
 
-describe('per-CUI batch jobs', function () {
-    it('changes only the rows of the CUI the job is given', function () {
+describe('per-token batches', function () {
+    it('changes only the rows of the token it is given', function () {
         Storage::fake('local');
         Http::fake([
             STATUS_URL => anafStatus('in prelucrare'),
@@ -991,12 +1185,12 @@ describe('per-CUI batch jobs', function () {
         $response = makeCompletedUpload($this->token);
         $received = $message($this->token, '4001130001');
         $otherPoll = $upload(['uploadable_id' => 3, 'status' => UploadStatus::Processing, 'upload_index' => '5001130299']);
-        $otherResponse = $upload(['uploadable_id' => 4, 'status' => UploadStatus::Completed, 'download_id' => '3001130099']);
+        $otherResponse = $upload(['uploadable_id' => 4, 'status' => UploadStatus::Completed, 'download_id' => '3001130099', 'processed_at' => now()]);
         $otherReceived = $message($other, '4001130099');
 
-        (new CheckUploadStatuses('12345678'))->handle($this->downloadService);
-        (new DownloadResponses('12345678'))->handle($this->downloadService);
-        (new DownloadReceivedInvoices('12345678'))->handle($this->downloadService);
+        $this->downloadService->checkAllStatuses($this->token);
+        $this->downloadService->downloadAllResponses($this->token);
+        $this->downloadService->downloadAllReceivedInvoices($this->token);
 
         expect($poll->refresh()->next_poll_at)->not->toBeNull()
             ->and($response->refresh()->response_path)->not->toBeNull()

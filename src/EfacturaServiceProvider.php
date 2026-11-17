@@ -11,12 +11,14 @@
 
 namespace BeeCoded\EFactura;
 
+use BeeCoded\EFactura\Services\CachedAnafLookup;
 use BeeCoded\EFactura\Services\DownloadService;
 use BeeCoded\EFactura\Services\MessageSyncService;
 use BeeCoded\EFactura\Services\RetryingAnafDetailsClient;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFacturaSdk\Contracts\AnafDetailsClientInterface;
+use BeeCoded\EFacturaSdk\Services\ApiClients\AnafDetailsClient;
 use Illuminate\Support\ServiceProvider;
 
 class EfacturaServiceProvider extends ServiceProvider
@@ -29,18 +31,13 @@ class EfacturaServiceProvider extends ServiceProvider
         $this->app->singleton(UploadService::class);
         $this->app->singleton(DownloadService::class);
         $this->app->singleton(MessageSyncService::class);
+        $this->app->singleton(EfacturaManager::class);
 
-        $this->app->singleton(EfacturaManager::class, function ($app) {
-            return new EfacturaManager(
-                $app->make(TokenService::class),
-                $app->make(UploadService::class),
-                $app->make(DownloadService::class),
-                $app->make(MessageSyncService::class),
-            );
-        });
+        // Verdicts share one cache key whatever the client, so the container's must be strict.
+        $this->app->bind(CachedAnafLookup::class, fn () => new CachedAnafLookup(new AnafDetailsClient(strict: true, tries: 1, timeoutSeconds: 2)));
 
-        // Wrap the SDK's ANAF lookup client with synchronous retry on the 1 req/sec
-        // rate limit. extend() decorates whatever the SDK provider bound, so the app
+        // Wrap the SDK's ANAF lookup client with synchronous retry on the SDK's
+        // company-lookup limit. extend() decorates whatever the SDK provider bound, so the app
         // injects the resilient client transparently via the SDK interface.
         $this->app->extend(AnafDetailsClientInterface::class, function (AnafDetailsClientInterface $inner) {
             return new RetryingAnafDetailsClient(

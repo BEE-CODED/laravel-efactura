@@ -32,6 +32,9 @@ class CheckSingleUploadStatus implements ShouldQueue
 
     public int $maxExceptions = 3;
 
+    // Its only model is its own upload: once that is gone there is nothing to check.
+    public bool $deleteWhenMissingModels = true;
+
     public function __construct(
         public EfacturaUpload $upload,
     ) {

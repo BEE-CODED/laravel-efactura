@@ -159,6 +159,18 @@ describe('a web-started authorization', function () {
         expect(EfacturaToken::count())->toBe(0);
     });
 
+    it('keeps an earlier state valid when the same session starts another one', function () {
+        $this->withSession(['_token' => 'SESSION_TOKEN']);
+        $stateA = stateFromUrl($this->get('/efactura/auth/18547290')->headers->get('Location'));
+
+        $this->flushSession();
+        $this->withSession(['_token' => 'SESSION_TOKEN']);
+        $this->get('/efactura/auth/18547290');
+
+        $this->get('/efactura/callback?code=AUTH_CODE&state='.urlencode($stateA))
+            ->assertSessionHas('efactura_success', true);
+    });
+
     it('completes for the same user in the same session', function () {
         $this->actingAs(new GenericUser(['id' => 1]));
         $state = stateFromUrl($this->get('/efactura/auth/18547290')->headers->get('Location'));

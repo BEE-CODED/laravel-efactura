@@ -14,8 +14,11 @@ namespace BeeCoded\EFactura\Exceptions;
 use BeeCoded\EFacturaSdk\Exceptions\AuthenticationException;
 
 /**
- * ANAF refused to refresh this grant within the cooldown, so the call was refused
- * without asking ANAF: nothing was sent. An AuthenticationException (401) like any
- * other refresh failure; uploads wait it out without spending a transient attempt.
+ * The company's grant is paused, so the call was refused without asking ANAF: nothing
+ * was sent. TokenService pauses a grant for 15 minutes after the token endpoint refused
+ * its refresh (400/401) or a request was refused with 401, and for 60 s after the token
+ * endpoint failed otherwise;
+ * a re-authorisation lifts it at once. An AuthenticationException (401) like any other
+ * grant failure; uploads wait it out without spending a try.
  */
 class RefreshCooldownException extends AuthenticationException {}

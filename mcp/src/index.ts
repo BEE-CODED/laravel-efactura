@@ -1,78 +1,103 @@
+import { readFileSync, readdirSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { wrapperDocsContent } from "./content/wrapper-docs.js";
-import { modelIntegrationContent } from "./content/model-integration.js";
-import { eventReferenceContent } from "./content/event-reference.js";
-import { jobReferenceContent } from "./content/job-reference.js";
-import { wrapperConfigContent } from "./content/wrapper-config.js";
-import { VALID_TOPICS } from "./registry.js";
 
-const server = new McpServer({
-  name: "efactura",
-  version: "1.0.0",
+// A thin reader: the package's own README.md, CHANGELOG.md and config/ are the only content.
+// They are read on every call from the installed package (mcp/dist/index.js → ../../).
+const packageRoot = new URL("../../", import.meta.url);
+const read = (path: string): string => readFileSync(new URL(path, packageRoot), "utf8");
+
+type Section = { slug: string; text: string };
+
+// README H2/H3 sections under GitHub-style slugs. A section runs to the next heading of the
+// same or a higher level. Lines inside code fences (`# comment` in bash) are not headings.
+function readmeSections(): Section[] {
+  const lines = read("README.md").split("\n");
+  const headings: { at: number; level: number; slug: string }[] = [];
+  const seen = new Map<string, number>();
+  let inFence = false;
+
+  lines.forEach((line, at) => {
+    if (/^\s*(```|~~~)/.test(line)) {
+      inFence = !inFence;
+      return;
+    }
+    const match = inFence ? null : /^(#{1,6})\s+(.*?)\s*#*\s*$/.exec(line);
+    if (!match) return;
+    const base = match[2].toLowerCase().replace(/[^\p{L}\p{N}_\- ]/gu, "").replace(/ /g, "-");
+    const repeats = seen.get(base) ?? 0;
+    seen.set(base, repeats + 1);
+    headings.push({ at, level: match[1].length, slug: repeats ? `${base}-${repeats}` : base });
+  });
+
+  return headings
+    .filter((h) => h.level === 2 || h.level === 3)
+    .map((h) => {
+      const end = headings.find((next) => next.at > h.at && next.level <= h.level)?.at ?? lines.length;
+      return { slug: h.slug, text: lines.slice(h.at, end).join("\n").trim() };
+    });
+}
+
+const text = (body: string, isError = false) => ({
+  content: [{ type: "text" as const, text: body }],
+  ...(isError ? { isError: true } : {}),
 });
 
-// Tool 1: get-wrapper-docs (parameterized by topic)
-server.tool(
+function section(slug: string) {
+  const sections = readmeSections();
+  const found = sections.find((s) => s.slug === slug);
+  if (found) return text(found.text);
+  return text(`Unknown topic "${slug}". Valid topics: changelog, ${sections.map((s) => s.slug).join(", ")}`, true);
+}
+
+const server = new McpServer({ name: "efactura", version: "1.0.0" });
+
+server.registerTool(
   "get-wrapper-docs",
-  "Get documentation about the Laravel e-Factura wrapper package for a specific topic. Use 'migration' for the upgrade guides: v3.1 to v4.0 (every behaviour change), then the step-by-step v2 to v3.0 guide (breaking changes, symptoms, and exact code changes).",
-  { topic: z.enum(VALID_TOPICS).describe("Documentation topic") },
-  async ({ topic }) => {
-    const content = wrapperDocsContent[topic];
-    if (!content) {
-      return {
-        isError: true,
-        content: [{ type: "text" as const, text: `Unknown topic "${topic}". Valid topics: ${VALID_TOPICS.join(", ")}` }],
-      };
-    }
-    return { content: [{ type: "text" as const, text: content }] };
-  }
+  {
+    description:
+      "Read a section of the Laravel e-Factura wrapper README by its heading slug (for example 'oauth-flow' or " +
+      "'status-check-outcomes'), or 'changelog' for CHANGELOG.md, which lists every 4.0 change and is the upgrade " +
+      "guide. An unknown topic returns the list of valid topics.",
+    inputSchema: { topic: z.string().describe("README heading slug, or 'changelog'") },
+  },
+  async ({ topic }) => (topic === "changelog" ? text(read("CHANGELOG.md")) : section(topic)),
 );
 
-// Tool 2: get-model-integration-guide (no params)
-server.tool(
+server.registerTool(
   "get-model-integration-guide",
-  "Get the complete guide for integrating a Laravel model with e-Factura",
-  {},
-  async () => ({
-    content: [{ type: "text" as const, text: modelIntegrationContent }],
-  })
+  { description: "The README's 'Model Integration' section: the interface, the trait and toEfacturaData()." },
+  async () => section("model-integration"),
 );
 
-// Tool 3: get-event-reference (no params)
-server.tool(
+server.registerTool(
   "get-event-reference",
-  "Get all events fired by the Laravel e-Factura wrapper package",
-  {},
-  async () => ({
-    content: [{ type: "text" as const, text: eventReferenceContent }],
-  })
+  { description: "The README's 'Events' section: every event the wrapper fires and its payload." },
+  async () => section("events"),
 );
 
-// Tool 4: get-job-reference (no params)
-server.tool(
+server.registerTool(
   "get-job-reference",
-  "Get all background jobs and scheduling guidance for Laravel e-Factura",
-  {},
-  async () => ({
-    content: [{ type: "text" as const, text: jobReferenceContent }],
-  })
+  { description: "The README's 'Job Scheduling (Required)' section: the jobs and the recommended schedule." },
+  async () => section("job-scheduling-required"),
 );
 
-// Tool 5: get-wrapper-config-reference (no params)
-server.tool(
+server.registerTool(
   "get-wrapper-config-reference",
-  "Get the full configuration schema for the Laravel e-Factura wrapper package",
-  {},
-  async () => ({
-    content: [{ type: "text" as const, text: wrapperConfigContent }],
-  })
+  { description: "The wrapper's config files (config/*.php), with their comments, env vars and defaults." },
+  async () =>
+    text(
+      readdirSync(new URL("config/", packageRoot))
+        .filter((file) => file.endsWith(".php"))
+        .sort()
+        .map((file) => `// config/${file}\n${read(`config/${file}`)}`)
+        .join("\n\n"),
+    ),
 );
 
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await server.connect(new StdioServerTransport());
   console.error("efactura MCP server running on stdio");
 }
 

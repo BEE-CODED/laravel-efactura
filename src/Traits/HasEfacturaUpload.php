@@ -172,8 +172,8 @@ trait HasEfacturaUpload
     }
 
     /**
-     * Scope: Models awaiting response download (completed, no response file yet, and still
-     * under EfacturaUpload::MAX_RESPONSE_ATTEMPTS, so DownloadResponses will fetch it).
+     * Scope: Models awaiting response download (completed, no response file yet, and within
+     * the 60 days ANAF keeps the archive, so DownloadResponses will fetch it).
      */
     public function scopeEfacturaAwaitingResponse(Builder $query): Builder
     {
@@ -181,6 +181,6 @@ trait HasEfacturaUpload
             ->where('status', UploadStatus::Completed)
             ->whereNotNull('download_id')
             ->whereNull('response_path')
-            ->where('response_attempts', '<', EfacturaUpload::MAX_RESPONSE_ATTEMPTS));
+            ->where('processed_at', '>=', now()->subDays(60)));
     }
 }

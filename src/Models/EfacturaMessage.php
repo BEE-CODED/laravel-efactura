@@ -29,6 +29,7 @@ use Illuminate\Support\Carbon;
  * @property bool $is_downloaded
  * @property Carbon|null $message_date
  * @property int $download_attempts
+ * @property Carbon|null $next_download_at
  * @property Carbon $created_at
  * @property Carbon $updated_at
  * @property-read EfacturaToken|null $token
@@ -37,6 +38,7 @@ use Illuminate\Support\Carbon;
  * @method static Builder|static received()
  * @method static Builder|static sent()
  * @method static Builder|static forToken(EfacturaToken $token)
+ * @method static Builder|static needsDownload()
  */
 class EfacturaMessage extends Model
 {
@@ -59,13 +61,8 @@ class EfacturaMessage extends Model
         'is_downloaded' => 'boolean',
         'message_date' => 'datetime',
         'download_attempts' => 'integer',
+        'next_download_at' => 'datetime',
     ];
-
-    /**
-     * Permanent download failures before a received invoice is set aside, mirroring
-     * EfacturaUpload::MAX_RESPONSE_ATTEMPTS: a broken download is not retried forever.
-     */
-    public const MAX_DOWNLOAD_ATTEMPTS = 3;
 
     public function token(): BelongsTo
     {
@@ -105,5 +102,18 @@ class EfacturaMessage extends Model
     public function scopeForToken(Builder $query, EfacturaToken $token): Builder
     {
         return $query->where('efactura_token_id', $token->id);
+    }
+
+    /**
+     * Received invoices not yet downloaded whose next try is due (next_download_at null or
+     * past), only within the 60 days ANAF keeps the archive.
+     */
+    public function scopeNeedsDownload(Builder $query): Builder
+    {
+        return $query->where('type', 'received')
+            ->where('is_downloaded', false)
+            ->whereNotNull('download_id')
+            ->where(fn (Builder $due) => $due->whereNull('next_download_at')->orWhere('next_download_at', '<=', now()))
+            ->whereRaw('COALESCE(message_date, created_at) >= ?', [now()->subDays(60)]);
     }
 }

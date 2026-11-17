@@ -12,6 +12,7 @@
 namespace BeeCoded\EFactura;
 
 use BeeCoded\EFactura\Contracts\EFacturaUploadableInterface;
+use BeeCoded\EFactura\Exceptions\DuplicateUploadException;
 use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
@@ -40,7 +41,7 @@ class EfacturaManager
     /**
      * From a web request, pass its session nonce and user id: see TokenService::getAuthorizationUrl().
      */
-    public function getAuthorizationUrl(string $cui, ?string $sessionNonce = null, int|string|null $userId = null): string
+    public function getAuthorizationUrl(string $cui, #[\SensitiveParameter] ?string $sessionNonce = null, int|string|null $userId = null): string
     {
         return $this->tokenService->getAuthorizationUrl($cui, $sessionNonce, $userId);
     }
@@ -62,6 +63,8 @@ class EfacturaManager
      *     $client = EFactura::client($cui);
      *     $result = $client->getMessages(...);
      *     app(TokenService::class)->handleClientTokenRefresh($client, EFactura::getToken($cui));
+     *
+     * @throws \RuntimeException When the CUI has no active token
      */
     public function client(string $cui): EFacturaClient
     {
@@ -70,16 +73,33 @@ class EfacturaManager
 
     // Upload Operations
 
+    /**
+     * @throws PipelineTablesDisabledException
+     * @throws \RuntimeException When the CUI has no active token
+     * @throws \InvalidArgumentException When $options['standard'] is not a StandardType value
+     * @throws DuplicateUploadException See UploadService::queueUpload()
+     */
     public function queueUpload(EFacturaUploadableInterface $model, ?array $options = null): EfacturaUpload
     {
         return $this->uploadService->queueUpload($model, $options);
     }
 
+    /**
+     * @throws PipelineTablesDisabledException
+     * @throws \RuntimeException When the CUI has no active token
+     * @throws \InvalidArgumentException When $options['standard'] is not a StandardType value
+     * @throws DuplicateUploadException See UploadService::queueUpload()
+     */
     public function queueB2CUpload(EFacturaUploadableInterface $model, ?array $options = null): EfacturaUpload
     {
         return $this->uploadService->queueB2CUpload($model, $options);
     }
 
+    /**
+     * Send the upload now if it is due (see UploadService::processUpload()).
+     *
+     * @throws PipelineTablesDisabledException
+     */
     public function processUpload(EfacturaUpload $upload): void
     {
         $this->uploadService->processUpload($upload);
@@ -92,6 +112,9 @@ class EfacturaManager
         return $this->tokenService;
     }
 
+    /**
+     * @throws PipelineTablesDisabledException
+     */
     public function uploadService(): UploadService
     {
         PipelineTablesDisabledException::throwIfDisabled();
@@ -99,6 +122,9 @@ class EfacturaManager
         return $this->uploadService;
     }
 
+    /**
+     * @throws PipelineTablesDisabledException
+     */
     public function downloadService(): DownloadService
     {
         PipelineTablesDisabledException::throwIfDisabled();
@@ -106,6 +132,9 @@ class EfacturaManager
         return $this->downloadService;
     }
 
+    /**
+     * @throws PipelineTablesDisabledException
+     */
     public function messageSyncService(): MessageSyncService
     {
         PipelineTablesDisabledException::throwIfDisabled();

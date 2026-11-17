@@ -19,6 +19,7 @@ use BeeCoded\EFactura\Jobs\ProcessPendingUploads;
 use BeeCoded\EFactura\Jobs\ProcessSingleUpload;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Models\EfacturaUpload;
+use BeeCoded\EFactura\Services\DownloadService;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFactura\Tests\Fixtures\TestInvoice;
@@ -29,13 +30,13 @@ use GuzzleHttp\Promise\Create;
 use GuzzleHttp\Psr7\Request as Psr7Request;
 use Illuminate\Cache\Events\CacheMissed;
 use Illuminate\Contracts\Filesystem\Filesystem;
-use Illuminate\Contracts\Queue\Job;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\QueryException;
+use Illuminate\Queue\MaxAttemptsExceededException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
-use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 
 /**
@@ -64,15 +65,6 @@ beforeEach(function () {
     ]);
 
     Storage::fake('local');
-
-    if (!Schema::hasTable('test_invoices')) {
-        Schema::create('test_invoices', function ($table) {
-            $table->id();
-            $table->string('number');
-            $table->string('cui');
-            $table->decimal('total', 10, 2)->nullable();
-        });
-    }
 
     $this->token = EfacturaToken::create([
         'cui' => '12345678',
@@ -167,7 +159,8 @@ describe('event semantics', function () {
         $upload = makePendingUpload();
         $this->uploadService->processUpload($upload);
 
-        Event::assertDispatched(InvoiceRateLimited::class);
+        // ANAF's own 429 names no wait.
+        Event::assertDispatched(InvoiceRateLimited::class, fn (InvoiceRateLimited $e) => $e->retryAfterSeconds === null && $e->errors !== []);
         Event::assertNotDispatched(InvoiceFailed::class);
     });
 
@@ -218,9 +211,35 @@ describe('transport ambiguity', function () {
         Event::assertDispatched(InvoiceFailed::class);
     });
 
+    // Nothing usable came back, so the warning must not claim ANAF answered without an index.
+    it('leads with the no-answer warning, not the missing-index one, for a thrown uncertain outcome', function (Closure $answer) {
+        Event::fake([InvoiceFailed::class]);
+        Http::fake([UPLOAD_URL => $answer]);
+
+        $upload = makePendingUpload();
+        $this->uploadService->processUpload($upload);
+
+        $upload->refresh();
+        expect($upload->failure_reason)->toBe(FailureReason::Indeterminate)
+            ->and($upload->errors[0])->toBe(__('efactura::messages.upload_outcome_no_answer'))
+            ->and($upload->errors[0])->not->toBe('efactura::messages.upload_outcome_no_answer')
+            ->and($upload->errors)->toHaveCount(2);
+        Event::assertDispatched(InvoiceFailed::class, fn (InvoiceFailed $e) => $e->errors === $upload->errors);
+    })->with([
+        'a read timeout after the request was written' => [fn ($request) => Create::rejectionFor(new ConnectException(
+            'cURL error 28: Operation timed out after 30001 milliseconds with 0 bytes received',
+            new Psr7Request($request->method(), $request->url()),
+            null,
+            ['errno' => 28, 'request_size' => 412, 'pretransfer_time' => 0.08],
+        ))],
+        'a 408' => [fn () => Http::response('Request Timeout', 408)],
+        'a 5xx' => [fn () => Http::response('Eroare interna', 500)],
+    ]);
+
     // cURL failed to connect, so the request never left: the SDK raises RequestNotSentException,
     // which was an indeterminate 500 and is now retried.
     it('retries an upload the SDK proves was never sent', function () {
+        $this->freezeSecond();
         Event::fake([InvoiceFailed::class]);
         Http::fake([UPLOAD_URL => function ($request) {
             $message = 'cURL error 7: Failed to connect to api.anaf.ro port 443';
@@ -236,11 +255,87 @@ describe('transport ambiguity', function () {
         $upload = makePendingUpload();
         $this->uploadService->processUpload($upload);
 
-        expect($upload->fresh()->status)->toBe(UploadStatus::Failed)
-            ->and($upload->fresh()->failure_reason)->toBe(FailureReason::Transient)
-            ->and($upload->fresh()->xml_path)->toBeNull();
+        expect($upload->fresh())->status->toBe(UploadStatus::Pending)
+            ->failure_reason->toBe(FailureReason::Transient)
+            ->status_failures->toBe(1)
+            ->xml_path->toBeNull()
+            ->and($upload->fresh()->next_poll_at->timestamp)->toBe(now()->addSeconds(UploadService::TRANSIENT_RETRY_DELAY)->timestamp);
         Event::assertNotDispatched(InvoiceFailed::class);
     });
+
+    // The send-side counterpart of the preparation retries: each try was claimed and its XML
+    // stored, and the fifth unsent one ends the upload and drops the XML it never filed.
+    it('abandons an upload at its fifth send that never left', function () {
+        Event::fake([InvoiceFailed::class]);
+        Http::fake([UPLOAD_URL => fn ($request) => Create::rejectionFor(new ConnectException(
+            'cURL error 7: Failed to connect to api.anaf.ro port 443',
+            new Psr7Request($request->method(), $request->url()),
+            null,
+            ['errno' => 7, 'error' => 'Failed to connect to api.anaf.ro port 443'],
+        ))]);
+        $upload = makePendingUpload();
+
+        foreach (range(1, UploadService::MAX_TRANSIENT_ATTEMPTS - 1) as $attempt) {
+            $this->uploadService->processUpload($upload->fresh());
+
+            expect($upload->fresh())->status->toBe(UploadStatus::Pending)
+                ->failure_reason->toBe(FailureReason::Transient)
+                ->status_failures->toBe($attempt)
+                ->xml_path->toBeNull()
+                ->and(Storage::disk('local')->allFiles())->toBe([]);
+            Event::assertNotDispatched(InvoiceFailed::class);
+            $this->travel(UploadService::TRANSIENT_RETRY_DELAY + 1)->seconds();
+        }
+
+        $this->uploadService->processUpload($upload->fresh());
+
+        expect($upload->fresh())->status->toBe(UploadStatus::Failed)
+            ->failure_reason->toBe(FailureReason::Abandoned)
+            ->status_failures->toBe(UploadService::MAX_TRANSIENT_ATTEMPTS)
+            ->xml_path->toBeNull()
+            ->and(Storage::disk('local')->allFiles())->toBe([]);
+        Event::assertDispatchedTimes(InvoiceFailed::class, 1);
+    });
+});
+
+// status_failures counts the unsent tries while Pending and the refused status reads while
+// Processing: ANAF accepting the upload must start the second count from zero.
+it('starts counting refused status reads from zero once ANAF accepts an upload that failed to send before', function () {
+    Event::fake([InvoiceFailed::class]);
+    $sends = 0;
+    Http::fake([
+        UPLOAD_URL => function ($request) use (&$sends) {
+            if (++$sends <= 2) {
+                return Create::rejectionFor(new ConnectException(
+                    'cURL error 7: Failed to connect to api.anaf.ro port 443',
+                    new Psr7Request($request->method(), $request->url()),
+                    null,
+                    ['errno' => 7, 'error' => 'Failed to connect to api.anaf.ro port 443'],
+                ));
+            }
+
+            return Http::response('<?xml version="1.0"?><header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" ExecutionStatus="0" index_incarcare="5001130259"/>');
+        },
+        'https://api.anaf.ro/test/FCTEL/rest/stareMesaj*' => Http::response(['eroare' => 'Bad request'], 400),
+    ]);
+    $upload = makePendingUpload();
+
+    foreach (range(1, 3) as $attempt) {
+        $this->uploadService->processUpload($upload->fresh());
+        $this->travel(UploadService::TRANSIENT_RETRY_DELAY + 1)->seconds();
+    }
+
+    expect($upload->fresh())->status->toBe(UploadStatus::Processing)
+        ->upload_index->toBe('5001130259')
+        ->status_failures->toBe(0);
+
+    foreach (range(1, DownloadService::MAX_STATUS_FAILURES - 1) as $read) {
+        app(DownloadService::class)->checkStatus($upload->fresh());
+    }
+
+    expect($upload->fresh())->status->toBe(UploadStatus::Processing)
+        ->status_failures->toBe(DownloadService::MAX_STATUS_FAILURES - 1);
+    Event::assertNotDispatched(InvoiceFailed::class);
 });
 
 describe('the persisted state of a rate-limited upload', function () {
@@ -251,6 +346,7 @@ describe('the persisted state of a rate-limited upload', function () {
      * event — and the row flips back to Pending 60 seconds later anyway.
      */
     it('stays in the pipeline at the model layer while it waits out the limit', function () {
+        $this->freezeSecond();
         Http::fake([UPLOAD_URL => Http::response('prea multe apeluri', 429)]);
 
         $upload = makePendingUpload();
@@ -263,7 +359,15 @@ describe('the persisted state of a rate-limited upload', function () {
             ->and($upload->isTerminal())->toBeFalse()
             ->and($upload->processed_at)->toBeNull()
             // The classification is still recorded — the retry path reads it.
-            ->and($upload->failure_reason)->toBe(FailureReason::RateLimited);
+            ->and($upload->failure_reason)->toBe(FailureReason::RateLimited)
+            // ANAF named no wait, so it waits at least a minute; its attempt left no file.
+            ->and($upload->next_poll_at->gte(now()->addSeconds(60)))->toBeTrue()
+            ->and($upload->xml_path)->toBeNull()
+            ->and(Storage::disk('local')->allFiles())->toBe([]);
+
+        // Not due yet: a run without a lease sends nothing.
+        $this->uploadService->processUpload($upload);
+        Http::assertSentCount(1);
     });
 
     /**
@@ -327,119 +431,161 @@ describe('the atomic claim', function () {
         Http::assertNothingSent();
     });
 
-    it('sends nothing when the row is re-queued with other options while it is being prepared', function () {
+    // A lost claim is not a try: nothing is counted.
+    it('sends nothing when one option is changed by a re-queue while the document is being prepared', function (string $method, array $options, string $column, mixed $expected) {
         Http::fake([UPLOAD_URL => Http::response('<?xml version="1.0"?><header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" ExecutionStatus="0" index_incarcare="5001130257"/>')]);
         $upload = $this->uploadService->queueUpload($this->invoice);
-        makeUblSpy(fn () => $this->uploadService->queueB2CUpload($this->invoice, ['standard' => 'CN']));
+        makeUblSpy(fn () => $this->uploadService->{$method}($this->invoice, $options));
 
         $this->uploadService->processUpload($upload);
 
         Http::assertNothingSent();
         expect($upload->fresh())->status->toBe(UploadStatus::Pending)
-            ->is_b2c->toBeTrue()->standard->toBe('CN')->xml_path->toBeNull();
+            ->xml_path->toBeNull()
+            ->status_failures->toBe(0)
+            ->{$column}->toBe($expected);
+    })->with([
+        'standard' => ['queueUpload', ['standard' => 'CII'], 'standard', 'CII'],
+        'extern' => ['queueUpload', ['extern' => true], 'is_extern', true],
+        'self_billed' => ['queueUpload', ['self_billed' => true], 'is_self_billed', true],
+        'b2c' => ['queueB2CUpload', [], 'is_b2c', true],
+    ]);
 
-        // The next attempt reads the row afresh and sends what it now says.
+    it('sends what the row says on the next attempt after a re-queue changed it', function () {
+        Http::fake([UPLOAD_URL => Http::response('<?xml version="1.0"?><header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" ExecutionStatus="0" index_incarcare="5001130257"/>')]);
+        $upload = $this->uploadService->queueUpload($this->invoice);
+        makeUblSpy(fn () => $this->uploadService->queueB2CUpload($this->invoice, ['standard' => 'CN']));
+        $this->uploadService->processUpload($upload);
+
         makeUblSpy(fn () => null);
         $this->uploadService->processUpload($upload->fresh());
+
         Http::assertSent(fn ($request) => str_contains($request->url(), '/uploadb2c?') && str_contains($request->url(), 'standard=CN'));
     });
 });
 
-describe('a token that predates the encryption migration', function () {
-    /**
-     * v3 deliberately makes a pre-migration (plaintext) token row throw DecryptException
-     * on read. That throw happens strictly BEFORE any HTTP request, so the document
-     * provably never entered ANAF's pipeline — but DecryptException extends
-     * RuntimeException, matched no specific catch, and fell through to catch(\Throwable)
-     * => Indeterminate: "NEVER auto-resubmitted, requires human reconciliation".
-     *
-     * During a normal deploy window (code live before migrate finishes) that wrote off
-     * every upload for every company, and running the migration afterwards did NOT
-     * unpark them.
-     */
-    it('is not written off as indeterminate, because nothing was ever transmitted', function () {
+/**
+ * A grant that cannot be used fails before anything is sent, for every upload of the company
+ * alike. It is not the upload's fault, so it is never counted, and the row waits in Pending.
+ */
+describe('a grant that cannot be used', function () {
+    it('leaves the upload pending and uncounted, however often it is tried', function (Closure $setup) {
+        Event::fake([InvoiceFailed::class, InvoiceRateLimited::class]);
+        Http::fake([
+            'https://logincert.anaf.ro/anaf-oauth2/v1/token' => Http::response(['error' => 'invalid_client'], 401),
+            UPLOAD_URL => Http::response('should never be reached', 200),
+        ]);
+        $setup->call($this);
+        $upload = makePendingUpload();
+
+        foreach (range(1, 6) as $attempt) {
+            $this->uploadService->processUpload($upload->fresh());
+            // Past a 15-minute pause, so every cycle reaches the grant again.
+            $this->travel(16)->minutes();
+        }
+
+        expect($upload->fresh())->status->toBe(UploadStatus::Pending)
+            ->failure_reason->toBeNull()
+            ->status_failures->toBe(0)
+            ->next_poll_at->toBeNull()
+            ->xml_path->toBeNull()
+            ->and(Storage::disk('local')->allFiles())->toBe([]);
+        Event::assertNothingDispatched();
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), '/upload'));
+    })->with([
+        'a refresh ANAF refuses with 401' => [fn () => $this->token->update(['expires_at' => now()->addSeconds(60)])],
         // Exactly as the pre-v3 release left the row: raw, unencrypted credentials.
-        DB::table('efactura_tokens')->where('id', $this->token->id)->update([
+        'a token that predates the encryption migration' => [fn () => DB::table('efactura_tokens')->where('id', $this->token->id)->update([
             'access_token' => 'PLAINTEXT_ACCESS',
             'refresh_token' => 'PLAINTEXT_REFRESH',
-        ]);
+        ])],
+        'a deactivated token' => [fn () => $this->token->update(['is_active' => false])],
+    ]);
+});
 
-        Http::fake([UPLOAD_URL => Http::response('should never be reached', 200)]);
-
+/**
+ * The grant is refused by ANAF on the upload request itself: the client already holds the
+ * document, so only isGrantFailure()'s AuthenticationException arm keeps it uncounted.
+ */
+describe('an upload request refused with 401', function () {
+    it('leaves the upload pending and uncounted, however often it is tried', function () {
+        Event::fake([InvoiceFailed::class, InvoiceRateLimited::class]);
+        Http::fake([UPLOAD_URL => Http::response(['eroare' => 'Unauthorized'], 401)]);
+        // Valid for the whole run, so every try reaches the upload request, not a refresh.
+        $this->token->update(['expires_at' => now()->addDay()]);
         $upload = makePendingUpload();
-        $this->uploadService->processUpload($upload);
 
-        $upload->refresh();
+        foreach (range(1, 6) as $attempt) {
+            $this->uploadService->processUpload($upload->fresh());
+            // Past a 15-minute pause, so every cycle reaches ANAF again.
+            $this->travel(16)->minutes();
+        }
 
-        expect($upload->failure_reason)->not->toBe(FailureReason::Indeterminate)
-            ->and($upload->failure_reason)->toBe(FailureReason::Transient)
-            ->and($upload->failure_reason->needsReconciliation())->toBeFalse()
-            // It fixes itself the moment the migration lands, so it must stay re-drivable.
-            ->and($upload->failure_reason->isRetryable())->toBeTrue();
-
-        Http::assertNothingSent();
+        expect($upload->fresh())->status->toBe(UploadStatus::Pending)
+            ->failure_reason->toBeNull()
+            ->status_failures->toBe(0)
+            ->xml_path->toBeNull()
+            ->and(Storage::disk('local')->allFiles())->toBe([]);
+        Event::assertNothingDispatched();
+        Http::assertSentCount(6);
     });
 });
 
-describe('a deactivated token', function () {
-    /**
-     * Only the locked refresh path re-checked is_active, so a deactivated token that was
-     * not about to expire still filed invoices.
-     */
-    it('refuses a deactivated token before anything is sent', function () {
-        $upload = makePendingUpload();
-        $this->token->update(['is_active' => false]);
-
-        Http::fake([UPLOAD_URL => Http::response('should never be reached', 200)]);
-
-        $this->uploadService->processUpload($upload);
-
-        expect($upload->fresh()->status)->toBe(UploadStatus::Failed)
-            ->and($upload->fresh()->failure_reason)->toBe(FailureReason::Transient)
-            ->and($upload->fresh()->errors)->toBe(['Token for CUI 12345678 has been deactivated']);
-
-        Http::assertNothingSent();
-    });
-});
-
-describe('an XML file that cannot be stored', function () {
-    /**
-     * put() returning false was ignored, and a storage exception was recorded as a
-     * terminal validation failure of the invoice. Storage is ours to fix: retry it.
-     */
-    it('is a transient failure, announced to nobody, and nothing is sent', function () {
+/**
+ * Preparation failed for a reason that is ours, not the invoice's: a database or storage error.
+ * Nothing was sent, so it is retried, and only the fifth failure ends the upload.
+ */
+describe('a local error while the upload is prepared', function () {
+    it('is retried, announced to nobody, and abandoned at the fifth', function (Closure $setup, string $class) {
         Event::fake([InvoiceFailed::class]);
-        $disk = Mockery::mock(Filesystem::class);
-        $disk->shouldReceive('put')->andReturn(false);
-        Storage::set('local', $disk);
-
-        Http::fake([UPLOAD_URL => Http::response('should never be reached', 200)]);
-
-        $upload = makePendingUpload();
-        $this->uploadService->processUpload($upload);
-
-        expect($upload->fresh()->status)->toBe(UploadStatus::Failed)
-            ->and($upload->fresh()->failure_reason)->toBe(FailureReason::Transient)
-            ->and($upload->fresh()->xml_path)->toBeNull();
-
-        Event::assertNotDispatched(InvoiceFailed::class);
-        Http::assertNothingSent();
-    });
-});
-
-describe('a database error while the invoice is built', function () {
-    it('is a transient failure, announced to nobody, and nothing is sent', function () {
-        Event::fake([InvoiceFailed::class]);
-        // Constructed, not raised by a failing query: that would abort the test transaction on PostgreSQL.
-        makeUblSpy(fn () => throw new QueryException('testing', 'select * from invoice_lines', [], new PDOException('SQLSTATE[40P01]: deadlock detected')));
         Http::fake();
-
+        $setup->call($this);
         $upload = makePendingUpload();
+
+        foreach (range(1, UploadService::MAX_TRANSIENT_ATTEMPTS - 1) as $attempt) {
+            $this->uploadService->processUpload($upload->fresh());
+
+            expect($upload->fresh())->status->toBe(UploadStatus::Pending)
+                ->failure_reason->toBe(FailureReason::Transient)
+                ->status_failures->toBe($attempt)
+                // The class only: a database message can carry SQL and data.
+                ->errors->toBe([__('efactura::messages.local_failure', ['class' => $class])])
+                ->and($this->invoice->fresh()->isEfacturaProcessed())->toBeFalse();
+            Event::assertNotDispatched(InvoiceFailed::class);
+
+            $this->travel(UploadService::TRANSIENT_RETRY_DELAY + 1)->seconds();
+        }
+
+        $this->uploadService->processUpload($upload->fresh());
+
+        expect($upload->fresh())->status->toBe(UploadStatus::Failed)
+            ->failure_reason->toBe(FailureReason::Abandoned)
+            ->status_failures->toBe(UploadService::MAX_TRANSIENT_ATTEMPTS);
+        Event::assertDispatchedTimes(InvoiceFailed::class, 1);
+        Http::assertNothingSent();
+    })->with([
+        'a disk that does not store the XML' => [function () {
+            $disk = Mockery::mock(Filesystem::class);
+            $disk->shouldReceive('put')->andReturn(false);
+            Storage::set('local', $disk);
+        }, 'RuntimeException'],
+        // Constructed, not raised by a failing query: that would abort the test transaction on PostgreSQL.
+        'a query exception' => [fn () => makeUblSpy(fn () => throw new QueryException('testing', 'select * from invoice_lines', [], new PDOException('SQLSTATE[40P01]: deadlock detected'))), 'QueryException'],
+        'a raw PDO exception' => [fn () => makeUblSpy(fn () => throw new PDOException('SQLSTATE[40001]: serialization failure')), 'PDOException'],
+    ]);
+
+    it('records an error in the invoice data as a validation failure, once', function () {
+        Event::fake([InvoiceFailed::class]);
+        Http::fake();
+        makeUblSpy(fn () => throw new InvalidArgumentException('The invoice has no lines'));
+        $upload = makePendingUpload();
+
         $this->uploadService->processUpload($upload);
 
-        expect($upload->fresh()->status)->toBe(UploadStatus::Failed)
-            ->and($upload->fresh()->failure_reason)->toBe(FailureReason::Transient);
-        Event::assertNotDispatched(InvoiceFailed::class);
+        expect($upload->fresh())->status->toBe(UploadStatus::Failed)
+            ->failure_reason->toBe(FailureReason::Validation)
+            ->errors->toBe(['The invoice has no lines']);
+        Event::assertDispatchedTimes(InvoiceFailed::class, 1);
         Http::assertNothingSent();
     });
 });
@@ -509,7 +655,8 @@ describe('an upload answer that does not say whether the document was taken in',
         'malformed XML' => '<?xml version="1.0" encoding="UTF-8"?><header ExecutionStatus="0" index_incarcare="12345"',
     ]);
 
-    it('parks an answer without a usable index or status as indeterminate', function (string $body, array $expectedErrors) {
+    // The index ANAF returned is kept, even one that cannot be polled: SPV is searched by it.
+    it('parks an answer without a usable index or status as indeterminate', function (string $body, array $expectedErrors, ?string $index) {
         Event::fake([InvoiceFailed::class, InvoiceUploaded::class]);
         Http::fake([UPLOAD_URL => Http::response($body, 200)]);
 
@@ -519,7 +666,7 @@ describe('an upload answer that does not say whether the document was taken in',
         $upload->refresh();
         expect($upload->status)->toBe(UploadStatus::Failed)
             ->and($upload->failure_reason)->toBe(FailureReason::Indeterminate)
-            ->and($upload->upload_index)->toBeNull()
+            ->and($upload->upload_index)->toBe($index)
             ->and($upload->errors)->toBe($expectedErrors);
         Event::assertDispatched(InvoiceFailed::class, fn (InvoiceFailed $e) => $e->errors === $expectedErrors);
         Event::assertNotDispatched(InvoiceUploaded::class);
@@ -527,28 +674,46 @@ describe('an upload answer that does not say whether the document was taken in',
         'success with a non-numeric index' => [
             '<header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" dateResponse="202407171230" ExecutionStatus="0" index_incarcare="abc"/>',
             fn () => [__('efactura::messages.upload_outcome_unknown')],
+            'abc',
         ],
         'success with a spaced index' => [
             json_encode(['ExecutionStatus' => '0', 'index_incarcare' => '12 345']),
             fn () => [__('efactura::messages.upload_outcome_unknown')],
+            '12 345',
         ],
         'success with an empty index' => [
             json_encode(['ExecutionStatus' => '0', 'index_incarcare' => '']),
             fn () => [__('efactura::messages.upload_outcome_unknown')],
+            null,
         ],
         'success without an index' => [
             '<header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" dateResponse="202407171230" ExecutionStatus="0"/>',
             fn () => [__('efactura::messages.upload_outcome_unknown')],
+            null,
         ],
         'errors without a status' => [
             json_encode(['Errors' => ['Eroare la procesare', '']]),
             fn () => [__('efactura::messages.upload_outcome_unknown'), 'Eroare la procesare'],
+            null,
         ],
         'an unrecognised status without an index' => [
             json_encode(['ExecutionStatus' => '9']),
             fn () => [__('efactura::messages.upload_outcome_unknown')],
+            null,
         ],
     ]);
+
+    it('keeps an index that cannot be polled, so it cannot be resolved as not filed without --despite-index', function () {
+        Http::fake([UPLOAD_URL => Http::response(json_encode(['ExecutionStatus' => '0', 'index_incarcare' => 'ABC123']), 200)]);
+        $upload = makePendingUpload();
+
+        $this->uploadService->processUpload($upload);
+
+        expect($upload->fresh())->status->toBe(UploadStatus::Failed)
+            ->failure_reason->toBe(FailureReason::Indeterminate)
+            ->upload_index->toBe('ABC123')
+            ->and(fn () => $this->uploadService->resolveIndeterminateAsNotFiled($upload->fresh()))->toThrow(InvalidArgumentException::class);
+    });
 
     it('still rejects an explicit ExecutionStatus=1 without an index as a validation failure', function () {
         Http::fake([UPLOAD_URL => Http::response(json_encode([
@@ -590,6 +755,73 @@ describe('an upload answer carrying a usable index', function () {
         'XML header without ExecutionStatus' => '<header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" dateResponse="202407171230" index_incarcare="12345"/>',
         'XML header with ExecutionStatus=1' => '<header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" dateResponse="202407171230" ExecutionStatus="1" index_incarcare="12345"/>',
     ]);
+
+    // The stale sweep parked the row while ANAF was answering: the index is the truth.
+    it('clears a park written while ANAF answered, and the row stays re-queueable', function () {
+        Event::fake([InvoiceUploaded::class]);
+        $upload = makePendingUpload();
+        Http::fake([UPLOAD_URL => function () use ($upload) {
+            app(UploadService::class)->parkStrandedUploadAsIndeterminate(EfacturaUpload::find($upload->id), 'swept');
+
+            return Http::response(json_encode(['ExecutionStatus' => '0', 'index_incarcare' => '12345']));
+        }]);
+
+        $this->uploadService->processUpload($upload);
+
+        expect($upload->fresh())->status->toBe(UploadStatus::Processing)
+            ->upload_index->toBe('12345')
+            ->failure_reason->toBeNull()
+            ->errors->toBeNull()
+            ->processed_at->toBeNull()
+            ->and($this->uploadService->queueUpload($this->invoice)->is($upload))->toBeTrue();
+        Event::assertDispatchedTimes(InvoiceUploaded::class, 1);
+    });
+
+    it('records the index when the first write of it fails', function () {
+        Event::fake([InvoiceFailed::class, InvoiceUploaded::class]);
+        Http::fake([UPLOAD_URL => Http::response(json_encode(['ExecutionStatus' => '0', 'index_incarcare' => '12345']))]);
+        $thrown = false;
+        // Thrown before the statement runs, so a PostgreSQL test transaction is not aborted.
+        DB::connection()->beforeExecuting(function (string $query, array $bindings) use (&$thrown) {
+            if (!$thrown && str_starts_with(strtolower($query), 'update') && str_contains($query, 'upload_index') && in_array('processing', $bindings, true)) {
+                $thrown = true;
+
+                throw new QueryException('testing', $query, $bindings, new PDOException('SQLSTATE[40P01]: deadlock detected'));
+            }
+        });
+
+        $this->uploadService->processUpload($upload = makePendingUpload());
+
+        expect($thrown)->toBeTrue()
+            ->and($upload->fresh())->status->toBe(UploadStatus::Processing)
+            ->upload_index->toBe('12345')
+            ->failure_reason->toBeNull();
+        Event::assertDispatched(InvoiceUploaded::class);
+        Event::assertNotDispatched(InvoiceFailed::class);
+    });
+
+    // A lost connection after the write committed: the re-run finds the row already recorded.
+    it('takes a write that ran before its error was reported as recorded', function () {
+        Event::fake([InvoiceFailed::class, InvoiceUploaded::class]);
+        Http::fake([UPLOAD_URL => Http::response(json_encode(['ExecutionStatus' => '0', 'index_incarcare' => '12345']))]);
+        $thrown = false;
+        DB::listen(function (QueryExecuted $query) use (&$thrown) {
+            if (!$thrown && str_starts_with(strtolower($query->sql), 'update') && str_contains($query->sql, 'upload_index') && in_array('processing', $query->bindings, true)) {
+                $thrown = true;
+
+                throw new QueryException('testing', $query->sql, $query->bindings, new PDOException('SQLSTATE[08006]: connection failure'));
+            }
+        });
+
+        $this->uploadService->processUpload($upload = makePendingUpload());
+
+        expect($thrown)->toBeTrue()
+            ->and($upload->status)->toBe(UploadStatus::Processing)
+            ->and($upload->fresh())->status->toBe(UploadStatus::Processing)
+            ->upload_index->toBe('12345');
+        Event::assertDispatchedTimes(InvoiceUploaded::class, 1);
+        Event::assertNotDispatched(InvoiceFailed::class);
+    });
 });
 
 /**
@@ -666,15 +898,11 @@ describe('a throwing listener after a recorded upload state', function () {
 });
 
 /**
- * The refresh cooldown refuses an upload without asking ANAF. Counted as a transient
- * failure, it abandoned every upload of the company within about 2.5 minutes.
+ * A paused grant refuses an upload without asking ANAF. Counted as a transient failure, it
+ * abandoned every upload of the company within about 2.5 minutes.
  */
-describe('an upload refused by the refresh cooldown', function () {
-    it('waits it out without spending transient attempts, then uploads', function () {
-        config([
-            'efactura.jobs.max_transient_attempts' => 5,
-            'efactura.jobs.transient_retry_delay_seconds' => 30,
-        ]);
+describe('an upload refused by a paused grant', function () {
+    it('waits the pause out without spending attempts, then uploads', function () {
         Event::fake([InvoiceFailed::class]);
         Http::fake([
             'https://logincert.anaf.ro/anaf-oauth2/v1/token' => Http::sequence()
@@ -685,83 +913,85 @@ describe('an upload refused by the refresh cooldown', function () {
         $this->token->update(['expires_at' => now()->addSeconds(60)]);
         $upload = makePendingUpload();
 
-        // One queued job: each release re-runs it with the row read afresh, under the same uuid.
-        $queueJob = Mockery::mock(Job::class);
-        $queueJob->shouldReceive('uuid')->andReturn('job-uuid-cooldown');
-        $queueJob->shouldReceive('release');
-        $run = fn () => app()->call([(new ProcessSingleUpload($upload->fresh()))->setJob($queueJob), 'handle']);
-
-        // The first run asks ANAF and is refused; the next five fall in the cooldown.
+        // The first run asks ANAF and is refused; the next five fall in the pause.
         foreach (range(1, 6) as $attempt) {
-            $run();
+            $this->uploadService->processUpload($upload->fresh());
             $this->travel(30)->seconds();
         }
 
-        expect($upload->fresh()->status)->toBe(UploadStatus::Pending)
-            ->and($upload->fresh()->failure_reason)->toBeNull();
+        expect($upload->fresh())->status->toBe(UploadStatus::Pending)
+            ->failure_reason->toBeNull()
+            ->status_failures->toBe(0);
         Event::assertNotDispatched(InvoiceFailed::class);
         Http::assertSentCount(1);
 
         $this->travel(15)->minutes();
-        $run();
+        $this->uploadService->processUpload($upload->fresh());
 
         expect($upload->fresh()->status)->toBe(UploadStatus::Processing)
             ->and($upload->fresh()->upload_index)->toBe('12345');
     });
 
-    // Released every 30 s, each run built and stored a new XML file for 24 hours.
-    it('sleeps the rest of the cooldown and builds no XML meanwhile', function () {
-        Http::fake([
-            'https://logincert.anaf.ro/anaf-oauth2/v1/token' => Http::response(['error' => 'invalid_grant'], 400),
-            UPLOAD_URL => Http::response('never reached', 500),
-        ]);
-        $this->token->update(['expires_at' => now()->addSeconds(60)]);
+    // Its lease is handed back, so the next dispatch after the pause takes it at once.
+    it('builds no XML and hands its lease back', function () {
+        Queue::fake();
         $upload = makePendingUpload();
+        $this->uploadService->dispatchPendingUploads($this->token);
+        $lease = Queue::pushed(ProcessSingleUpload::class)->first()->lease;
+        coolDownGrant($this->token, 600);
+        Http::fake();
 
-        $delays = [];
-        $queueJob = Mockery::mock(Job::class);
-        $queueJob->shouldReceive('uuid')->andReturn('job-uuid-cooldown-sleep');
-        $queueJob->shouldReceive('release')->andReturnUsing(function (int $delay) use (&$delays) {
-            $delays[] = $delay;
-        });
-        $run = fn () => app()->call([(new ProcessSingleUpload($upload->fresh()))->setJob($queueJob), 'handle']);
+        $this->uploadService->processUpload($upload->fresh(), $lease);
 
-        $run(); // refused by ANAF: the cooldown starts
-        $files = Storage::disk('local')->allFiles();
-        $this->travel(30)->seconds();
-        $run();
+        expect($lease)->not->toBeNull()
+            ->and($upload->fresh())->status->toBe(UploadStatus::Pending)
+            ->next_poll_at->toBeNull()
+            ->and(Storage::disk('local')->allFiles())->toBe([]);
+        Http::assertNothingSent();
+    });
 
-        expect($delays[1])->toBeGreaterThanOrEqual(860)->toBeLessThanOrEqual(870)
-            ->and(Storage::disk('local')->allFiles())->toBe($files)
-            ->and($upload->fresh()->status)->toBe(UploadStatus::Pending);
-        Http::assertSentCount(1);
+    // Redis hands a stored int back as a numeric string, which an is_int() read took for no pause.
+    it('keeps a rate-limited row\'s reason while the pause lasts', function () {
+        Http::fake();
+        $upload = makePendingUpload();
+        $upload->update(['failure_reason' => FailureReason::RateLimited]);
+        coolDownGrant($this->token, 600);
+
+        $this->uploadService->processUpload($upload->fresh());
+
+        expect($upload->fresh())->status->toBe(UploadStatus::Pending)
+            ->failure_reason->toBe(FailureReason::RateLimited);
+        Http::assertNothingSent();
     });
 });
 
-describe('a freshly queued row whose own job waits on the quota pre-check', function () {
-    it('gets no second job from the scheduler', function () {
-        Queue::fake();
-        $upload = $this->uploadService->queueUpload($this->invoice);
-
-        // A month-start backlog: its job starts minutes later and meets an exhausted quota.
-        $this->travel(5)->minutes();
+describe('the global quota pre-check', function () {
+    it('makes a job wait at least a minute without asking ANAF or announcing a rate limit', function () {
+        $this->freezeSecond();
+        Event::fake([InvoiceRateLimited::class]);
+        Http::fake();
         $rateLimiter = Mockery::mock(RateLimiter::class);
         $rateLimiter->shouldReceive('isEnabled')->andReturn(true);
         $rateLimiter->shouldReceive('getRemainingQuota')->with('global')->andReturn(['remaining' => 0, 'resetsIn' => 40]);
-        $queueJob = Mockery::mock(Job::class);
-        $queueJob->shouldReceive('release')->once()->with(40);
-        (new ProcessSingleUpload($upload->fresh()))->setJob($queueJob)->handle($this->uploadService, $rateLimiter);
+        $this->instance(RateLimiter::class, $rateLimiter);
+        app()->forgetInstance(UploadService::class);
+        $upload = makePendingUpload();
 
-        app()->call([new ProcessPendingUploads, 'handle']);
+        app()->call([new ProcessSingleUpload($upload), 'handle']);
 
-        Queue::assertNothingPushed();
+        expect($upload->fresh())->status->toBe(UploadStatus::Pending)
+            ->failure_reason->toBe(FailureReason::RateLimited)
+            ->and($upload->fresh()->next_poll_at->gte(now()->addSeconds(60)))->toBeTrue()
+            ->and(Storage::disk('local')->allFiles())->toBe([]);
+        Event::assertNotDispatched(InvoiceRateLimited::class);
+        Http::assertNothingSent();
     });
 });
 
 describe('a model read before the row was reset for a retry', function () {
-    // Claimed in memory without syncing originals, the failure write skipped status and
-    // reason (equal to the stale ones), leaving a never-sent row in Uploading.
-    it('records the failure of its own run', function () {
+    // Claimed in memory without syncing originals, the next write skipped status (equal to
+    // the stale one), leaving a never-sent row in Uploading.
+    it('records the outcome of its own run', function () {
         $upload = makePendingUpload();
         $upload->update(['status' => UploadStatus::Failed, 'failure_reason' => FailureReason::Transient, 'errors' => ['earlier']]);
         $stale = EfacturaUpload::find($upload->id);
@@ -773,8 +1003,9 @@ describe('a model read before the row was reset for a retry', function () {
 
         $this->uploadService->processUpload($stale);
 
-        expect($upload->fresh()->status)->toBe(UploadStatus::Failed)
-            ->and($upload->fresh()->failure_reason)->toBe(FailureReason::Transient);
+        expect($upload->fresh())->status->toBe(UploadStatus::Pending)
+            ->xml_path->toBeNull()
+            ->errors->toBe([__('efactura::messages.local_failure', ['class' => 'RuntimeException'])]);
         Http::assertNothingSent();
     });
 });
@@ -800,54 +1031,38 @@ describe('a rate limit answered after the row was parked', function () {
     });
 });
 
-/**
- * The cooldown is stored as its expiry. Redis hands a stored int back as a numeric string,
- * which an is_int() read took for no cooldown at all: every job asked ANAF again.
- */
-describe('a refresh cooldown read back as a numeric string', function () {
-    beforeEach(function () {
-        Http::fake();
-        $this->delays = [];
-        $this->runJob = function (EfacturaUpload $upload): void {
-            $queueJob = Mockery::mock(Job::class);
-            $queueJob->shouldReceive('uuid')->andReturn('job-uuid-numeric-cooldown');
-            $queueJob->shouldReceive('release')->andReturnUsing(function (int $delay) {
-                $this->delays[] = $delay;
-            });
-            app()->call([(new ProcessSingleUpload($upload->fresh()))->setJob($queueJob), 'handle']);
-        };
-    });
-
-    it('is seen, and the job sleeps it out without asking ANAF', function () {
+// A transport failure answered after the row was parked: this worker no longer owns it.
+describe('a send that failed after the row was parked', function () {
+    it('leaves the park in place and announces nothing', function () {
+        Event::fake([InvoiceFailed::class, InvoiceRateLimited::class]);
         $upload = makePendingUpload();
-        coolDownGrant($this->token, 600);
+        Http::fake([UPLOAD_URL => function ($request) use ($upload) {
+            EfacturaUpload::whereKey($upload->id)->update([
+                'status' => UploadStatus::Failed,
+                'failure_reason' => FailureReason::Indeterminate,
+            ]);
 
-        expect(app(TokenService::class)->refreshCooldownSeconds($this->token))->toBeGreaterThan(590);
+            return Create::rejectionFor(new ConnectException(
+                'cURL error 7: Failed to connect to api.anaf.ro port 443',
+                new Psr7Request($request->method(), $request->url()),
+                null,
+                ['errno' => 7, 'error' => 'Failed to connect to api.anaf.ro port 443'],
+            ));
+        }]);
 
-        ($this->runJob)($upload);
+        $this->uploadService->processUpload($upload);
 
-        expect($this->delays)->toHaveCount(1)
-            ->and($this->delays[0])->toBeGreaterThan(590)->toBeLessThanOrEqual(600)
-            ->and($upload->fresh()->status)->toBe(UploadStatus::Pending);
-        Http::assertNothingSent();
-    });
-
-    it('releases a rate-limited row for the rest of the cooldown, not the usual minute', function () {
-        $upload = makePendingUpload();
-        $upload->update(['failure_reason' => FailureReason::RateLimited]);
-        coolDownGrant($this->token, 600);
-
-        ($this->runJob)($upload);
-
-        expect($this->delays)->toHaveCount(1)
-            ->and($this->delays[0])->toBeGreaterThan(590)->toBeLessThanOrEqual(600)
-            ->and($upload->fresh()->failure_reason)->toBe(FailureReason::RateLimited);
-        Http::assertNothingSent();
+        expect($upload->fresh())->status->toBe(UploadStatus::Failed)
+            ->failure_reason->toBe(FailureReason::Indeterminate)
+            ->status_failures->toBe(0);
+        Event::assertNothingDispatched();
     });
 });
 
 describe('an upload refused by the SDK\'s daily RASP limit', function () {
     it('waits until the limit lets it through, not a minute', function () {
+        Event::fake([InvoiceRateLimited::class]);
+        $this->freezeSecond();
         config(['efactura-sdk.rate_limits.enabled' => true, 'efactura-sdk.rate_limits.rasp_upload_per_day_cui' => 1]);
         app()->forgetInstance(RateLimiter::class);
         app(RateLimiter::class)->checkRaspUpload('12345678');
@@ -855,17 +1070,16 @@ describe('an upload refused by the SDK\'s daily RASP limit', function () {
         $upload = makePendingUpload();
         $upload->update(['standard' => 'RASP']);
 
-        $delays = [];
-        $queueJob = Mockery::mock(Job::class);
-        $queueJob->shouldReceive('uuid')->andReturn('job-uuid-rasp');
-        $queueJob->shouldReceive('release')->andReturnUsing(function (int $delay) use (&$delays) {
-            $delays[] = $delay;
-        });
-        app()->call([(new ProcessSingleUpload($upload->fresh()))->setJob($queueJob), 'handle']);
+        $this->uploadService->processUpload($upload->fresh());
 
-        expect($upload->fresh()->failure_reason)->toBe(FailureReason::RateLimited)
-            ->and($delays)->toHaveCount(1)
-            ->and($delays[0])->toBeGreaterThan(3600);
+        $wait = null;
+        Event::assertDispatched(InvoiceRateLimited::class, function (InvoiceRateLimited $e) use ($upload, &$wait) {
+            $wait = $e->retryAfterSeconds;
+
+            return $e->retryAfterSeconds > 3600 && $e->upload->is($upload);
+        });
+        expect($upload->fresh())->failure_reason->toBe(FailureReason::RateLimited)
+            ->and($upload->fresh()->next_poll_at->timestamp)->toBe(now()->addSeconds($wait)->timestamp);
         Http::assertNothingSent();
     });
 });
@@ -896,15 +1110,129 @@ describe('the dispatchers during a refresh cooldown', function () {
     it('leave a cooling grant\'s rows out of the scheduled dispatch', function () {
         app()->call([new ProcessPendingUploads, 'handle']);
 
+        Queue::assertPushed(ProcessPendingUploads::class, 1);
+        Queue::assertPushed(ProcessPendingUploads::class, fn (ProcessPendingUploads $job) => $job->cui === '87654321');
+
+        app()->call([new ProcessPendingUploads('12345678'), 'handle']);
+        app()->call([new ProcessPendingUploads('87654321'), 'handle']);
+
         Queue::assertPushed(ProcessSingleUpload::class, 1);
         Queue::assertPushed(ProcessSingleUpload::class, fn (ProcessSingleUpload $job) => $job->upload->is($this->other));
     });
+});
 
-    it('leave a cooling grant\'s rows out of dispatchPendingUploads()', function () {
-        expect($this->uploadService->dispatchPendingUploads())->toBe(1);
+/**
+ * The row is reserved with a lease before its job is queued, so a second dispatch (another
+ * scheduler tick, a second server) queues no second job, and only the leased job may claim it.
+ */
+describe('dispatching pending uploads', function () {
+    it('queues one job per row, leased with the row\'s next try', function () {
+        Queue::fake();
+        $upload = makePendingUpload();
+
+        expect($this->uploadService->dispatchPendingUploads($this->token))->toBe(1)
+            ->and($this->uploadService->dispatchPendingUploads($this->token))->toBe(0);
 
         Queue::assertPushed(ProcessSingleUpload::class, 1);
-        Queue::assertPushed(ProcessSingleUpload::class, fn (ProcessSingleUpload $job) => $job->upload->is($this->other));
+        $job = Queue::pushed(ProcessSingleUpload::class)->first();
+        expect($job->upload->is($upload))->toBeTrue()
+            ->and($upload->fresh()->next_poll_at->toDateTimeString())->toBe($job->lease);
+    });
+
+    // efactura:upload --sync (no lease) sent the row between the dispatcher's read and its lease.
+    it('leases and queues nothing for a row another run claimed after it was read', function () {
+        Queue::fake();
+        $upload = makePendingUpload();
+        $raced = false;
+        EfacturaUpload::retrieved(function (EfacturaUpload $read) use (&$raced) {
+            if ($raced) {
+                return;
+            }
+
+            $raced = true;
+            DB::table('efactura_uploads')->where('id', $read->id)
+                ->update(['status' => UploadStatus::Processing->value, 'upload_index' => '5001']);
+        });
+
+        expect($this->uploadService->dispatchPendingUploads($this->token))->toBe(0)
+            ->and($raced)->toBeTrue()
+            ->and($upload->fresh()->next_poll_at)->toBeNull();
+        Queue::assertNothingPushed();
+    });
+
+    it('lets a job with a stale lease send nothing', function () {
+        Queue::fake();
+        Http::fake();
+        $upload = makePendingUpload();
+        $this->uploadService->dispatchPendingUploads($this->token);
+        $this->travel(6)->minutes(); // past the first lease
+        $this->uploadService->dispatchPendingUploads($this->token);
+        [$stale, $current] = Queue::pushed(ProcessSingleUpload::class)->all();
+
+        app()->call([$stale, 'handle']);
+
+        expect($stale->lease)->not->toBe($current->lease)
+            ->and($upload->fresh()->status)->toBe(UploadStatus::Pending);
+        Http::assertNothingSent();
+    });
+});
+
+describe('the upload job', function () {
+    // The claim UPDATE throws: the stored XML is removed and failed() counts one attempt.
+    it('counts a failure before anything was sent once, and keeps no file', function () {
+        $this->freezeSecond();
+        Event::fake([InvoiceFailed::class]);
+        Queue::fake();
+        Http::fake();
+        $upload = makePendingUpload();
+        $this->uploadService->dispatchPendingUploads($this->token);
+        $job = Queue::pushed(ProcessSingleUpload::class)->first();
+        $thrown = null;
+        DB::connection()->beforeExecuting(function (string $query, array $bindings) use (&$thrown) {
+            if ($thrown === null && str_starts_with(strtolower($query), 'update') && str_contains($query, 'xml_path') && in_array('uploading', $bindings, true)) {
+                throw $thrown = new QueryException('testing', $query, $bindings, new PDOException('SQLSTATE[40P01]: deadlock detected'));
+            }
+        });
+
+        expect(fn () => app()->call([$job, 'handle']))->toThrow(QueryException::class);
+        $job->failed($thrown);
+
+        expect($upload->fresh())->status->toBe(UploadStatus::Pending)
+            ->failure_reason->toBe(FailureReason::Transient)
+            ->status_failures->toBe(1)
+            ->and($upload->fresh()->next_poll_at->timestamp)->toBe(now()->addSeconds(UploadService::TRANSIENT_RETRY_DELAY)->timestamp)
+            ->and(Storage::disk('local')->allFiles())->toBe([]);
+        Event::assertNotDispatched(InvoiceFailed::class);
+        Http::assertNothingSent();
+    });
+
+    // The queue redelivered a copy of a job that already ran; the row belongs to that run.
+    it('leaves the row alone when the queue gives up on a redelivered copy', function () {
+        Event::fake([InvoiceFailed::class]);
+        $upload = makePendingUpload();
+        $upload->update(['status' => UploadStatus::Uploading]);
+
+        (new ProcessSingleUpload($upload))->failed(new MaxAttemptsExceededException('attempted too many times'));
+
+        expect($upload->fresh()->status)->toBe(UploadStatus::Uploading);
+        Event::assertNotDispatched(InvoiceFailed::class);
+    });
+
+    it('leaves a waiting row as it is while uploads are switched off', function () {
+        Queue::fake();
+        Http::fake();
+        $upload = makePendingUpload();
+        $this->uploadService->dispatchPendingUploads($this->token);
+        $job = Queue::pushed(ProcessSingleUpload::class)->first();
+        $upload->update(['failure_reason' => FailureReason::RateLimited]);
+        $before = $upload->fresh()->next_poll_at;
+        config(['efactura.features.upload_invoices' => false]);
+
+        app()->call([$job, 'handle']);
+
+        expect($upload->fresh())->failure_reason->toBe(FailureReason::RateLimited)
+            ->and($upload->fresh()->next_poll_at->equalTo($before))->toBeTrue();
+        Http::assertNothingSent();
     });
 });
 
@@ -931,7 +1259,9 @@ describe('a cooldown that starts after the row was claimed', function () {
         expect($refused)->toBeTrue()
             ->and($upload->status)->toBe(UploadStatus::Pending)
             ->and($upload->failure_reason)->toBeNull()
-            ->and($upload->errors[0])->toContain('ANAF refused to refresh the token')
+            ->and($upload->status_failures)->toBe(0)
+            ->and($upload->next_poll_at)->toBeNull()
+            ->and($upload->errors[0])->toContain('is paused for')
             // Nothing was sent: no file is kept for this attempt.
             ->and($upload->xml_path)->toBeNull()
             ->and(Storage::disk('local')->allFiles())->toBe([]);
@@ -949,8 +1279,8 @@ describe('the XML file of an attempt that was not sent', function () {
         $upload = makePendingUpload();
 
         foreach (range(1, 3) as $attempt) {
-            $this->travel(1)->seconds(); // a new file name each attempt
             $this->uploadService->processUpload($upload->fresh());
+            $this->travel(61)->seconds(); // past the rate limit's next try
         }
 
         expect($upload->fresh()->failure_reason)->toBe(FailureReason::RateLimited)
@@ -959,26 +1289,24 @@ describe('the XML file of an attempt that was not sent', function () {
         Http::assertSentCount(3);
     });
 
-    it('is deleted when the attempt fails transiently before anything is sent', function () {
+    it('is deleted when the attempt fails before anything is sent', function () {
         $upload = makePendingUpload();
         $this->token->update(['is_active' => false]);
 
         $this->uploadService->processUpload($upload);
 
-        expect($upload->fresh()->failure_reason)->toBe(FailureReason::Transient)
+        expect($upload->fresh()->failure_reason)->toBeNull()
             ->and($upload->fresh()->xml_path)->toBeNull()
             ->and(Storage::disk('local')->allFiles())->toBe([]);
     });
 
-    it('is deleted when another worker wins the claim, unless the row names it', function (bool $sameName) {
-        $this->freezeSecond();
+    it('is deleted when another worker wins the claim', function () {
         $upload = makePendingUpload();
-        $path = 'efactura-test/uploads/12345678/'.$upload->id.'_'.now()->format('Ymd_His').'.xml';
 
-        makeUblSpy(function () use ($upload, $path, $sameName) {
+        makeUblSpy(function () use ($upload) {
             EfacturaUpload::where('id', $upload->id)->update([
                 'status' => UploadStatus::Uploading,
-                'xml_path' => $sameName ? $path : 'efactura-test/uploads/12345678/other.xml',
+                'xml_path' => 'efactura-test/uploads/12345678/other.xml',
             ]);
         });
         Http::fake([UPLOAD_URL => Http::response('ok', 200)]);
@@ -986,8 +1314,64 @@ describe('the XML file of an attempt that was not sent', function () {
         $this->uploadService->processUpload($upload);
 
         Http::assertNothingSent();
-        expect(Storage::disk('local')->exists($path))->toBe($sameName);
-    })->with(['another name' => false, 'the same name' => true]);
+        expect(Storage::disk('local')->allFiles())->toBe([]);
+    });
+
+    it('is deleted when the claim throws before it ran, and kept when it ran', function (bool $ran) {
+        Http::fake();
+        $upload = makePendingUpload();
+        $isClaim = fn (string $query): bool => str_starts_with(strtolower($query), 'update') && str_contains($query, 'xml_path');
+        $failed = false;
+        $fail = function () use (&$failed): void {
+            $failed = true;
+
+            throw new QueryException('testing', 'update efactura_uploads', [], new PDOException('SQLSTATE[40P01]: deadlock detected'));
+        };
+        $ran
+            ? DB::listen(fn (QueryExecuted $query) => !$failed && $isClaim($query->sql) && $fail())
+            : DB::connection()->beforeExecuting(fn (string $query) => !$failed && $isClaim($query) && $fail());
+
+        expect(fn () => $this->uploadService->processUpload($upload))->toThrow(QueryException::class);
+
+        Http::assertNothingSent();
+        if ($ran) {
+            expect(Storage::disk('local')->allFiles())->toBe([$upload->fresh()->xml_path]);
+        } else {
+            expect(Storage::disk('local')->allFiles())->toBe([])
+                ->and($upload->fresh()->status)->toBe(UploadStatus::Pending);
+        }
+    })->with(['before the claim ran' => false, 'after the claim ran' => true]);
+
+    // A second run of the row in the same second used to store under the same name.
+    it('keeps the file of the run that was sent when another run of the row stores in the same second', function () {
+        $this->freezeSecond();
+        Http::fake([UPLOAD_URL => Http::response('<?xml version="1.0"?><header xmlns="mfp:anaf:dgti:spv:respUploadFisier:v1" ExecutionStatus="0" index_incarcare="5001130258"/>')]);
+        $upload = makePendingUpload();
+        UblBuilder::swap(new class($upload)
+        {
+            private int $calls = 0;
+
+            public function __construct(private EfacturaUpload $upload) {}
+
+            public function generateInvoiceXml($data): string
+            {
+                // Run A is preparing when run B takes the row and sends it.
+                if (++$this->calls === 1) {
+                    app(UploadService::class)->processUpload(EfacturaUpload::find($this->upload->id));
+
+                    return '<Invoice>A</Invoice>';
+                }
+
+                return '<Invoice>B</Invoice>';
+            }
+        });
+
+        $this->uploadService->processUpload($upload);
+
+        Http::assertSentCount(1);
+        expect(Storage::disk('local')->allFiles())->toBe([$upload->fresh()->xml_path])
+            ->and(Storage::disk('local')->get($upload->fresh()->xml_path))->toBe('<Invoice>B</Invoice>');
+    });
 
     it('is kept for an attempt that was sent', function () {
         Http::fake([UPLOAD_URL => Http::response(

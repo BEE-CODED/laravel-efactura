@@ -32,14 +32,16 @@ namespace BeeCoded\EFactura\Enums;
 enum FailureReason: string
 {
     /**
-     * ANAF's quota was exhausted (client-side pre-flight, or a real HTTP 429).
-     * The document was rejected before filing — safe to re-submit.
+     * ANAF's quota was exhausted (client-side pre-flight, or a real HTTP 429), before
+     * anything was filed. Only on a Pending row, waiting for its next_poll_at; it is never
+     * given up for waiting.
      */
     case RateLimited = 'rate_limited';
 
     /**
-     * A transient error that provably happened before ANAF accepted the document:
-     * an authentication/token failure, or a pre-flight error. Safe to re-submit.
+     * An error that provably happened before the document was sent: a database or
+     * storage error while preparing it, or a transport failure the SDK proves never left.
+     * Only on a Pending row, waiting for its next_poll_at; status_failures counts these.
      */
     case Transient = 'transient';
 
@@ -66,26 +68,17 @@ enum FailureReason: string
     case Configuration = 'configuration';
 
     /**
-     * A retryable failure was re-driven until the pipeline ran out of attempts, or ran
-     * past its retry window, and gave up.
+     * The upload failed UploadService::MAX_TRANSIENT_ATTEMPTS times before it was sent.
      *
-     * The underlying failure was pre-transmission — `rate_limited` and `transient` both
-     * prove the document never entered ANAF's filing pipeline — so nothing is at risk and
-     * no reconciliation is needed. But it must NOT be re-driven automatically.
-     *
-     * That distinction is the whole reason this case exists. Giving up while leaving the
-     * row `transient` left it matching RetryRateLimitedUploads' selection
-     * (Failed + rate_limited|transient), so the scheduled job reset it to Pending with a
-     * fresh attempts counter and a fresh retry window — the cap reset itself every ten
-     * minutes, and InvoiceFailed fired every ten minutes for an upload that was
-     * immediately retried.
-     *
-     * Re-queueing an abandoned upload is a deliberate act: queueUpload() recycles the row.
+     * Nothing was sent, so nothing is at risk and no reconciliation is needed. But it is
+     * final: Failed is never re-driven automatically. Re-queueing an abandoned upload is a
+     * deliberate act: queueUpload() recycles the row.
      */
     case Abandoned = 'abandoned';
 
     /**
-     * Whether an upload with this reason may be automatically re-submitted to ANAF.
+     * Whether an upload with this reason is tried again automatically: it waits in
+     * Pending, never Failed.
      *
      * Only reasons that PROVE the document never entered ANAF's pipeline qualify — and,
      * for `abandoned`, only where the pipeline has not already decided to stop.
@@ -105,18 +98,5 @@ enum FailureReason: string
     public function needsReconciliation(): bool
     {
         return $this === self::Indeterminate;
-    }
-
-    /**
-     * Every reason that may be automatically re-submitted. Handy for query scopes.
-     *
-     * @return array<int, self>
-     */
-    public static function retryable(): array
-    {
-        return array_values(array_filter(
-            self::cases(),
-            fn (self $reason) => $reason->isRetryable(),
-        ));
     }
 }

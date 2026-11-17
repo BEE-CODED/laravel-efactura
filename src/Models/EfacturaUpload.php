@@ -144,23 +144,14 @@ class EfacturaUpload extends Model
     }
 
     /**
-     * Pending uploads no job is on: no failure_reason (a rate-limited row's job still owns
-     * it), and untouched for longer than a transient release plus a minute. A job's
-     * resetForRetry() clears the reason while the job waits out that release, a job
-     * released by the quota pre-check touches the row, and a freshly queued row may have
-     * its own job queued; a second job would double the transient cap. A new row is
-     * therefore taken only after the same window.
-     *
-     * shortcut: a released job a busy queue starts more than a minute late can meet a second
-     * one; both are safe (the claim is atomic). Raise the margin if queues lag longer.
+     * Pending uploads whose next try is due (next_poll_at null or past). A dispatch leases the
+     * row by writing next_poll_at, and a retry writes when it is due again, so a row a job is
+     * on, or one waiting out a rate limit, is not taken twice.
      */
     public function scopeAwaitingDispatch(Builder $query): Builder
     {
-        $releasedBefore = now()->subSeconds((int) config('efactura.jobs.transient_retry_delay_seconds', 30) + 60);
-
         return $query->where('status', UploadStatus::Pending)
-            ->whereNull('failure_reason')
-            ->where('updated_at', '<', $releasedBefore);
+            ->where(fn (Builder $due) => $due->whereNull('next_poll_at')->orWhere('next_poll_at', '<=', now()));
     }
 
     public function scopeProcessing(Builder $query): Builder
@@ -179,20 +170,18 @@ class EfacturaUpload extends Model
     }
 
     /**
-     * Attempts to fetch a response from ANAF before a poisoned row is set aside.
-     *
-     * A 2xx-but-not-a-ZIP body may be a transient ANAF glitch, so the download is
-     * retried a few times; past this it is left for `efactura:reconcile` rather
-     * than re-hit on every scheduled run.
+     * Completed or Failed uploads with a download id and no stored response whose next
+     * download try is due. Once the upload is Completed or Failed, next_poll_at holds that
+     * try: each one backs off from an hour to a day. Only within the 60 days ANAF keeps the
+     * archive.
      */
-    public const MAX_RESPONSE_ATTEMPTS = 3;
-
     public function scopeNeedsResponseDownload(Builder $query): Builder
     {
         return $query->whereIn('status', [UploadStatus::Completed, UploadStatus::Failed])
             ->whereNotNull('download_id')
             ->whereNull('response_path')
-            ->where('response_attempts', '<', self::MAX_RESPONSE_ATTEMPTS);
+            ->where(fn (Builder $due) => $due->whereNull('next_poll_at')->orWhere('next_poll_at', '<=', now()))
+            ->where('processed_at', '>=', now()->subDays(60));
     }
 
     public function scopeForToken(Builder $query, EfacturaToken $token): Builder

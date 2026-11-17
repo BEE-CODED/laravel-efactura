@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Carbon\CarbonInterface;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -221,5 +222,112 @@ describe('v4 per-token message key', function () {
 
         expect(Schema::hasIndex('efactura_messages', ['efactura_token_id', 'message_id'], 'unique'))->toBeTrue()
             ->and(Schema::hasIndex('efactura_messages', ['message_id'], 'unique'))->toBeFalse();
+    });
+});
+
+describe('v4 failure counters', function () {
+    it('drops next_download_at on rollback and adds it once on a re-run', function () {
+        $migration = loadMigrationMatching('add_failure_counters');
+
+        $migration->down();
+        expect(Schema::hasColumn('efactura_messages', 'next_download_at'))->toBeFalse();
+
+        $migration->up();
+        $migration->up();
+        expect(Schema::hasColumn('efactura_messages', 'next_download_at'))->toBeTrue();
+    });
+
+    /**
+     * 4.0 never leaves a rate-limited or transient upload Failed: it waits in Pending. A 3.x
+     * row in that state was provably not sent; a recent one is retried, an older one is not
+     * filed weeks late.
+     */
+    it('returns recent unsent 3.x failures to Pending and abandons older ones', function () {
+        $tokenId = DB::table('efactura_tokens')->insertGetId([
+            'cui' => '12345678',
+            'access_token' => 'irrelevant',
+            'refresh_token' => 'irrelevant',
+            'expires_at' => now()->addHour(),
+            'is_active' => true,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+        $row = fn (int $id, string $status, string $reason, ?CarbonInterface $processedAt) => [
+            'efactura_token_id' => $tokenId,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => $id,
+            'status' => $status,
+            'failure_reason' => $reason,
+            'processed_at' => $processedAt,
+            'status_failures' => 3,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ];
+        DB::table('efactura_uploads')->insert([
+            $row(1, 'failed', 'rate_limited', now()->subDay()),
+            $row(2, 'failed', 'transient', now()->subDays(6)),
+            $row(3, 'failed', 'rate_limited', now()->subDays(8)),
+            $row(4, 'failed', 'transient', null),
+            $row(5, 'failed', 'validation', now()),
+            $row(6, 'pending', 'rate_limited', null),
+        ]);
+
+        $migration = loadMigrationMatching('add_failure_counters');
+        $migration->up();
+        $migration->up();
+
+        expect(DB::table('efactura_uploads')->orderBy('uploadable_id')->get(['status', 'failure_reason', 'status_failures'])->map(fn ($r) => [$r->status, $r->failure_reason, (int) $r->status_failures])->all())
+            ->toBe([
+                ['pending', 'rate_limited', 0],
+                ['pending', 'transient', 0],
+                ['failed', 'abandoned', 3],
+                ['failed', 'abandoned', 3],
+                ['failed', 'validation', 3],
+                ['pending', 'rate_limited', 3],
+            ])
+            ->and(DB::table('efactura_uploads')->whereIn('uploadable_id', [1, 2])->whereNotNull('processed_at')->count())->toBe(0);
+    });
+});
+
+describe('v4 redundant upload indexes', function () {
+    it('drops the plain indexes the unique and (status, next_poll_at) indexes cover, also on a re-run, and restores them on rollback', function () {
+        $plain = fn (array $columns) => collect(Schema::getIndexes('efactura_uploads'))
+            ->contains(fn (array $index) => $index['columns'] === $columns && !$index['unique'] && !$index['primary']);
+        $migration = loadMigrationMatching('add_response_verification_and_next_poll');
+
+        expect($plain(['uploadable_type', 'uploadable_id']))->toBeFalse()
+            ->and($plain(['status']))->toBeFalse()
+            ->and(Schema::hasIndex('efactura_uploads', 'efactura_uploads_uploadable_unique'))->toBeTrue()
+            ->and(Schema::hasIndex('efactura_uploads', ['status', 'next_poll_at']))->toBeTrue();
+
+        // An interrupt before the drop committed.
+        Schema::table('efactura_uploads', fn (Blueprint $table) => $table->index('status'));
+        $migration->up();
+        expect($plain(['status']))->toBeFalse();
+
+        $migration->down();
+        expect($plain(['status']))->toBeTrue()
+            ->and($plain(['uploadable_type', 'uploadable_id']))->toBeTrue();
+
+        $migration->up();
+    });
+
+    // 000006's abort message sends operators to run the later migrations with --path while
+    // duplicates remain: the morph columns must not be left without any index then.
+    it('keeps the plain (uploadable_type, uploadable_id) index while the 000006 unique index is missing', function () {
+        $plain = fn (array $columns) => collect(Schema::getIndexes('efactura_uploads'))
+            ->contains(fn (array $index) => $index['columns'] === $columns && !$index['unique'] && !$index['primary']);
+        $migration = loadMigrationMatching('add_response_verification_and_next_poll');
+        $migration->down();
+        loadMigrationMatching('add_unique_uploadable_index')->down();
+        expect(Schema::hasIndex('efactura_uploads', ['uploadable_type', 'uploadable_id'], 'unique'))->toBeFalse();
+
+        $migration->up();
+
+        expect($plain(['uploadable_type', 'uploadable_id']))->toBeTrue()
+            ->and($plain(['status']))->toBeFalse();
+
+        // The teardown rollback runs 000006's down().
+        loadMigrationMatching('add_unique_uploadable_index')->up();
     });
 });

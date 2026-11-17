@@ -212,6 +212,49 @@ describe('the efactura:reconcile command', function () {
             ->and($upload->fresh()->failure_reason)->toBe(FailureReason::Indeterminate);
     });
 
+    /**
+     * PostgreSQL refuses a non-numeric bigint and MySQL cuts it to its leading digits, and a
+     * bare or '0' option used to fall through to the listing with exit 0.
+     */
+    it('says an option that names no upload is not found, leaving the upload parked', function (Closure $options) {
+        $upload = makeIndeterminateUpload();
+
+        $this->artisan('efactura:reconcile', $options($upload))
+            ->expectsOutputToContain('not found')
+            ->assertExitCode(1);
+
+        expect($upload->fresh()->status)->toBe(UploadStatus::Failed)
+            ->and($upload->fresh()->failure_reason)->toBe(FailureReason::Indeterminate);
+    })->with([
+        'a decimal --not-filed' => fn (EfacturaUpload $upload) => ['--not-filed' => "{$upload->id}.0"],
+        'a bare --not-filed' => fn () => ['--not-filed' => null],
+        'a zero --filed' => fn () => ['--filed' => '0', '--index' => '1'],
+    ]);
+
+    it('leaves an upload parked with another ANAF index than the one given without a confirmation', function () {
+        $upload = makeIndeterminateUpload();
+        $upload->update(['upload_index' => '5001130255']);
+
+        $this->artisan('efactura:reconcile', ['--filed' => (string) $upload->id, '--index' => '5001130299', '--no-interaction' => true])
+            ->expectsOutputToContain("Upload {$upload->id} was left as it is.")
+            ->assertExitCode(1);
+
+        expect($upload->fresh()->upload_index)->toBe('5001130255')
+            ->and($upload->fresh()->failure_reason)->toBe(FailureReason::Indeterminate);
+    });
+
+    it('resolves an upload as filed under another index once the operator confirms it', function () {
+        $upload = makeIndeterminateUpload();
+        $upload->update(['upload_index' => '5001130255']);
+
+        $this->artisan('efactura:reconcile', ['--filed' => (string) $upload->id, '--index' => '5001130299'])
+            ->expectsConfirmation("Upload {$upload->id} has ANAF upload index 5001130255, not 5001130299. Did you find this invoice in SPV under 5001130299?", 'yes')
+            ->assertExitCode(0);
+
+        expect($upload->fresh()->upload_index)->toBe('5001130299')
+            ->and($upload->fresh()->status)->toBe(UploadStatus::Processing);
+    });
+
     it('fails loudly when the upload is not awaiting reconciliation', function () {
         $upload = makeIndeterminateUpload();
         $upload->update(['failure_reason' => FailureReason::Validation]);

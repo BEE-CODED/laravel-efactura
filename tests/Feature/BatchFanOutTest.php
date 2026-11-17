@@ -15,6 +15,7 @@ use BeeCoded\EFactura\Events\InvoiceFailed;
 use BeeCoded\EFactura\Jobs\CheckUploadStatuses;
 use BeeCoded\EFactura\Jobs\DownloadReceivedInvoices;
 use BeeCoded\EFactura\Jobs\DownloadResponses;
+use BeeCoded\EFactura\Jobs\ProcessPendingUploads;
 use BeeCoded\EFactura\Jobs\SyncMessages;
 use BeeCoded\EFactura\Models\EfacturaMessage;
 use BeeCoded\EFactura\Models\EfacturaToken;
@@ -22,15 +23,17 @@ use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFactura\Services\DownloadService;
 use BeeCoded\EFactura\Services\MessageSyncService;
 use BeeCoded\EFactura\Services\UploadService;
+use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
 
 /**
  * A null-CUI batch job used to work through every tenant inside one 120 s job: one slow
- * CUI used up the budget of all the others. It now dispatches one job per CUI with due
- * work, and a per-CUI job never runs twice at once.
+ * CUI used up the budget of all the others. It now dispatches one job per usable company
+ * with due work, and a per-company job is queued once and never runs twice at once.
  */
 function fanOutToken(string $cui, bool $active = true): EfacturaToken
 {
@@ -60,116 +63,133 @@ function giveDueWork(string $job, EfacturaToken $token, int $id): void
         return;
     }
 
+    if ($job === ProcessPendingUploads::class) {
+        EfacturaUpload::create([
+            'efactura_token_id' => $token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => $id,
+            'status' => UploadStatus::Pending,
+        ]);
+
+        return;
+    }
+
+    if ($job === SyncMessages::class) {
+        return;
+    }
+
     EfacturaUpload::create([
         'efactura_token_id' => $token->id,
         'uploadable_type' => 'App\\Models\\Invoice',
         'uploadable_id' => $id,
         ...($job === CheckUploadStatuses::class
             ? ['status' => UploadStatus::Processing, 'upload_index' => (string) (5001130000 + $id)]
-            : ['status' => UploadStatus::Completed, 'upload_index' => (string) (5001130000 + $id), 'download_id' => (string) (3001130000 + $id)]),
+            : ['status' => UploadStatus::Completed, 'upload_index' => (string) (5001130000 + $id), 'download_id' => (string) (3001130000 + $id), 'processed_at' => now()]),
     ]);
 }
 
 dataset('batch jobs', [
-    'status checks' => [CheckUploadStatuses::class, 'checkAllStatuses'],
-    'response downloads' => [DownloadResponses::class, 'downloadAllResponses'],
-    'received invoices' => [DownloadReceivedInvoices::class, 'downloadAllReceivedInvoices'],
+    'status checks' => [CheckUploadStatuses::class, DownloadService::class, 'checkAllStatuses', true],
+    'response downloads' => [DownloadResponses::class, DownloadService::class, 'downloadAllResponses', true],
+    'received invoices' => [DownloadReceivedInvoices::class, DownloadService::class, 'downloadAllReceivedInvoices', true],
+    'message sync' => [SyncMessages::class, MessageSyncService::class, 'syncMessages', 0],
+    'pending uploads' => [ProcessPendingUploads::class, UploadService::class, 'dispatchPendingUploads', 0],
 ]);
 
 describe('a null-CUI batch job', function () {
-    it('dispatches one job per active CUI with due work and does none itself', function (string $job, string $method) {
-        Queue::fake();
-        $this->mock(DownloadService::class)->shouldNotReceive($method);
-
-        giveDueWork($job, fanOutToken('12345678'), 1);
-        giveDueWork($job, fanOutToken('12345678'.'9'), 2);
-        giveDueWork($job, fanOutToken('87654321', active: false), 3);
-        fanOutToken('11111111'); // nothing due
-
-        app()->call([new $job, 'handle']);
-
-        expect(Queue::pushed($job)->pluck('cui')->sort()->values()->all())->toBe(['12345678', '123456789']);
-    })->with('batch jobs');
-
-    it('SyncMessages dispatches one job per active CUI', function () {
-        Queue::fake();
-        $this->mock(MessageSyncService::class)->shouldNotReceive('syncMessages', 'syncAllMessages');
-
-        fanOutToken('12345678');
-        fanOutToken('87654321');
-        fanOutToken('11111111', active: false);
-
-        app()->call([new SyncMessages, 'handle']);
-
-        expect(Queue::pushed(SyncMessages::class)->pluck('cui')->sort()->values()->all())->toBe(['12345678', '87654321']);
-    });
-
-    it('SyncMessages is unique per CUI', function () {
-        Queue::fake();
-        fanOutToken('12345678');
-
-        SyncMessages::dispatch('12345678');
-        SyncMessages::dispatch('12345678');
-        Queue::assertPushed(SyncMessages::class, 1);
-    });
-
     /**
-     * A child queues behind its siblings. It used to inherit the parent's dispatch time, so
-     * every child starting over max_staleness_seconds later dropped itself, on every run.
+     * Inactive, paused and legacy (non-canonical CUI) tokens are left out, and so is a
+     * company with nothing due, except for SyncMessages, which always has work.
      */
-    it('runs a child that waited behind its siblings past the stale limit', function (string $job, string $service, string $method) {
-        config(['efactura.jobs.max_staleness_seconds' => 120]);
+    it('dispatches one job per usable company with due work, under its canonical CUI, and does none itself', function (string $job, string $service, string $method) {
         Queue::fake();
-        $token = fanOutToken('12345678');
-        if ($job !== SyncMessages::class) {
-            giveDueWork($job, $token, 1);
+        $this->mock($service)->shouldNotReceive($method);
+
+        $a = fanOutToken('12345678');
+        $b = fanOutToken('87654321');
+        $c = fanOutToken('11111111', active: false);
+        $d = fanOutToken('22222222');
+        $e = fanOutToken('012345678');
+        refuseGrant($d);
+        foreach ([$a, $c, $d, $e] as $i => $token) {
+            giveDueWork($job, $token, $i + 1);
         }
 
         app()->call([new $job, 'handle']);
-        $child = Queue::pushed($job)->sole();
-        $this->travel(200)->seconds();
 
-        $this->mock($service)->shouldReceive($method)->once()->andReturn(0);
-        app()->call([$child, 'handle']);
-    })->with('stale-guarded fan-outs');
+        expect(Queue::pushed($job)->pluck('cui')->sort()->values()->all())
+            ->toBe($job === SyncMessages::class ? ['12345678', '87654321'] : ['12345678']);
+    })->with('batch jobs');
 
-    it('still drops a per-CUI job the scheduler dispatched that waited too long', function (string $job, string $service, string $method) {
-        config(['efactura.jobs.max_staleness_seconds' => 120]);
+    it('SyncMessages is unique per company', function () {
         Queue::fake();
         fanOutToken('12345678');
 
-        $job::dispatch('12345678');
-        $queued = Queue::pushed($job)->sole();
-        $this->travel(200)->seconds();
+        SyncMessages::dispatch('12345678');
+        SyncMessages::dispatch('RO12345678');
+        Queue::assertPushed(SyncMessages::class, 1);
+    });
 
-        $this->mock($service)->shouldNotReceive($method);
-        app()->call([$queued, 'handle']);
-    })->with('stale-guarded fan-outs');
+    it('DownloadReceivedInvoices is unique per company', function () {
+        Queue::fake();
+        fanOutToken('12345678');
+
+        DownloadReceivedInvoices::dispatch('12345678');
+        DownloadReceivedInvoices::dispatch('RO12345678');
+        Queue::assertPushed(DownloadReceivedInvoices::class, 1);
+    });
 });
 
-dataset('stale-guarded fan-outs', [
-    'status checks' => [CheckUploadStatuses::class, DownloadService::class, 'checkAllStatuses'],
-    'response downloads' => [DownloadResponses::class, DownloadService::class, 'downloadAllResponses'],
-    'message sync' => [SyncMessages::class, MessageSyncService::class, 'syncMessages'],
-]);
-
 describe('a per-CUI batch job', function () {
-    it('does not run while another run of it holds the CUI', function (string $job, string $method) {
+    it('does not run while another run of it holds the company, whatever the CUI spelling', function (string $job, string $service, string $method, bool|int $returns) {
+        fanOutToken('12345678');
         $called = 0;
-        $this->mock(DownloadService::class)->shouldReceive($method)->with('12345678')->andReturnUsing(function () use (&$called) {
-            $called++;
-        });
+        $this->mock($service)->shouldReceive($method)
+            ->with(Mockery::on(fn ($token) => $token instanceof EfacturaToken && $token->cui === '12345678'))
+            ->andReturnUsing(function () use (&$called, $returns) {
+                $called++;
+
+                return $returns;
+            });
 
         $lock = Cache::lock((new $job('12345678'))->middleware()[0]->getLockKey(new $job('12345678')), 150);
         expect($lock->get())->toBeTrue();
 
-        $job::dispatch('12345678');
+        $job::dispatch('ro12345678');
         expect($called)->toBe(0);
 
         $lock->release();
-        $job::dispatch('12345678');
+        $job::dispatch('RO 1234 5678');
         expect($called)->toBe(1);
     })->with('batch jobs');
+
+    it('keys one company on one id, whatever the CUI spelling', function (string $job) {
+        expect((new $job('RO12345678'))->uniqueId())->toBe('12345678')
+            ->and((new $job(' 12345678'))->uniqueId())->toBe('12345678');
+    })->with('batch jobs');
+
+    /**
+     * A blank or malformed CUI used to mean "every company", or reached the service as it was.
+     */
+    it('fails when it runs with a CUI that is not one, and touches nothing', function (string $job, string $service, string $method, bool|int $returns, string $cui) {
+        Http::fake();
+        Event::fake([JobFailed::class]);
+        $token = fanOutToken('12345678');
+        giveDueWork($job, $token, 1);
+        $pending = EfacturaUpload::create([
+            'efactura_token_id' => $token->id,
+            'uploadable_type' => 'App\\Models\\Invoice',
+            'uploadable_id' => 99,
+            'status' => UploadStatus::Pending,
+        ]);
+
+        Queue::connection('sync')->push(new $job($cui));
+
+        Event::assertDispatched(JobFailed::class, fn (JobFailed $event) => $event->exception instanceof InvalidArgumentException
+            && $event->exception->getMessage() === "Invalid CUI: '{$cui}'");
+        Http::assertNothingSent();
+        expect($pending->fresh()->next_poll_at)->toBeNull();
+    })->with('batch jobs')->with(['', ' ', 'RO', '0', '0123']);
 });
 
 /**

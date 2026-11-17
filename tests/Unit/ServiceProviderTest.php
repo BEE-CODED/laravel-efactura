@@ -1,12 +1,15 @@
 <?php
 
 use BeeCoded\EFactura\EfacturaManager;
+use BeeCoded\EFactura\EfacturaServiceProvider;
 use BeeCoded\EFactura\Services\DownloadService;
 use BeeCoded\EFactura\Services\MessageSyncService;
 use BeeCoded\EFactura\Services\RetryingAnafDetailsClient;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFacturaSdk\Contracts\AnafDetailsClientInterface;
+use Illuminate\Routing\RouteCollection;
+use Illuminate\Support\Facades\Route;
 
 describe('EfacturaServiceProvider', function () {
     describe('Service Registration', function () {
@@ -88,18 +91,16 @@ describe('EfacturaServiceProvider', function () {
     });
 
     describe('Route Registration', function () {
-        it('registers routes when enabled', function () {
-            config(['efactura.routes.enabled' => true]);
+        it('registers the OAuth routes only when enabled', function (bool $enabled) {
+            config(['efactura.routes.enabled' => $enabled]);
 
-            $routes = collect(app('router')->getRoutes()->getRoutes());
+            Route::setRoutes(new RouteCollection);
+            (fn () => $this->registerRoutes())->call(app()->getProvider(EfacturaServiceProvider::class));
+            Route::getRoutes()->refreshNameLookups();
 
-            $efacturaRoutes = $routes->filter(function ($route) {
-                return str_contains($route->uri(), 'efactura') ||
-                       str_contains($route->getName() ?? '', 'efactura');
-            });
-
-            expect($efacturaRoutes)->not->toBeEmpty();
-        });
+            expect(Route::has('efactura.auth'))->toBe($enabled)
+                ->and(Route::has('efactura.callback'))->toBe($enabled);
+        })->with(['enabled' => [true], 'disabled' => [false]]);
     });
 
     describe('Console Commands', function () {

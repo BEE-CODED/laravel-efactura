@@ -20,6 +20,10 @@ use Illuminate\Support\Facades\Schema;
  * efactura_uploads.next_poll_at: when the next status read is due (null = due now), so a
  * status run reads each upload on the SDK's PollSchedule instead of on every run.
  *
+ * Drops two indexes others cover: the plain (uploadable_type, uploadable_id) index from
+ * morphs(), covered by the 000006 unique index (only when that index exists), and the plain
+ * `status` index, covered by (status, next_poll_at).
+ *
  * RE-ENTRANT like 000007: DDL auto-commits on MySQL and is unwrapped on SQLite, so each
  * change is guarded on its own state.
  */
@@ -44,10 +48,29 @@ return new class extends Migration
                 $table->index(['status', 'next_poll_at']);
             });
         }
+
+        // The morphs() index goes only once a unique index covers it: run with --path before 000006
+        // (its abort message's route), it stays, and is left in place when 000006 runs later.
+        $drop = [['status']];
+        if (Schema::hasIndex('efactura_uploads', ['uploadable_type', 'uploadable_id'], 'unique')) {
+            $drop[] = ['uploadable_type', 'uploadable_id'];
+        }
+
+        foreach ($drop as $columns) {
+            if ($name = $this->plainIndex($columns)) {
+                Schema::table('efactura_uploads', fn (Blueprint $table) => $table->dropIndex($name));
+            }
+        }
     }
 
     public function down(): void
     {
+        foreach ([['uploadable_type', 'uploadable_id'], ['status']] as $columns) {
+            if (!$this->plainIndex($columns)) {
+                Schema::table('efactura_uploads', fn (Blueprint $table) => $table->index($columns));
+            }
+        }
+
         if (Schema::hasIndex('efactura_uploads', ['status', 'next_poll_at'])) {
             Schema::table('efactura_uploads', function (Blueprint $table) {
                 $table->dropIndex(['status', 'next_poll_at']);
@@ -61,5 +84,22 @@ return new class extends Migration
                 });
             }
         }
+    }
+
+    /**
+     * The name of the index on exactly these columns that is neither unique nor primary, so
+     * the 000006 unique index never matches, whatever the prefix or name.
+     *
+     * @param  list<string>  $columns
+     */
+    private function plainIndex(array $columns): ?string
+    {
+        foreach (Schema::getIndexes('efactura_uploads') as $index) {
+            if ($index['columns'] === $columns && !$index['unique'] && !$index['primary']) {
+                return $index['name'];
+            }
+        }
+
+        return null;
     }
 };

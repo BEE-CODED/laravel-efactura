@@ -24,8 +24,10 @@ use Throwable;
 /**
  * A cached, fail-closed "does this CUI exist and is it active today?" check.
  *
- * You pass the client explicitly, normally `new AnafDetailsClient(strict: true, ...)`:
- * not the container's AnafDetailsClientInterface, whose RetryingAnafDetailsClient sleeps.
+ * Type-hinting this class gets one built on `new AnafDetailsClient(strict: true, tries: 1,
+ * timeoutSeconds: 2)`, not the container's AnafDetailsClientInterface, whose
+ * RetryingAnafDetailsClient sleeps. A client you pass yourself must be strict too, because
+ * verdicts from every client share one cache key.
  * Found means ANAF answered with exactly one company whose CUI is the one asked; NotFound
  * means its notFound list is exactly that CUI. Anything else is Unavailable, a rate limit
  * is Busy, and neither is cached. Verdicts are cached in the default cache store as plain
@@ -47,7 +49,7 @@ final class CachedAnafLookup
      * Today's cached verdict, or null when there is none (or it is malformed, or the cache
      * fails). Never calls ANAF, so a host can apply its own throttle before resolve().
      *
-     * @throws InvalidArgumentException When the CUI is not 2-10 digits (an RO prefix is allowed)
+     * @throws InvalidArgumentException When the CUI is not 2-10 digits with a valid control digit (an RO prefix and spaces are allowed)
      */
     public function cachedRead(string $cui): ?AnafLookupResult
     {
@@ -77,7 +79,7 @@ final class CachedAnafLookup
      * Never throws for ANAF or cache failures: an ANAF failure is Unavailable (or Busy); a
      * cache that cannot be read or written only means ANAF is asked (again).
      *
-     * @throws InvalidArgumentException When the CUI is not 2-10 digits (an RO prefix is allowed)
+     * @throws InvalidArgumentException When the CUI is not 2-10 digits with a valid control digit (an RO prefix and spaces are allowed)
      */
     public function resolve(string $cui): AnafLookupResult
     {
@@ -139,14 +141,15 @@ final class CachedAnafLookup
         return 'efactura:anaf-lookup:'.hash('sha256', self::POLICY_VERSION.'|'.$this->client::getBaseUrl()).':'.$date.':'.$cui;
     }
 
+    // CUI only: no CNP enters a plain cache key.
     private static function normalize(string $cui): string
     {
-        $cui = VatNumberValidator::stripPrefix($cui);
+        $canonical = VatNumberValidator::canonical($cui);
 
-        if (preg_match('/\A[1-9][0-9]{1,9}\z/', $cui) !== 1) {
-            throw new InvalidArgumentException('A CUI is 2 to 10 digits, optionally prefixed with RO.');
+        if ($canonical === null || strlen($canonical) > 10 || !VatNumberValidator::isValid($canonical)) {
+            throw new InvalidArgumentException('A CUI is 2 to 10 digits with a valid control digit, optionally prefixed with RO.');
         }
 
-        return $cui;
+        return $canonical;
     }
 }

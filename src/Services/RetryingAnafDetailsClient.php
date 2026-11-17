@@ -10,8 +10,8 @@ use BeeCoded\EFacturaSdk\Exceptions\RateLimitExceededException;
 use Illuminate\Support\Sleep;
 
 /**
- * Decorates the SDK's AnafDetailsClient with synchronous retry on ANAF's
- * 1 req/sec company-lookup rate limit. The SDK throws RateLimitExceededException
+ * Decorates the SDK's AnafDetailsClient with synchronous retry on the SDK's
+ * company-lookup limit. The SDK throws RateLimitExceededException
  * (mechanism); this layer owns the retry policy (up to N total attempts, backoff
  * = retryAfterSeconds), then re-throws so the consuming app can present it.
  *

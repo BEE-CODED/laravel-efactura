@@ -11,7 +11,6 @@
 
 namespace BeeCoded\EFactura\Services;
 
-use BeeCoded\EFactura\Exceptions\MessageSyncFailedException;
 use BeeCoded\EFactura\Exceptions\PipelineTablesDisabledException;
 use BeeCoded\EFactura\Models\EfacturaMessage;
 use BeeCoded\EFactura\Models\EfacturaToken;
@@ -76,8 +75,9 @@ class MessageSyncService
      * swallowed, and every run looked successful while syncing zero messages. A broken
      * wire contract has to be loud.
      *
-     * Batch callers that want per-token isolation should catch around this method —
-     * see syncAllMessages().
+     * Callers that work for several companies catch around this method, one company at a
+     * time: SyncMessages runs one job per company, and efactura:sync carries on with the
+     * next company and exits 1.
      *
      * Listed messages without a usable id are skipped with a warning and not counted.
      *
@@ -125,7 +125,7 @@ class MessageSyncService
             }
 
             // Our own page count bounds the loop even if ANAF kept echoing an old page index.
-            if (!$response->hasNextPage() || $page >= $response->totalPages) {
+            if ($page >= ($response->totalPages ?? 0)) {
                 return $synced;
             }
         }
@@ -208,48 +208,6 @@ class MessageSyncService
     }
 
     /**
-     * Sync all messages for all active tokens.
-     *
-     * Isolation is deliberate: one company's revoked token must not stop every other
-     * company from syncing, so each token is attempted regardless of its neighbours.
-     * But the batch does NOT get to report success afterwards — if any token failed,
-     * this throws once every token has had its turn, carrying the full failure list.
-     *
-     * @return int How many messages were synced across all tokens.
-     *
-     * @throws MessageSyncFailedException If any token failed to sync.
-     */
-    public function syncAllMessages(?MessageFilter $filter = null): int
-    {
-        PipelineTablesDisabledException::throwIfDisabled();
-
-        $tokens = $this->tokenService->getActiveTokens();
-
-        $synced = 0;
-        $failures = [];
-
-        foreach ($tokens as $token) {
-            try {
-                $synced += $this->syncMessages($token, $filter);
-            } catch (\Throwable $e) {
-                Log::error('EFactura message sync failed', [
-                    'token_id' => $token->id,
-                    'cui' => $token->cui,
-                    'error' => $e->getMessage(),
-                ]);
-
-                $failures[$token->cui] = $e->getMessage();
-            }
-        }
-
-        if ($failures !== []) {
-            throw MessageSyncFailedException::forTokens($failures, $tokens->count());
-        }
-
-        return $synced;
-    }
-
-    /**
      * Upsert a message into the database.
      */
     protected function upsertMessage(EfacturaToken $token, MessageDetailsData $messageData, ?MessageFilter $filter): void
@@ -257,19 +215,29 @@ class MessageSyncService
         $type = $this->determineMessageType($messageData, $filter);
         [$cifEmitent, $cifBeneficiar] = $this->extractCifs($token, $messageData, $type);
 
-        EfacturaMessage::updateOrCreate(
+        $values = [
+            'type' => $type,
+            // ANAF's message id IS the download id - it's what /descarcare?id= expects.
+            'download_id' => $messageData->id,
+            'cif_emitent' => $cifEmitent,
+            'cif_beneficiar' => $cifBeneficiar,
+            'message_date' => $this->parseMessageDate($messageData->dataCreare),
+        ];
+        $details = $messageData->toArray();
+
+        $message = EfacturaMessage::firstOrCreate(
             // Per token: two connected companies can both list one message (migration 000011).
             ['efactura_token_id' => $token->id, 'message_id' => $messageData->id],
-            [
-                'type' => $type,
-                // ANAF's message id IS the download id - it's what /descarcare?id= expects.
-                'download_id' => $messageData->id,
-                'cif_emitent' => $cifEmitent,
-                'cif_beneficiar' => $cifBeneficiar,
-                'details' => $messageData->toArray(),
-                'message_date' => $this->parseMessageDate($messageData->dataCreare),
-            ]
+            $values + ['details' => $details],
         );
+        $message->fill($values);
+
+        // Loose ==: MySQL's JSON type reorders keys, which === would read as a change.
+        if ($message->details != $details) {
+            $message->details = $details;
+        }
+
+        $message->save();
     }
 
     /**
@@ -381,6 +349,9 @@ class MessageSyncService
      * a Bucharest-anchored Carbon would therefore write "12:30" and read it back as
      * 12:30 app-time — reintroducing the very skew this resolves. Converting first
      * makes the round trip land on the instant ANAF meant.
+     *
+     * A data_creare that names no real minute in Bucharest (30 February, the spring-forward
+     * gap) is null.
      */
     protected function parseMessageDate(string $dataCreare): ?Carbon
     {
@@ -390,17 +361,8 @@ class MessageSyncService
             return null;
         }
 
-        try {
-            $date = Carbon::createFromFormat('YmdHi', $dataCreare, DateHelper::ANAF_TIMEZONE);
-        } catch (\Throwable) {
-            return null;
-        }
+        $date = DateHelper::exact($dataCreare, 'YmdHi', DateHelper::ANAF_TIMEZONE);
 
-        if (!$date) {
-            return null;
-        }
-
-        // ANAF gives minute precision; unspecified seconds would otherwise default to "now".
-        return $date->startOfMinute()->setTimezone(date_default_timezone_get());
+        return $date === null ? null : Carbon::instance($date)->setTimezone(date_default_timezone_get());
     }
 }

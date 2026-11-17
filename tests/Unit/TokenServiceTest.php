@@ -1,10 +1,15 @@
 <?php
 
 use BeeCoded\EFactura\Events\TokenRefreshed;
+use BeeCoded\EFactura\Exceptions\RefreshCooldownException;
 use BeeCoded\EFactura\Models\EfacturaToken;
 use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFacturaSdk\Contracts\AnafAuthenticatorInterface;
 use BeeCoded\EFacturaSdk\Data\Auth\OAuthTokensData;
+use BeeCoded\EFacturaSdk\Exceptions\ApiException;
+use BeeCoded\EFacturaSdk\Exceptions\AuthenticationException;
+use BeeCoded\EFacturaSdk\Exceptions\RateLimitExceededException;
+use BeeCoded\EFacturaSdk\Exceptions\ValidationException;
 use BeeCoded\EFacturaSdk\Services\ApiClients\EFacturaClient;
 use Carbon\Carbon as BaseCarbon;
 use Carbon\CarbonImmutable;
@@ -73,6 +78,14 @@ describe('TokenService', function () {
 
             expect($result)->toBeNull();
         });
+
+        it('finds the token for a spaced, prefixed CUI', function () {
+            expect($this->tokenService->getToken(' RO 1234 5678 ')?->id)->toBe($this->token->id);
+        });
+
+        it('returns null for a blank or malformed CUI', function (string $cui) {
+            expect($this->tokenService->getToken($cui))->toBeNull();
+        })->with(['blank' => [''], 'leading zero' => ['0123']]);
     });
 
     describe('storeToken', function () {
@@ -120,6 +133,13 @@ describe('TokenService', function () {
 
             expect($result->cui)->toBe('88888888');
         });
+
+        it('refuses a malformed CUI', function () {
+            expect(fn () => $this->tokenService->storeToken('0123', new OAuthTokensData(accessToken: 'a', refreshToken: 'r', expiresAt: now()->addHour())))
+                ->toThrow(InvalidArgumentException::class);
+
+            $this->assertDatabaseCount('efactura_tokens', 1);
+        });
     });
 
     /**
@@ -161,6 +181,10 @@ describe('TokenService', function () {
                 ->first(fn ($key) => str_starts_with($key, 'efactura_oauth_state_'));
 
             expect($stateKey)->toBeNull();
+        });
+
+        it('refuses a malformed CUI', function () {
+            expect(fn () => $this->tokenService->getAuthorizationUrl('0123'))->toThrow(InvalidArgumentException::class);
         });
     });
 
@@ -273,21 +297,9 @@ describe('TokenService', function () {
                 ->toThrow(RuntimeException::class, 'No active token found for CUI: 99999999');
         });
 
-        it('calls createClient when token exists', function () {
-            // This test verifies the method finds the token and calls createClient
-            // Actual client creation depends on SDK configuration
-            try {
-                $this->tokenService->createClientForCui('12345678');
-                // If we get here, SDK was configured and worked
-                expect(true)->toBeTrue();
-            } catch (RuntimeException $e) {
-                // If this is "No active token", the test failed
-                expect($e->getMessage())->not->toContain('No active token found');
-            } catch (Exception $e) {
-                // SDK not configured - but we verified token was found
-                // (otherwise RuntimeException would have been thrown)
-                expect(true)->toBeTrue();
-            }
+        it('builds a client on the canonical CUI', function () {
+            expect($this->tokenService->createClientForCui('RO12345678'))->toBeInstanceOf(EFacturaClient::class)
+                ->getVatNumber()->toBe('12345678');
         });
     });
 
@@ -381,31 +393,39 @@ describe('TokenService', function () {
             $this->token->refresh();
             expect($this->token->is_active)->toBeTrue();
         });
+
+        it('does nothing for a blank CUI', function () {
+            $this->tokenService->deactivateToken('');
+
+            expect($this->token->fresh()->is_active)->toBeTrue();
+        });
     });
 
-    describe('getActiveTokens', function () {
-        it('returns only active tokens', function () {
-            EfacturaToken::create([
-                'cui' => '22222222',
-                'access_token' => 'test',
-                'refresh_token' => 'test',
-                'expires_at' => now()->addHour(),
-                'is_active' => true,
-            ]);
+    describe('usableTokens', function () {
+        it('returns only active, canonical, unpaused tokens', function () {
+            $paused = EfacturaToken::create(['cui' => '22222222', 'access_token' => 'a', 'refresh_token' => 'r', 'expires_at' => now()->addHour(), 'is_active' => true]);
+            EfacturaToken::create(['cui' => '33333333', 'access_token' => 'a', 'refresh_token' => 'r', 'expires_at' => now()->addHour(), 'is_active' => false]);
+            EfacturaToken::create(['cui' => '01234567', 'access_token' => 'a', 'refresh_token' => 'r', 'expires_at' => now()->addHour(), 'is_active' => true]);
+            refuseGrant($paused);
 
-            EfacturaToken::create([
-                'cui' => '33333333',
-                'access_token' => 'test',
-                'refresh_token' => 'test',
-                'expires_at' => now()->addHour(),
-                'is_active' => false,
-            ]);
-
-            $tokens = $this->tokenService->getActiveTokens();
-
-            expect($tokens)->toHaveCount(2);
-            expect($tokens->pluck('cui')->toArray())->toContain('12345678', '22222222');
+            expect($this->tokenService->usableTokens()->modelKeys())->toBe([$this->token->id])
+                ->and($this->tokenService->usableToken('RO12345678')?->id)->toBe($this->token->id)
+                ->and($this->tokenService->usableToken('22222222'))->toBeNull();
         });
+    });
+
+    describe('isGrantFailure', function () {
+        it('reads failures before sending and authentication failures as grant-wide', function (Throwable $e, bool $sent, bool $grant) {
+            expect($this->tokenService->isGrantFailure($e, $sent))->toBe($grant);
+        })->with([
+            'paused' => [new RefreshCooldownException('paused', 401), true, true],
+            'request 401' => [new AuthenticationException('refused', 401), true, true],
+            'no answer' => [new AuthenticationException('lock timeout', 0), true, true],
+            'ANAF 500' => [new ApiException('down', 500), true, false],
+            'rate limit' => [new RateLimitExceededException('limit'), true, false],
+            'local failure before sending' => [new RuntimeException('deactivated'), false, true],
+            'malformed CUI before sending' => [new ValidationException('CIF is not a valid Romanian CUI or CNP'), false, true],
+        ]);
     });
 
     describe('executeWithClient', function () {
@@ -459,10 +479,7 @@ describe('TokenService', function () {
             expect($this->token->isExpiringSoon(120))->toBeTrue();
         });
 
-        it('throws exception if token is deactivated during lock', function () {
-            // Set token to expire soon to trigger lock path
-            $this->token->update(['expires_at' => now()->addSeconds(60)]);
-
+        it('refuses a deactivated token before anything is sent', function () {
             // Deactivate before calling - simulates race condition
             $this->token->update(['is_active' => false]);
 

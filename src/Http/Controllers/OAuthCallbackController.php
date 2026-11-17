@@ -13,7 +13,8 @@ namespace BeeCoded\EFactura\Http\Controllers;
 
 use BeeCoded\EFactura\Events\TokenStored;
 use BeeCoded\EFactura\Services\TokenService;
-use BeeCoded\EFacturaSdk\Facades\EFacturaSdkAuth;
+use BeeCoded\EFacturaSdk\Contracts\AnafAuthenticatorInterface;
+use BeeCoded\EFacturaSdk\Exceptions\AuthenticationException;
 use BeeCoded\EFacturaSdk\Support\Validators\VatNumberValidator;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -27,15 +28,10 @@ class OAuthCallbackController extends Controller
     ) {}
 
     /**
-     * Session key of the nonce an authorization started here is bound to.
-     */
-    private const SESSION_NONCE_KEY = 'efactura_oauth_nonce';
-
-    /**
      * Redirect to ANAF OAuth authorization.
      *
-     * The state is bound to this browser session and the logged-in user, so only they can
-     * complete it.
+     * The state is bound to this browser session's CSRF token and the logged-in user, so
+     * only they can complete it. A session regenerated in between (a login) refuses it.
      */
     public function redirect(Request $request, string $cui): RedirectResponse
     {
@@ -83,16 +79,15 @@ class OAuthCallbackController extends Controller
         }
 
         // Validate state token (CSRF protection)
-        $nonce = $request->hasSession() ? $request->session()->get(self::SESSION_NONCE_KEY) : null;
-        $cui = $this->tokenService->validateOAuthState($state, is_string($nonce) ? $nonce : null, $request->user()?->getAuthIdentifier());
+        $cui = $this->tokenService->validateOAuthState($state, $this->sessionNonce($request), $request->user()?->getAuthIdentifier());
 
         if (!$cui) {
             return $this->errorRedirect('Invalid or expired state parameter. Please try again.');
         }
 
         try {
-            // Exchange code for tokens using SDK
-            $tokens = EFacturaSdkAuth::exchangeCodeForToken($code);
+            // Not through the facade: Facade::__callStatic's frame would hold the unspent code in the reported trace.
+            $tokens = app(AnafAuthenticatorInterface::class)->exchangeCodeForToken($code);
 
             // Store tokens
             $token = $this->tokenService->storeToken($cui, $tokens);
@@ -101,31 +96,27 @@ class OAuthCallbackController extends Controller
             rescue(fn () => event(new TokenStored($token)));
 
             return $this->successRedirect($cui);
-        } catch (\Exception $e) {
+        } catch (AuthenticationException $e) {
             report($e);
 
             return $this->errorRedirect('Failed to exchange authorization code: '.$e->getMessage());
+        } catch (\Exception $e) {
+            // Anything else (a failed save) can carry SQL or ciphertext: never show it.
+            report($e);
+
+            return $this->errorRedirect('Failed to complete the e-Factura authorization. Please try again.');
         }
     }
 
     /**
-     * The nonce of this browser session, created once; null without a session.
+     * The session's CSRF token, which the state is bound to; null without a session.
      *
-     * One per session rather than per flow, so two tabs authorizing two CUIs both complete.
+     * One per session rather than per flow, so two tabs authorizing two CUIs both complete,
+     * and starting a second flow never invalidates the first.
      */
     protected function sessionNonce(Request $request): ?string
     {
-        if (!$request->hasSession()) {
-            return null;
-        }
-
-        $session = $request->session();
-
-        if (!is_string($nonce = $session->get(self::SESSION_NONCE_KEY))) {
-            $session->put(self::SESSION_NONCE_KEY, $nonce = Str::random(40));
-        }
-
-        return $nonce;
+        return $request->hasSession() ? $request->session()->token() : null;
     }
 
     /**
@@ -186,7 +177,7 @@ class OAuthCallbackController extends Controller
      * reachable from the console-initiated flow), so cleanup delegates to the service
      * that owns it.
      */
-    protected function cleanupOAuthSession(?string $state): void
+    protected function cleanupOAuthSession(#[\SensitiveParameter] ?string $state): void
     {
         $this->tokenService->forgetOAuthState($state);
     }

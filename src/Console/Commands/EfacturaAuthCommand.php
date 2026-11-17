@@ -30,7 +30,15 @@ class EfacturaAuthCommand extends Command
             return self::FAILURE;
         }
 
-        $cui = VatNumberValidator::stripPrefix($this->argument('cui'));
+        $raw = (string) $this->argument('cui');
+
+        if (!VatNumberValidator::isValid($raw)) {
+            $this->error('Invalid CUI format provided.');
+
+            return self::FAILURE;
+        }
+
+        $cui = (string) VatNumberValidator::canonical($raw);
 
         // Check if token already exists
         $existingToken = EfacturaToken::forCui($cui)->first();
@@ -38,7 +46,13 @@ class EfacturaAuthCommand extends Command
         if ($existingToken) {
             $this->warn("A token already exists for CUI: {$cui}");
             $this->line('Status: '.($existingToken->is_active ? 'Active' : 'Inactive'));
-            $this->line('Expires: '.($existingToken->expires_at?->format('Y-m-d H:i:s') ?? 'Unknown'));
+            $this->line('Expires: '.($existingToken->expires_at?->copy()->setTimezone(config('app.timezone'))->format('Y-m-d H:i:s T') ?? 'Unknown'));
+
+            if (!$this->input->isInteractive()) {
+                $this->error('No URL generated: a token already exists for this CUI; rerun interactively to confirm.');
+
+                return self::FAILURE;
+            }
 
             if (!$this->confirm('Do you want to generate a new authorization URL anyway?')) {
                 return self::SUCCESS;

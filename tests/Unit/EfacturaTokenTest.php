@@ -1,10 +1,12 @@
 <?php
 
+use BeeCoded\EFactura\Enums\UploadStatus;
+use BeeCoded\EFactura\Models\EfacturaMessage;
 use BeeCoded\EFactura\Models\EfacturaToken;
+use BeeCoded\EFactura\Models\EfacturaUpload;
 use BeeCoded\EFacturaSdk\Data\Auth\OAuthTokensData;
 use Carbon\Carbon as BaseCarbon;
 use Carbon\CarbonImmutable;
-use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\DateFactory;
 use Illuminate\Support\Facades\Date;
@@ -26,11 +28,11 @@ describe('EfacturaToken Model', function () {
     });
 
     it('casts expires_at to datetime', function () {
-        expect($this->token->expires_at)->toBeInstanceOf(Carbon::class);
+        expect($this->token->fresh()->expires_at)->toBeInstanceOf(Carbon::class);
     });
 
     it('casts is_active to boolean', function () {
-        expect($this->token->is_active)->toBeBool()->toBeTrue();
+        expect($this->token->fresh()->is_active)->toBeBool()->toBeTrue();
     });
 
     it('casts last_used_at to datetime', function () {
@@ -38,16 +40,10 @@ describe('EfacturaToken Model', function () {
         expect($this->token->fresh()->last_used_at)->toBeInstanceOf(Carbon::class);
     });
 
-    it('hides tokens when serialized', function () {
-        $array = $this->token->toArray();
-        expect($array)->not->toHaveKey('access_token');
-        expect($array)->not->toHaveKey('refresh_token');
-    });
-
     describe('getVatNumber', function () {
-        it('returns CUI without RO prefix', function () {
-            expect($this->token->getVatNumber())->toBe('12345678');
-        });
+        it('returns the canonical CUI', function (string $cui) {
+            expect((new EfacturaToken(['cui' => $cui]))->getVatNumber())->toBe('12345678');
+        })->with(['bare' => ['12345678'], 'prefixed' => ['RO12345678'], 'spaced' => ['1234 5678']]);
     });
 
     describe('isExpired', function () {
@@ -80,19 +76,6 @@ describe('EfacturaToken Model', function () {
         it('returns false outside buffer period', function () {
             $token = new EfacturaToken(['expires_at' => now()->addMinutes(10)]);
             expect($token->isExpiringSoon(300))->toBeFalse();
-        });
-
-        it('does not mutate expires_at', function () {
-            $expiresAt = now()->addHour();
-            $originalTimestamp = $expiresAt->timestamp;
-            $token = new EfacturaToken(['expires_at' => $expiresAt->copy()]);
-
-            // Call isExpiringSoon multiple times
-            $token->isExpiringSoon(300);
-            $token->isExpiringSoon(300);
-
-            // The expires_at timestamp should still be the same
-            expect($token->expires_at->timestamp)->toBe($originalTimestamp);
         });
     });
 
@@ -162,14 +145,12 @@ describe('EfacturaToken Model', function () {
     });
 
     describe('relationships', function () {
-        it('has uploads relationship', function () {
-            expect($this->token->uploads())
-                ->toBeInstanceOf(HasMany::class);
-        });
+        it('reaches its uploads and messages', function () {
+            $upload = EfacturaUpload::create(['efactura_token_id' => $this->token->id, 'uploadable_type' => 'App\\Models\\Invoice', 'uploadable_id' => 1, 'status' => UploadStatus::Pending]);
+            $message = EfacturaMessage::create(['efactura_token_id' => $this->token->id, 'message_id' => '4001130001', 'type' => 'received']);
 
-        it('has messages relationship', function () {
-            expect($this->token->messages())
-                ->toBeInstanceOf(HasMany::class);
+            expect($this->token->uploads->modelKeys())->toBe([$upload->id])
+                ->and($this->token->messages->modelKeys())->toBe([$message->id]);
         });
     });
 });

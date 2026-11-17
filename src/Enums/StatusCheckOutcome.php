@@ -22,9 +22,15 @@ enum StatusCheckOutcome: string
     /** Nothing to poll: no upload index, already final, or no token. */
     case NotPollable = 'not_pollable';
 
-    /** Skipped: this upload's per-message status limit is reached; a later run polls it. */
+    /**
+     * Not asked: a rate limit stopped it, either this upload's per-message status limit, the
+     * SDK's global limit or ANAF's 429. A later run polls it.
+     */
     case RateLimited = 'rate_limited';
 
-    /** The check failed and was logged: transient failures are retried, permanent ones counted. */
+    /**
+     * The check failed and was logged, a grant failure (refused, paused, deactivated or
+     * unreadable token) included. Only ANAF refusing the read is counted against the upload.
+     */
     case Failed = 'failed';
 }

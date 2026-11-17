@@ -18,7 +18,6 @@ use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFactura\Tests\Fixtures\TestInvoice;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Schema;
 
 /**
  * queueUpload() used to create() unconditionally. Two calls for the same model — a
@@ -28,15 +27,6 @@ use Illuminate\Support\Facades\Schema;
  * so the second row was not even reachable through it.
  */
 beforeEach(function () {
-    if (!Schema::hasTable('test_invoices')) {
-        Schema::create('test_invoices', function ($table) {
-            $table->id();
-            $table->string('number');
-            $table->string('cui');
-            $table->decimal('total', 10, 2)->nullable();
-        });
-    }
-
     $this->token = EfacturaToken::create([
         'cui' => '12345678',
         'access_token' => 'test',
@@ -310,6 +300,25 @@ describe('queueing with different options', function () {
         expect($second->id)->toBe($first->id)
             ->and($second->status)->toBe(UploadStatus::Uploading);
     });
+
+    // Resetting them would discard ANAF's wait and the transient cap on every idempotent call.
+    it('keeps a pending upload\'s next try and attempt count when it is queued again', function () {
+        $first = $this->uploadService->queueUpload($this->invoice);
+        $next = now()->addMinutes(10)->startOfSecond();
+        EfacturaUpload::whereKey($first->id)->update(['next_poll_at' => $next, 'status_failures' => 2]);
+
+        $this->uploadService->queueUpload($this->invoice);
+
+        expect($first->fresh())->status_failures->toBe(2)
+            ->and($first->fresh()->next_poll_at->equalTo($next))->toBeTrue();
+    });
+
+    it('refuses an unknown standard at queue time and stores nothing', function (string $method) {
+        expect(fn () => $this->uploadService->{$method}($this->invoice, ['standard' => 'ubl']))
+            ->toThrow(InvalidArgumentException::class);
+
+        expect(EfacturaUpload::count())->toBe(0);
+    })->with(['queueUpload', 'queueB2CUpload']);
 });
 
 describe('re-uploading after a failure', function () {
@@ -394,7 +403,8 @@ describe('re-uploading after a failure', function () {
 
     /**
      * The recycled row kept the old attempt's counters, so its new response was never
-     * downloaded (needsResponseDownload() stops at MAX_RESPONSE_ATTEMPTS).
+     * downloaded (3.x stopped after three response tries); now it would start at the old
+     * attempt's backoff.
      */
     it('starts the new attempt with fresh download and status counters', function () {
         $first = $this->uploadService->queueUpload($this->invoice);

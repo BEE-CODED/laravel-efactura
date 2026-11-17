@@ -39,7 +39,7 @@ describe('EfacturaMessage Model', function () {
     });
 
     it('casts is_downloaded to boolean', function () {
-        expect($this->message->is_downloaded)->toBeBool()->toBeFalse();
+        expect($this->message->fresh()->is_downloaded)->toBeBool()->toBeFalse();
     });
 
     it('casts message_date to datetime', function () {

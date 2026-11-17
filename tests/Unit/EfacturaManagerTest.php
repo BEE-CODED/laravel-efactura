@@ -10,19 +10,8 @@ use BeeCoded\EFactura\Services\TokenService;
 use BeeCoded\EFactura\Services\UploadService;
 use BeeCoded\EFactura\Tests\Fixtures\TestInvoice;
 use BeeCoded\EFacturaSdk\Services\ApiClients\EFacturaClient;
-use Illuminate\Support\Facades\Schema;
 
 beforeEach(function () {
-    // Create test_invoices table
-    if (!Schema::hasTable('test_invoices')) {
-        Schema::create('test_invoices', function ($table) {
-            $table->id();
-            $table->string('number');
-            $table->string('cui');
-            $table->decimal('total', 10, 2)->nullable();
-        });
-    }
-
     $this->token = EfacturaToken::create([
         'cui' => '12345678',
         'access_token' => 'test',
@@ -59,11 +48,11 @@ describe('EfacturaManager', function () {
 
         it('delegates getAuthorizationUrl to TokenService', function () {
             $this->tokenService->shouldReceive('getAuthorizationUrl')
-                ->with('12345678', null, null)
+                ->with('12345678', 'nonce', 7)
                 ->once()
                 ->andReturn('https://auth.example.com');
 
-            $result = $this->manager->getAuthorizationUrl('12345678');
+            $result = $this->manager->getAuthorizationUrl('12345678', 'nonce', 7);
 
             expect($result)->toBe('https://auth.example.com');
         });

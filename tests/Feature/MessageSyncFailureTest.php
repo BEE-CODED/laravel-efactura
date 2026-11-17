@@ -9,16 +9,17 @@
  * file that was distributed with this source code.
  */
 
-use BeeCoded\EFactura\Exceptions\MessageSyncFailedException;
 use BeeCoded\EFactura\Jobs\SyncMessages;
 use BeeCoded\EFactura\Models\EfacturaMessage;
 use BeeCoded\EFactura\Models\EfacturaToken;
+use BeeCoded\EFactura\Services\DownloadService;
 use BeeCoded\EFactura\Services\MessageSyncService;
-use BeeCoded\EFacturaSdk\Enums\MessageFilter;
 use BeeCoded\EFacturaSdk\Exceptions\ApiException;
+use Illuminate\Database\QueryException;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Queue;
@@ -29,8 +30,8 @@ use Illuminate\Support\Facades\Queue;
  * months: every sync threw, every throw was swallowed, and every run reported success
  * while syncing zero messages.
  *
- * Genuinely unexpected errors must be loud. Per-token isolation is still worth having
- * — one company's broken token should not stop the others — but the BATCH must not
+ * Genuinely unexpected errors must be loud. Per-company isolation is still worth having
+ * — one company's broken token should not stop the others — but efactura:sync must not
  * report success when part of it failed.
  */
 const MESSAGES_URL = 'https://api.anaf.ro/test/FCTEL/rest/listaMesajePaginatieFactura*';
@@ -107,6 +108,28 @@ describe('syncMessages', function () {
 
         expect($synced)->toBe(1);
         expect(EfacturaMessage::count())->toBe(1);
+    });
+
+    it('does not rewrite a listed message whose stored details differ only in key order', function () {
+        Http::fake([MESSAGES_URL => Http::response(anafMessagesBody('12345678', [[
+            'data_creare' => '202407171230',
+            'cif' => '12345678',
+            'id_solicitare' => '5001130255',
+            'detalii' => 'Factura cu id_incarcare=5001130255 emisa de cif_emitent=12345678 pentru cif_beneficiar=87654321',
+            'tip' => 'FACTURA TRIMISA',
+            'id' => '3001130059',
+        ]]))]);
+        $token = makeSyncToken('12345678');
+
+        $this->messageSyncService->syncMessages($token);
+        // MySQL's JSON type stores the keys in its own order.
+        DB::table('efactura_messages')->update(['details' => json_encode(array_reverse(EfacturaMessage::sole()->details, true))]);
+        $updatedAt = EfacturaMessage::sole()->updated_at;
+        $this->travel(1)->minutes();
+
+        $this->messageSyncService->syncMessages($token);
+
+        expect(EfacturaMessage::sole()->updated_at->equalTo($updatedAt))->toBeTrue();
     });
 
     it('skips listed messages without a usable id instead of merging them into one row', function () {
@@ -202,12 +225,12 @@ describe('paginated listing', function () {
         expect(syncQueries()->pluck('pagina')->all())->toBe(['1', '2']);
     });
 
-    it('stops when ANAF does not say which page it answered', function () {
+    it('keeps paging by its own count when ANAF does not say which page it answered', function () {
         Http::fake([MESSAGES_URL => Http::response([...anafMessagesBody('12345678'), 'numar_total_pagini' => 2])]);
 
         $this->messageSyncService->syncMessages(makeSyncToken('12345678'));
 
-        expect(syncQueries()->pluck('pagina')->all())->toBe(['1']);
+        expect(syncQueries()->pluck('pagina')->all())->toBe(['1', '2']);
     });
 
     /**
@@ -294,59 +317,6 @@ describe('ANAF error channel', function () {
     });
 });
 
-describe('syncAllMessages', function () {
-    it('keeps per-token isolation but refuses to report success', function () {
-        $good = makeSyncToken('12345678');
-        $bad = makeSyncToken('87654321');
-
-        Http::fake([
-            'https://api.anaf.ro/test/FCTEL/rest/listaMesajePaginatieFactura?cif=12345678*' => Http::response(
-                anafMessagesBody('12345678', [[
-                    'data_creare' => '202407171230',
-                    'cif' => '12345678',
-                    'id_solicitare' => '5001130255',
-                    'detalii' => 'Factura cu id_incarcare=5001130255 emisa de cif_emitent=12345678 pentru cif_beneficiar=87654321',
-                    'tip' => 'FACTURA TRIMISA',
-                    'id' => '3001130059',
-                ]])
-            ),
-            'https://api.anaf.ro/test/FCTEL/rest/listaMesajePaginatieFactura?cif=87654321*' => Http::response('Eroare', 500),
-        ]);
-
-        expect(fn () => $this->messageSyncService->syncAllMessages())
-            ->toThrow(MessageSyncFailedException::class);
-
-        // Isolation held: the healthy token still synced.
-        expect(EfacturaMessage::where('efactura_token_id', $good->id)->count())->toBe(1);
-        expect(EfacturaMessage::where('efactura_token_id', $bad->id)->count())->toBe(0);
-    });
-
-    it('names the tokens that failed', function () {
-        makeSyncToken('12345678');
-
-        Http::fake([MESSAGES_URL => Http::response('Eroare', 500)]);
-
-        try {
-            $this->messageSyncService->syncAllMessages();
-            $this->fail('Expected MessageSyncFailedException');
-        } catch (MessageSyncFailedException $e) {
-            expect($e->getMessage())->toContain('12345678');
-            expect($e->failures)->toHaveCount(1);
-        }
-    });
-
-    it('stays quiet when every token syncs', function () {
-        makeSyncToken('12345678');
-        makeSyncToken('87654321');
-
-        Http::fake([MESSAGES_URL => Http::response(anafMessagesBody('12345678'))]);
-
-        $this->messageSyncService->syncAllMessages();
-
-        expect(true)->toBeTrue();
-    });
-});
-
 /**
  * The operator-facing end of the same bug: `efactura:sync` printed "Synced 0
  * message(s)." and exited 0 while ANAF was refusing every request. Both directions are
@@ -363,6 +333,55 @@ describe('efactura:sync command', function () {
         ])]);
 
         $this->artisan('efactura:sync')
+            ->assertExitCode(1);
+    });
+
+    it('syncs and downloads for the other companies, prints only the class of a failure, and exits 1', function () {
+        $failing = makeSyncToken('12345678');
+        $healthy = makeSyncToken('87654321');
+        $message = fn (string $cui, string $id) => anafMessagesBody($cui, [[
+            'data_creare' => '202407171230',
+            'cif' => $cui,
+            'id_solicitare' => '5001130255',
+            'detalii' => "Factura cu id_incarcare=5001130255 emisa de cif_emitent=11111111 pentru cif_beneficiar={$cui}",
+            'tip' => 'FACTURA PRIMITA',
+            'id' => $id,
+        ]]);
+        Http::fake([
+            'https://api.anaf.ro/test/FCTEL/rest/listaMesajePaginatieFactura?cif=12345678*' => Http::response($message('12345678', '3001130059')),
+            'https://api.anaf.ro/test/FCTEL/rest/listaMesajePaginatieFactura?cif=87654321*' => Http::response($message('87654321', '3001130060')),
+        ]);
+        EfacturaMessage::creating(function (EfacturaMessage $row) use ($failing) {
+            if ($row->efactura_token_id === $failing->id) {
+                throw new QueryException('testing', 'insert into efactura_messages values (?)', ['SECRET-BINDING'], new PDOException('boom'));
+            }
+        });
+        $downloads = $this->mock(DownloadService::class);
+        $downloads->shouldReceive('downloadAllReceivedInvoices')->twice()->andReturn(true);
+
+        $this->artisan('efactura:sync', ['--download' => true])
+            ->expectsOutputToContain('Message sync failed for 12345678 (QueryException); see the log.')
+            ->doesntExpectOutputToContain('SECRET-BINDING')
+            ->assertExitCode(1);
+
+        expect(EfacturaMessage::forToken($healthy)->count())->toBe(1);
+    });
+
+    it('carries on past a received-invoice download that throws, and exits 1', function () {
+        makeSyncToken('12345678');
+        makeSyncToken('87654321');
+        Http::fake([MESSAGES_URL => Http::response([
+            'eroare' => 'Nu exista mesaje in intervalul selectat',
+            'titlu' => 'Lista Mesaje',
+        ])]);
+        $downloads = $this->mock(DownloadService::class);
+        $downloads->shouldReceive('downloadAllReceivedInvoices')->twice()->andReturnUsing(
+            fn (EfacturaToken $token) => $token->cui === '12345678' ? throw new RuntimeException('SECRET-PATH') : true,
+        );
+
+        $this->artisan('efactura:sync', ['--download' => true])
+            ->expectsOutputToContain('Received-invoice download failed for 12345678 (RuntimeException); see the log.')
+            ->doesntExpectOutputToContain('SECRET-PATH')
             ->assertExitCode(1);
     });
 
@@ -443,6 +462,5 @@ describe('message filters', function () {
     })->with([
         'syncSentMessages' => [fn (MessageSyncService $service, EfacturaToken $token) => $service->syncSentMessages($token), 'T'],
         'syncReceivedMessages' => [fn (MessageSyncService $service, EfacturaToken $token) => $service->syncReceivedMessages($token), 'P'],
-        'syncAllMessages' => [fn (MessageSyncService $service) => $service->syncAllMessages(MessageFilter::InvoiceSent), 'T'],
     ]);
 });

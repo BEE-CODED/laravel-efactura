@@ -117,6 +117,7 @@ describe('EfacturaUpload Model', function () {
                 'status' => UploadStatus::Completed,
                 'download_id' => 'DL123',
                 'standard' => 'UBL',
+                'processed_at' => now(),
             ]);
         });
 

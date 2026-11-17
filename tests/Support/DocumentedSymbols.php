@@ -16,18 +16,24 @@ use ReflectionClass;
  * Extracts the symbols our documentation claims exist, so DocsDriftTest can
  * check each one against PHP reality.
  *
- * Why this exists: the MCP suite asserts documentation *contains* a string
- * (`expect(content).toContain("fromTokens")`). That is circular — the docs are
- * both the subject and the oracle, so a doc naming a deleted method stays green
- * forever. Only a check against the source can fail for the right reason.
+ * Why this exists: a test that asserts documentation *contains* a string is
+ * circular — the docs are both the subject and the oracle, so a doc naming a
+ * deleted method stays green forever. Only a check against the source can fail
+ * for the right reason.
  *
- * Scope is deliberately limited to forms whose meaning is unambiguous. Two are
+ * The sources are README.md and CHANGELOG.md. The MCP server under mcp/ only
+ * serves those files and config/, so it has no prose of its own to check.
+ *
+ * Scope is deliberately limited to forms whose meaning is unambiguous. Three are
  * excluded on purpose:
  *
  *  - Bare `method()` mentions, and the `$var->method()` form. Their owning class
  *    is not machine-recoverable; guessing an owner produces noise, not signal.
  *  - Bare class names in prose. `EFactura` is both a facade and the product
  *    name; matching prose words produces noise, not signal.
+ *  - Event and job properties (constructor parameters, tries/timeout/backoff,
+ *    uniqueness), and artisan options named outside a `php artisan efactura:`
+ *    line. They are not machine-checked here.
  */
 final class DocumentedSymbols
 {
@@ -40,46 +46,87 @@ final class DocumentedSymbols
     private const FOREIGN_NAMESPACE_PREFIXES = ['App\\'];
 
     /**
-     * Symbols the docs name precisely BECAUSE they no longer exist.
+     * Symbols CHANGELOG.md names precisely BECAUSE they no longer exist.
      *
-     * The v2->v3 migration guide quotes the exact fatal error an upgrader hits
-     * ("Call to undefined method ...UploadService::resetForRateLimit()"), so that
-     * documentation is correct only while the symbol is absent. Asserting it
-     * exists would invert the guard and demand we resurrect the method.
+     * A removal entry is correct only while the symbol is absent, so it is
+     * accepted as a miss in CHANGELOG.md and nowhere else. It is also asserted
+     * ABSENT: if one is ever reintroduced, the entry telling users it was removed
+     * becomes a lie, and the suite fails.
      *
-     * These are asserted ABSENT instead: if one is ever reintroduced, a guide
-     * still telling users it was removed becomes a lie, and this fails.
+     * Entries are flat strings, by kind: 'Fqcn::method', 'Fqcn', 'Fqcn::CONST',
+     * a config path relative to config/efactura.php, an env var, and
+     * 'efactura:command --option'. A lane that deletes a symbol adds it here in
+     * the same change.
      *
-     * @var list<array{class: class-string|string, method: string}>
+     * @var array{method: list<string>, class: list<string>, constant: list<string>, config: list<string>, env: list<string>, option: list<string>}
      */
     private const DOCUMENTED_AS_REMOVED = [
-        ['class' => 'BeeCoded\\EFactura\\Services\\UploadService', 'method' => 'resetForRateLimit'],
-        // v4.0 CHANGELOG "Removed".
-        ['class' => 'BeeCoded\\EFactura\\Services\\TokenService', 'method' => 'persistTokenRefreshWithLock'],
-        ['class' => 'BeeCoded\\EFactura\\Services\\TokenService', 'method' => 'isFresherThanStored'],
-        ['class' => 'BeeCoded\\EFactura\\Services\\DownloadService', 'method' => 'isPoisonedBody'],
-        ['class' => 'BeeCoded\\EFactura\\Services\\UploadService', 'method' => 'markUploadAsUploading'],
-        ['class' => 'BeeCoded\\EFactura\\Services\\UploadService', 'method' => 'markUploadAsCompleted'],
-        ['class' => 'BeeCoded\\EFactura\\Services\\TokenService', 'method' => 'updateTokenFromOAuth'],
-        ['class' => 'BeeCoded\\EFactura\\Jobs\\SyncMessages', 'method' => 'failBatch'],
-        ['class' => 'BeeCoded\\EFactura\\Services\\UploadService', 'method' => 'classifyApiException'],
+        'method' => [
+            'BeeCoded\\EFactura\\Services\\TokenService::persistTokenRefreshWithLock',
+            'BeeCoded\\EFactura\\Services\\TokenService::isFresherThanStored',
+            'BeeCoded\\EFactura\\Services\\DownloadService::isPoisonedBody',
+            'BeeCoded\\EFactura\\Services\\UploadService::markUploadAsUploading',
+            'BeeCoded\\EFactura\\Services\\UploadService::markUploadAsCompleted',
+            'BeeCoded\\EFactura\\Services\\TokenService::updateTokenFromOAuth',
+            'BeeCoded\\EFactura\\Jobs\\SyncMessages::failBatch',
+            'BeeCoded\\EFactura\\Services\\UploadService::classifyApiException',
+            'BeeCoded\\EFactura\\Services\\UploadService::resetForRetry',
+            'BeeCoded\\EFactura\\Services\\UploadService::abandonFailure',
+            'BeeCoded\\EFactura\\Services\\UploadService::abandonUnsentUpload',
+            'BeeCoded\\EFactura\\Services\\UploadService::processPendingUploads',
+            'BeeCoded\\EFactura\\Services\\UploadService::failBeforeTransmission',
+            'BeeCoded\\EFactura\\Services\\UploadService::failTerminally',
+            'BeeCoded\\EFactura\\Services\\UploadService::markAsRateLimited',
+            'BeeCoded\\EFactura\\Enums\\FailureReason::retryable',
+            'BeeCoded\\EFactura\\Jobs\\ProcessSingleUpload::retryUntil',
+            'BeeCoded\\EFactura\\Services\\DownloadService::stopBatchForRateLimit',
+            'BeeCoded\\EFactura\\Services\\TokenService::getActiveTokens',
+            'BeeCoded\\EFactura\\Services\\MessageSyncService::syncAllMessages',
+        ],
+        'class' => [
+            'BeeCoded\\EFactura\\Jobs\\RetryRateLimitedUploads',
+            'BeeCoded\\EFactura\\Exceptions\\MessageSyncFailedException',
+            'BeeCoded\\EFactura\\Jobs\\Concerns\\DiscardsWhenStale',
+        ],
+        'constant' => [
+            'BeeCoded\\EFactura\\Models\\EfacturaUpload::MAX_RESPONSE_ATTEMPTS',
+        ],
+        'config' => [
+            'rate_limit.retry_window_hours',
+            'rate_limit.retry_batch_size',
+            'rate_limit.retry_max_age_days',
+            'jobs.max_staleness_seconds',
+            'jobs.unique_for_seconds',
+            'jobs.transient_retry_delay_seconds',
+            'jobs.max_transient_attempts',
+            'jobs.stale_uploading_minutes',
+        ],
+        'env' => [
+            'EFACTURA_RATE_LIMIT_RETRY_HOURS',
+            'EFACTURA_RATE_LIMIT_RETRY_BATCH',
+            'EFACTURA_RATE_LIMIT_RETRY_MAX_DAYS',
+            'EFACTURA_JOB_MAX_STALENESS',
+            'EFACTURA_JOB_UNIQUE_FOR',
+            'EFACTURA_JOB_TRANSIENT_RETRY_DELAY',
+            'EFACTURA_JOB_MAX_TRANSIENT_ATTEMPTS',
+            'EFACTURA_JOB_STALE_UPLOADING_MINUTES',
+        ],
+        'option' => [],
     ];
 
     /**
      * The one recommended cadence per scheduled job, as a Laravel scheduler method.
      *
      * The package schedules nothing itself, so this lives only in the docs: the
-     * README's "Recommended schedule" table and the MCP job reference's
-     * "Recommended Scheduling" table. Every schedule call and every cadence cell in
-     * the docs must say the same.
+     * README's "Recommended schedule" table. Every schedule call and every cadence
+     * cell in the docs must say the same.
      *
      * @var array<string, string> job => scheduler method
      */
     public const RECOMMENDED_CADENCES = [
-        'ProcessPendingUploads' => 'everyFiveMinutes',
+        'ProcessPendingUploads' => 'everyMinute',
         'CheckUploadStatuses' => 'everyTenMinutes',
         'DownloadResponses' => 'everyFifteenMinutes',
-        'RetryRateLimitedUploads' => 'everyThirtyMinutes',
         'SweepStaleUploads' => 'everyFifteenMinutes',
         'SyncMessages' => 'hourly',
         'DownloadReceivedInvoices' => 'hourly',
@@ -91,15 +138,15 @@ final class DocumentedSymbols
      * @var array<string, string>
      */
     public const CADENCE_WORDING = [
+        'everyMinute' => 'Every minute',
         'everyFiveMinutes' => 'Every 5 minutes',
         'everyTenMinutes' => 'Every 10 minutes',
         'everyFifteenMinutes' => 'Every 15 minutes',
-        'everyThirtyMinutes' => 'Every 30 minutes',
         'hourly' => 'Hourly',
     ];
 
     /**
-     * @return list<array{class: string, method: string}>
+     * @return array{method: list<string>, class: list<string>, constant: list<string>, config: list<string>, env: list<string>, option: list<string>}
      */
     public static function documentedAsRemoved(): array
     {
@@ -107,17 +154,14 @@ final class DocumentedSymbols
     }
 
     /**
-     * True when a documented Class::method reference is one we expect to be gone.
+     * True when $symbol is a removal CHANGELOG.md records. Only CHANGELOG.md may
+     * name a removed symbol; the README must describe what exists.
+     *
+     * @param  'method'|'class'|'constant'|'config'|'env'|'option'  $kind
      */
-    public static function isDocumentedAsRemoved(string $fqcn, string $method): bool
+    public static function isDocumentedAsRemoved(string $label, string $kind, string $symbol): bool
     {
-        foreach (self::DOCUMENTED_AS_REMOVED as $removed) {
-            if ($removed['class'] === $fqcn && $removed['method'] === $method) {
-                return true;
-            }
-        }
-
-        return false;
+        return $label === 'CHANGELOG.md' && in_array($symbol, self::DOCUMENTED_AS_REMOVED[$kind], true);
     }
 
     public static function packageRoot(): string
@@ -133,34 +177,11 @@ final class DocumentedSymbols
     public static function sources(): array
     {
         $root = self::packageRoot();
-        $sources = [
+
+        return [
             'README.md' => (string) file_get_contents($root.'/README.md'),
             'CHANGELOG.md' => (string) file_get_contents($root.'/CHANGELOG.md'),
         ];
-
-        foreach (glob($root.'/mcp/src/content/*.ts') ?: [] as $path) {
-            // The MCP content files are TypeScript template literals holding
-            // markdown, so every backslash and backtick arrives escaped:
-            // `BeeCoded\\EFactura\\Events\\TokenStored` on disk is one
-            // backslash in the rendered doc. Undo the escaping first — that
-            // also removes the trailing `\` of an escaped closing backtick,
-            // which would otherwise glue itself onto the symbol name.
-            $label = 'mcp/src/content/'.basename($path);
-            $sources[$label] = self::unescapeTemplateLiteral((string) file_get_contents($path));
-        }
-
-        return $sources;
-    }
-
-    /**
-     * Resolve TypeScript template-literal escapes to the characters they denote.
-     *
-     * Processes left to right, so `\\` collapses to `\` and \` collapses to a
-     * backtick without either interfering with the other.
-     */
-    public static function unescapeTemplateLiteral(string $text): string
-    {
-        return (string) preg_replace('/\\\\(.)/s', '$1', $text);
     }
 
     /**
@@ -310,7 +331,7 @@ final class DocumentedSymbols
      * Is this member name an enum case rather than a static method?
      *
      * Convention decides it: cases are PascalCase (`FailureReason::Validation`),
-     * methods are camelCase (`FailureReason::retryable()`). Trailing parens
+     * methods are camelCase (`FailureReason::isRetryable()`). Trailing parens
      * cannot decide it — docs write `` `UploadStatus::Pending` (queued) ``, where
      * the paren opens a parenthetical, not an argument list.
      */
@@ -320,7 +341,8 @@ final class DocumentedSymbols
     }
 
     /**
-     * Short enum name => FQCN, for enums this package declares.
+     * Short enum name => FQCN, for enums this package and the SDK declare (the
+     * wrapper's wins a shared short name).
      *
      * @return array<string, class-string>
      */
@@ -331,6 +353,11 @@ final class DocumentedSymbols
         foreach (glob(self::packageRoot().'/src/Enums/*.php') ?: [] as $path) {
             $short = basename($path, '.php');
             $enums[$short] = 'BeeCoded\\EFactura\\Enums\\'.$short;
+        }
+
+        foreach (glob(self::sdkSourceDir().'/Enums/*.php') ?: [] as $path) {
+            $short = basename($path, '.php');
+            $enums[$short] ??= 'BeeCoded\\EFacturaSdk\\Enums\\'.$short;
         }
 
         return $enums;
@@ -513,16 +540,21 @@ final class DocumentedSymbols
      * Config paths the docs claim, normalised to be relative to config/efactura.php.
      *
      * Handles the three forms in use: `config('efactura.queue')`, a backticked
-     * `efactura.jobs.max_staleness_seconds`, and a backticked bare
-     * `jobs.max_staleness_seconds`. The bare form is only accepted when its
-     * first segment is a real top-level group, so ordinary dotted prose does
-     * not masquerade as a config key.
+     * `efactura.features.upload_invoices`, and a backticked bare
+     * `features.upload_invoices`. The bare form is only accepted when its
+     * first segment is a real top-level group, or the first segment of a config
+     * path CHANGELOG.md records as removed, so ordinary dotted prose does not
+     * masquerade as a config key.
      *
      * @return array<string, list<string>> label => dotted path
      */
     public static function configPaths(): array
     {
-        $groups = array_keys(self::realConfig());
+        $removedGroups = array_map(
+            fn (string $path): string => explode('.', $path)[0],
+            self::DOCUMENTED_AS_REMOVED['config'],
+        );
+        $groups = array_values(array_unique([...array_keys(self::realConfig()), ...$removedGroups]));
         $groupAlternation = implode('|', array_map('preg_quote', $groups));
         $found = [];
 
@@ -537,7 +569,7 @@ final class DocumentedSymbols
             preg_match_all('/`efactura\.([A-Za-z0-9_.]+)`/', $text, $m);
             $paths = array_merge($paths, $m[1]);
 
-            // `jobs.x` in backticks — only for real top-level groups.
+            // `features.x` in backticks — only for real top-level groups (or removed ones).
             if ($groupAlternation !== '') {
                 preg_match_all("/`(({$groupAlternation})\.[A-Za-z0-9_.]+)`/", $text, $m);
                 $paths = array_merge($paths, $m[1]);
@@ -656,7 +688,7 @@ final class DocumentedSymbols
                 $refs[] = ['job' => $job, 'cadence' => $method, 'ref' => $whole];
             }
 
-            preg_match_all("/^\\|\\s*`({$jobs})`\\s*\\|.*?\\b(Every \\d+ (?:minutes?|hours?)|Every hour|Hourly|Daily)\\b/mi", $text, $rows, PREG_SET_ORDER);
+            preg_match_all("/^\\|\\s*`({$jobs})`\\s*\\|.*?\\b(Every \\d+ (?:minutes?|hours?)|Every minute|Every hour|Hourly|Daily)\\b/mi", $text, $rows, PREG_SET_ORDER);
             foreach ($rows as [$whole, $job, $wording]) {
                 $refs[] = ['job' => $job, 'cadence' => $methods[$wording] ?? $wording, 'ref' => $whole];
             }

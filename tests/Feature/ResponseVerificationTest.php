@@ -42,9 +42,10 @@ it('stores a response archive with how it was checked, and keeps a mismatching o
     app(DownloadService::class)->downloadResponse($upload);
 
     $upload->refresh();
+    // response_attempts counts tries made: this one.
     expect($upload->response_verification)->toBe($expected)
         ->and($upload->response_path)->not->toBeNull()
-        ->and($upload->response_attempts)->toBe(0);
+        ->and($upload->response_attempts)->toBe(1);
 })->with([
     'accepted, same invoice' => [UploadStatus::Completed, 'efactura-test/INV-1.xml', ['1.xml' => VERIFY_INVOICE, 'semnatura_1.xml' => VERIFY_SIGNATURE], ResponseVerification::Verified],
     'accepted, another invoice' => [UploadStatus::Completed, 'efactura-test/INV-1.xml', ['1.xml' => str_replace('INV-1', 'INV-2', VERIFY_INVOICE)], ResponseVerification::Mismatch],
@@ -64,12 +65,12 @@ it('checks only the limits when the uploaded XML is gone from a disk that throws
     app(DownloadService::class)->downloadResponse($upload);
 
     $upload->refresh();
-    expect([$upload->response_verification, $upload->response_attempts])->toBe([ResponseVerification::LimitsOnly, 0])
+    expect([$upload->response_verification, $upload->response_attempts])->toBe([ResponseVerification::LimitsOnly, 1])
         ->and($upload->response_path)->not->toBeNull();
 });
 
 /** A non-throwing disk (S3's default) answers null for a stored file it cannot read right now. */
-it('retries uncounted, instead of checking only the limits, when the stored XML cannot be read', function () {
+it('retries without recording a failure, instead of checking only the limits, when the stored XML cannot be read', function () {
     $disk = Mockery::mock(Storage::disk('local'))->makePartial();
     $disk->shouldReceive('get')->with('efactura-test/INV-1.xml')->andReturn(null);
     Storage::set('local', $disk);
@@ -79,10 +80,10 @@ it('retries uncounted, instead of checking only the limits, when the stored XML 
     app(DownloadService::class)->downloadResponse($upload);
 
     $upload->refresh();
-    expect([$upload->response_verification, $upload->response_path, $upload->response_attempts])->toBe([null, null, 0]);
+    expect([$upload->response_verification, $upload->response_path, $upload->response_failed_at])->toBe([null, null, null]);
 });
 
-it('counts an archive outside the limits but not a local temp-file failure', function () {
+it('records an archive outside the limits as failed, but not a local temp-file failure', function () {
     // Starts with "PK", so it passes the SDK's download guard, but is no ZIP.
     Http::fake([VERIFY_DOWNLOAD_URL => Http::response("PK\x03\x04not a zip", 200, ['Content-Type' => 'application/zip'])]);
     $unopenable = ($this->upload)(UploadStatus::Completed);
@@ -93,11 +94,13 @@ it('counts an archive outside the limits but not a local temp-file failure', fun
     $local = ($this->upload)(UploadStatus::Completed);
     app(DownloadService::class)->downloadResponse($local);
 
+    // Both tries were made; only ANAF's archive is recorded as failed.
     expect([$unopenable->fresh()->response_attempts, $unopenable->fresh()->response_path])->toBe([1, null])
-        ->and([$local->fresh()->response_attempts, $local->fresh()->response_path])->toBe([0, null]);
+        ->and($unopenable->fresh()->response_failed_at)->not->toBeNull()
+        ->and([$local->fresh()->response_attempts, $local->fresh()->response_path, $local->fresh()->response_failed_at])->toBe([1, null, null]);
 });
 
-it('counts a received archive outside the limits but not a local temp-file failure, and stores neither', function () {
+it('stores neither a received archive outside the limits nor one it could not check', function () {
     Event::fake([InvoiceReceived::class]);
     Http::fake([VERIFY_DOWNLOAD_URL => Http::response("PK\x03\x04not a zip", 200, ['Content-Type' => 'application/zip'])]);
     $received = fn (string $id) => EfacturaMessage::create([
@@ -116,6 +119,6 @@ it('counts a received archive outside the limits but not a local temp-file failu
     app(DownloadService::class)->downloadMessage($local);
 
     expect([$unopenable->fresh()->download_attempts, $unopenable->fresh()->is_downloaded, $unopenable->fresh()->xml_path])->toBe([1, false, null])
-        ->and([$local->fresh()->download_attempts, $local->fresh()->is_downloaded])->toBe([0, false]);
+        ->and([$local->fresh()->download_attempts, $local->fresh()->is_downloaded, $local->fresh()->xml_path])->toBe([1, false, null]);
     Event::assertNotDispatched(InvoiceReceived::class);
 });
