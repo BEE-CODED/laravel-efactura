@@ -72,8 +72,22 @@ jobs:
     # on sqlite and run here against a real Postgres — this is the only job that
     # actually exercises queueFor()'s savepoint recovery inside a caller's
     # transaction. Without it that fix would be shipped unverified.
-    name: Postgres (transaction poisoning)
+    name: Postgres (transaction poisoning) / PHP ${{ matrix.php }} / Laravel ${{ matrix.laravel }}
     runs-on: ubuntu-latest
+
+    # Each DB job runs both supported Laravel versions; the PHP versions are crossed so the
+    # consumers' real stacks run once each (Laravel 13 + PHP 8.5 + PostgreSQL here).
+    strategy:
+      fail-fast: false
+      matrix:
+        laravel: ['12.*', '13.*']
+        include:
+          - laravel: '12.*'
+            testbench: '10.*'
+            php: '8.4'
+          - laravel: '13.*'
+            testbench: '11.*'
+            php: '8.5'
 
     services:
       postgres:
@@ -102,15 +116,24 @@ jobs:
       - uses: actions/checkout@v5
       - uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.4'
+          php-version: ${{ matrix.php }}
           extensions: dom, curl, libxml, mbstring, zip, pdo_pgsql, pgsql
           coverage: none
-      - run: composer update --prefer-dist --no-interaction
+      - name: Install dependencies
+        run: |
+          composer config --global policy.advisories.block false
+          composer require "laravel/framework:${{ matrix.laravel }}" "orchestra/testbench:${{ matrix.testbench }}" --no-interaction --no-update
+          composer update --prefer-dist --no-interaction
       # Fail loudly if the race tests are skipped here — this job exists solely to
       # run them, so a skip means Postgres is not actually wired up.
       - name: Race tests must run (not skip) on Postgres
         run: |
           vendor/bin/pest --filter="create/constraint race" --log-junit junit.xml
+          # A filter that matches nothing leaves no <skipped> to catch, so also require tests ran.
+          if ! grep -qE '<testsuite[^>]* tests="[1-9]' junit.xml; then
+            echo "::error::The create/constraint race filter matched no tests."
+            exit 1
+          fi
           if grep -q '<skipped' junit.xml; then
             echo "::error::The create/constraint race tests skipped on the Postgres job — the DB is not wired up."
             exit 1
@@ -122,8 +145,21 @@ jobs:
     # Hosts run MariaDB/MySQL too. REPEATABLE READ cannot see a race winner committed after the
     # caller's snapshot, so the create/constraint race tests skip here (see the README's
     # queueUpload() note); everything else, including migration 000008's data move, runs.
-    name: MariaDB
+    name: MariaDB / PHP ${{ matrix.php }} / Laravel ${{ matrix.laravel }}
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        laravel: ['12.*', '13.*']
+        include:
+          # A consumer's production stack: MariaDB + Laravel 12 + PHP 8.5.
+          - laravel: '12.*'
+            testbench: '10.*'
+            php: '8.5'
+          - laravel: '13.*'
+            testbench: '11.*'
+            php: '8.4'
 
     services:
       mariadb:
@@ -151,10 +187,14 @@ jobs:
       - uses: actions/checkout@v5
       - uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.4'
+          php-version: ${{ matrix.php }}
           extensions: dom, curl, libxml, mbstring, zip, pdo_mysql
           coverage: none
-      - run: composer update --prefer-dist --no-interaction
+      - name: Install dependencies
+        run: |
+          composer config --global policy.advisories.block false
+          composer require "laravel/framework:${{ matrix.laravel }}" "orchestra/testbench:${{ matrix.testbench }}" --no-interaction --no-update
+          composer update --prefer-dist --no-interaction
       - name: Full suite on MariaDB
         run: vendor/bin/pest
 
@@ -164,8 +204,21 @@ jobs:
     # broke only on Redis (an is_int() check never matched), so the array-store jobs above
     # could not catch it. sqlite :memory: as in the main tests job; tests/TestCase.php gives
     # each test its own cache prefix on a non-array store.
-    name: Redis cache
+    name: Redis cache / PHP ${{ matrix.php }} / Laravel ${{ matrix.laravel }}
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        laravel: ['12.*', '13.*']
+        include:
+          # Same consumer stack as the MariaDB Laravel 12 row: phpredis + Laravel 12 + PHP 8.5.
+          - laravel: '12.*'
+            testbench: '10.*'
+            php: '8.5'
+          - laravel: '13.*'
+            testbench: '11.*'
+            php: '8.4'
 
     services:
       redis:
@@ -189,10 +242,14 @@ jobs:
       - uses: actions/checkout@v5
       - uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.4'
+          php-version: ${{ matrix.php }}
           extensions: dom, curl, libxml, mbstring, zip, sqlite3, pdo_sqlite, redis
           coverage: none
-      - run: composer update --prefer-dist --no-interaction
+      - name: Install dependencies
+        run: |
+          composer config --global policy.advisories.block false
+          composer require "laravel/framework:${{ matrix.laravel }}" "orchestra/testbench:${{ matrix.testbench }}" --no-interaction --no-update
+          composer update --prefer-dist --no-interaction
       - name: Full suite on the Redis cache store
         run: vendor/bin/pest
 

@@ -6,9 +6,104 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Entries start at 4.0.0. To
 upgrade from 2.x, follow the v3.1.1 README first.
 
-## [4.0.0] - Unreleased
+## [4.0.0] - 2026-11-18
 
 Every behaviour change since 3.1.1.
+
+### Upgrading from 3.1.1
+
+Follow the steps in order. Each step names the section that has the details.
+
+1. Check every host that runs the app: PHP 8.4 or later with `ext-dom` and `ext-zip`, and Laravel
+   12.27.1 or later, or Laravel 13. See the README's [Requirements](README.md#requirements).
+2. On every production host, set `EFACTURA_SANDBOX=false` (or `0`). In 4.0 a blank or `null` value
+   selects the ANAF sandbox; in 3.x it selected production (SDK CHANGELOG, "Fixed: blank env values
+   keep the safe default").
+3. If `EFACTURA_STORAGE_DISK` is present but blank, set it to the disk your e-Factura files are on
+   (your `FILESYSTEM_DISK`). In 4.0 a blank value means `local` (Breaking, "Before upgrading, check
+   `EFACTURA_STORAGE_DISK`").
+4. Run the token query in Breaking, "Before upgrading, check `efactura_tokens.cui`", and note the rows
+   it returns. Fix them in step 15, not earlier: 3.x finds a token only by its stored spelling, so a
+   row fixed while 3.x runs stops matching the CUI your code passes.
+5. Check every CUI your own code passes to the package (for example to `getToken()`, a scheduled
+   job's `$cui` or a command's `--cui`). In 4.0 a CUI with a leading zero, `''`, `'0'` or `'RO'` is
+   refused or fails the job; spaces and an `RO` prefix are still accepted. Correct those CUIs in
+   step 15.
+6. List the uploads that migration `000008` sends again:
+
+   ```sql
+   SELECT id, uploadable_type, uploadable_id, failure_reason, processed_at
+   FROM efactura_uploads
+   WHERE status = 'failed' AND failure_reason IN ('rate_limited', 'transient');
+   ```
+
+   A row with `processed_at` within 7 days of the migration goes back to `pending` and is sent; an
+   older row becomes `abandoned` (Added, migration `000008`). Check the recent rows against SPV and
+   your own records, and note each one that was filed by hand or whose document was cancelled.
+7. Change your requirement to `bee-coded/laravel-efactura` `^4.0`, and to
+   `bee-coded/laravel-efactura-sdk` `^4.0` if you require the SDK directly. On a development machine,
+   run `composer update bee-coded/laravel-efactura bee-coded/laravel-efactura-sdk` (or
+   `composer update bee-coded/laravel-efactura -W`) and commit `composer.lock`: updating the wrapper
+   alone cannot resolve while the lock holds SDK 3.x.
+8. In the same branch, remove `RetryRateLimitedUploads` from your schedule (the class is gone, see
+   Removed) and run `ProcessPendingUploads` every minute. The README's
+   [Recommended schedule](README.md#recommended-schedule) lists the cadence of every job.
+9. If you published `config/efactura.php`, set `routes.middleware` to `['web', 'auth']`: a published
+   config keeps `['web']`. Add your own check that the user may act for the CUI (Breaking, the
+   `routes.middleware` entry). A check placed in `routes.middleware` also runs on
+   `efactura/callback` with a null CUI and must allow a null CUI; otherwise put the check on the
+   `efactura/auth/{cui}` route only. Delete the published config's `rate_limit` and `jobs` blocks, which
+   4.0 ignores (Removed).
+10. In the same branch, update your calls to every API listed in Breaking, including the builder
+    input SDK 4.0 refuses, and run your tests against 4.0.
+11. Start the maintenance window: pause the scheduler on every host that runs `schedule:run`. Keep
+    the 3.x workers running.
+12. Let the 3.x workers drain the queue the package jobs use: run
+    `php artisan queue:monitor <connection>:<queue>` (for example `redis:efactura`) until it reports
+    0. Never flush the queue instead: a 3.x `ProcessSingleUpload` that survives into 4.0 fails, and a
+    flushed 3.x batch job leaves its unique lock behind, which blocks the 4.0 job with the same key
+    for up to an hour.
+13. Run `php artisan down` on every web host, because 4.0 code reads the columns step 17 adds. A
+    worker takes no jobs in maintenance mode unless it runs with `--force`: if `queue:monitor` now
+    shows a job your web code queued after step 12, drain it with a 3.x `queue:work --force`, then
+    stop the 3.x workers.
+14. Run the step 6 query again, because 3.x workers changed these rows until the drain. Mark each
+    upload that must not be sent again as `abandoned`; migration `000008` leaves an `abandoned` row as
+    it is:
+
+    ```sql
+    UPDATE efactura_uploads SET failure_reason = 'abandoned'
+    WHERE id IN (...) AND status = 'failed' AND failure_reason IN ('rate_limited', 'transient');
+    ```
+
+15. Fix the token rows from step 4 and your own CUIs from step 5, as Breaking, "Before upgrading,
+    check `efactura_tokens.cui`", describes.
+16. Before you deploy, check the `retry_after` of the queue connection the package jobs use on every
+    host: it must be above the jobs' 120-second timeout (Laravel's default of 90 is not), and
+    `retry_after` plus the time a job waits in the queue must stay under about 240 seconds, because
+    of the 300-second dispatch lease (README, [Requirements](README.md#requirements)). Keep
+    `APP_TIMEZONE` unchanged in this deploy: migration `000009` converts the stored token expiry
+    times with it (Added). Change `APP_TIMEZONE`, if at all, in a later release. Then deploy the
+    branch to every host: code, `composer.lock` (installed with `composer install`), schedule,
+    config (including any `retry_after` change) and caller changes together. Keep every host in
+    maintenance mode, and do not start workers or the scheduler.
+17. Run `php artisan migrate --force` once. The package loads migrations `000008` to `000011` itself,
+    also when you published the older ones (Added).
+18. Run `php artisan up`, then start the 4.0 workers, then re-enable the scheduler.
+19. Expect a burst of ANAF reads on the first runs: every `processing` upload is due for a status
+    read at once (`next_poll_at` is null), and a 3.x response that stopped after 3 download attempts
+    and was processed within the last 60 days is downloaded again and fires `InvoiceProcessed`
+    (Breaking, the download-retry entry). Rate-limit warnings during this burst are not an upgrade
+    failure.
+20. Check `failed_jobs` and the log. A 3.x `ProcessSingleUpload` in `failed_jobs` survived the drain;
+    an error naming `RetryRateLimitedUploads` means the old schedule line is still deployed;
+    `EFactura: no usable token for CUI` names a company whose token is unknown, deactivated, paused or
+    not stored under a canonical CUI.
+21. Run `php artisan efactura:reconcile`: migration `000008` moved 3.x `failed` rows with `validation`
+    or no `failure_reason` that have an upload index but no download id to `indeterminate`. Resolve
+    each one after checking SPV, as the README's
+    [Reconciliation (indeterminate uploads)](README.md#reconciliation-indeterminate-uploads)
+    describes.
 
 ### Breaking
 
@@ -37,14 +132,16 @@ Every behaviour change since 3.1.1.
   deleted with it. Do not re-authorise such a company (`efactura:auth` or the `efactura/auth` route)
   before its row is fixed: that stores a second, canonical row, which syncs ANAF's messages again
   and fires `InvoiceReceived` again for invoices the old row already received, while the old row's
-  uploads stay pending.
+  uploads stay pending. Fix the rows during the maintenance window, at step 15 of "Upgrading from
+  3.1.1".
 - **Before upgrading, check `EFACTURA_STORAGE_DISK`.** A blank value now means `local` (see Fixed).
   If yours is blank, set it to the disk your files are on (your `FILESYSTEM_DISK`) before upgrading,
   or copy them to `local` under the same paths: otherwise response verification for those uploads
   falls back to limits-only and their cleanup deletes nothing.
 - **Stop 3.x queue workers before running the migrations, and drain the jobs they queued.** Start
   the 4.0 workers after `php artisan migrate`. Migration `000008` changes 3.x rows a 3.x worker can
-  still write (see Added), and the 4.0 jobs take different constructor arguments.
+  still write (see Added), and the 4.0 jobs take different constructor arguments. Drain with the 3.x
+  workers still running, then stop them: steps 11 to 18 of "Upgrading from 3.1.1".
 - **Schedule `ProcessPendingUploads` every minute and remove `RetryRateLimitedUploads` from your
   schedule.** The upload row owns its retry schedule: an upload that hit a rate limit, or failed
   before it was sent, waits in `pending` with `failure_reason` `rate_limited` or `transient` until its
@@ -728,3 +825,5 @@ Every behaviour change since 3.1.1.
   or non-integer `EFACTURA_ANAF_LOOKUP_RETRY_ATTEMPTS` means 5. A blank disk used to store files on
   the host's default disk, a blank prefix mounted the OAuth routes at the site root, a `null` redirect
   reported a stored authorization as failed, and a blank retry count turned lookup retries off.
+
+[4.0.0]: https://github.com/BEE-CODED/laravel-efactura/compare/v3.1.1...v4.0.0
