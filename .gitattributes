@@ -1,0 +1,20 @@
+* text=auto eol=lf
+
+# Maintainer-only files: left out of release archives (composer --prefer-dist).
+/.github export-ignore
+/.claude export-ignore
+/docs export-ignore
+/tests export-ignore
+/coverage export-ignore
+/CLAUDE.md export-ignore
+/phpunit.xml export-ignore
+/phpunit.xml.dist export-ignore
+/phpstan.neon export-ignore
+/pint.json export-ignore
+/.gitignore export-ignore
+/.gitattributes export-ignore
+/mcp/src export-ignore
+/mcp/tests export-ignore
+/mcp/tsconfig.json export-ignore
+/mcp/tsup.config.ts export-ignore
+/mcp/package-lock.json export-ignore

@@ -47,7 +47,7 @@ class ProcessSingleUpload implements ShouldQueue
         public EfacturaUpload $upload,
         public ?string $lease = null,
     ) {
-        $this->onQueue(config('efactura.queue'));
+        $this->onConnection(config('efactura.connection') ?: null)->onQueue(config('efactura.queue'));
     }
 
     public function handle(UploadService $uploadService): void

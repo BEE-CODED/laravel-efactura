@@ -63,7 +63,7 @@ class SweepStaleUploads implements ShouldBeUniqueUntilProcessing, ShouldQueue
 
     public function __construct()
     {
-        $this->onQueue(config('efactura.queue'));
+        $this->onConnection(config('efactura.connection') ?: null)->onQueue(config('efactura.queue'));
     }
 
     public function handle(UploadService $uploadService): void

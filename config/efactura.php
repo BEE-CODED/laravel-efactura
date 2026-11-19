@@ -57,8 +57,16 @@ return [
     | Specify which queue the e-Factura jobs should be dispatched to.
     | Set to null to use the default queue.
     |
+    | connection: the queue connection every job the package dispatches goes
+    | on. Null or blank means the app's default connection. Its retry_after
+    | must be above the jobs' 120-second timeout, and retry_after plus the
+    | time a job waits in the queue must stay under about 240 seconds (see
+    | the README's Requirements). Set it when your default connection's
+    | retry_after is larger, for example to a connection with 180.
+    |
     */
     'queue' => env('EFACTURA_QUEUE', null),
+    'connection' => env('EFACTURA_QUEUE_CONNECTION'),
 
     /*
     |--------------------------------------------------------------------------

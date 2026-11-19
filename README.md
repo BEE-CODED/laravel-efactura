@@ -19,18 +19,20 @@ From 2.x, follow the v3.1.1 README first.
 ## Requirements
 
 - PHP 8.4+
-- Laravel 12 (laravel/framework 12.27.1 or later, required by the SDK) or Laravel 13
-- `bee-coded/laravel-efactura-sdk` ^4.0 (installed automatically)
+- Laravel 12 (laravel/framework 12.27.1 or later) or Laravel 13
+- `bee-coded/laravel-efactura-sdk` ^4.0.1 (installed automatically)
 - ANAF SPV OAuth credentials
 - A database: SQLite, PostgreSQL or MariaDB (all tested in CI). MySQL 8 is expected to work but is
   not tested in CI.
 - A stable, backed-up `APP_KEY` — it encrypts the stored ANAF credentials
 - A shared, persistent cache store (redis, memcached, database — **not `array`**), for the OAuth
   state and token-refresh locks
-- A running queue worker on `config('efactura.queue')` — uploads are dispatched, not inline.
+- A running queue worker on `config('efactura.queue')`, on the connection `config('efactura.connection')`
+  names (the app's default connection when it is not set) — uploads are dispatched, not inline.
   Without a queue worker, schedule `php artisan efactura:upload --sync` every minute instead: it
   sends each company's due uploads inline, and a later run sends an upload that is waiting for a
-  retry once it is due. On `QUEUE_CONNECTION=sync` a batch job without a CUI runs its per-company
+  retry once it is due. When the package's connection (`EFACTURA_QUEUE_CONNECTION`, else
+  `QUEUE_CONNECTION`) is `sync`, a batch job without a CUI runs its per-company
   jobs inline, inside itself, so one company's exception propagates through it and stops that run
   for the remaining companies. On a real queue connection with no worker, a scheduled
   `$schedule->job(...)` is only queued, so schedule the rest of the work inline too:
@@ -47,7 +49,14 @@ From 2.x, follow the v3.1.1 README first.
   dispatch lease ends and the next `ProcessPendingUploads` run leases the upload again. Past 300
   seconds in the queue, an upload job finds its upload leased again by a later dispatch and does
   nothing, so behind a queue that keeps waiting that long no upload is sent: give the package's
-  jobs their own queue (`EFACTURA_QUEUE`).
+  jobs their own queue (`EFACTURA_QUEUE`). If your default connection's `retry_after` is larger
+  (for example 1020 for long-running jobs of your own), set `EFACTURA_QUEUE_CONNECTION` to a
+  connection whose `retry_after` is about 180 (available from 4.1.0): every job the package
+  dispatches then goes on that connection, and your own jobs keep the default one. A job's
+  reservation time comes from the connection whose worker takes it, and two connections on the same
+  Redis database or jobs table share a queue of the same name. So give the package jobs a queue no
+  worker of another connection reads (`EFACTURA_QUEUE`, for example `efactura`), and run only
+  workers of the package's connection on it.
 
 ## Installation
 
@@ -88,6 +97,8 @@ EFACTURA_STORAGE_PATH=efactura
 
 # Queue (null = default queue)
 EFACTURA_QUEUE=null
+# Queue connection for every package job (null = the app's default connection)
+EFACTURA_QUEUE_CONNECTION=null
 
 # Routes
 EFACTURA_ROUTES_ENABLED=true
@@ -107,7 +118,8 @@ The configuration file (`config/efactura.php`) allows you to:
 - Use tokens, OAuth and the raw client only (`pipeline_tables` false): only the token migrations
   are loaded and published, and the upload/message services, jobs and commands throw
   `PipelineTablesDisabledException`
-- Choose the queue e-Factura jobs are dispatched to
+- Choose the queue e-Factura jobs are dispatched to (`queue`) and the queue connection they go on
+  (`connection`)
 - Configure file storage for XML and ZIP files (`storage.disk`, `storage.path`)
 - Set the company-lookup retries (`anaf_lookup.retry_attempts`)
 - Customize OAuth callback routes
@@ -877,6 +889,7 @@ Jobs are dispatched to the queue specified in `config/efactura.php`:
 
 ```php
 'queue' => env('EFACTURA_QUEUE', null), // null = default queue
+'connection' => env('EFACTURA_QUEUE_CONNECTION'), // null = the app's default connection
 ```
 
 Set `EFACTURA_QUEUE=efactura` in your `.env` to use a dedicated queue. This allows you to run a separate worker for e-Factura jobs:
@@ -884,6 +897,23 @@ Set `EFACTURA_QUEUE=efactura` in your `.env` to use a dedicated queue. This allo
 ```bash
 php artisan queue:work --queue=efactura
 ```
+
+`connection` (from 4.1.0) puts every job the package dispatches on that queue connection: the
+scheduled batch jobs, the per-company jobs they dispatch, `ProcessSingleUpload` and
+`CheckSingleUploadStatus`. A null or blank value keeps the app's default connection. A
+`connection:` you pass to `$schedule->job()` and a `dispatchSync()` still win. Set it when your
+default connection's `retry_after` does not fit the package jobs (see
+[Requirements](#requirements)): define a connection with `retry_after` about 180, for example a copy
+of your `redis` connection, set `EFACTURA_QUEUE_CONNECTION` to its name and run a worker on it:
+
+```bash
+php artisan queue:work efactura-redis --queue=efactura
+```
+
+Keep that queue for the package: a worker of another connection reading the same queue name on the
+same Redis database or jobs table would take the package jobs with its own `retry_after`. With
+Horizon, add a supervisor whose `connection` is the package's connection and whose `queue` is
+`EFACTURA_QUEUE`, and leave that queue out of your other supervisors.
 
 ### Rate Limit Configuration
 
@@ -894,11 +924,14 @@ hits a global limit or ANAF's 429 stops for that company until its next run.
 
 ### Queue Worker
 
-Ensure your queue worker is running (a real connection such as `redis` or `database`; for
-`QUEUE_CONNECTION=sync` see [Requirements](#requirements)):
+Ensure a queue worker runs on the package's connection and queue (a real connection such as
+`redis` or `database`; for a `sync` connection see [Requirements](#requirements)). The connection is
+`EFACTURA_QUEUE_CONNECTION`, else your default one; the queue is `EFACTURA_QUEUE`, else the
+connection's default queue (see [Queue Configuration](#queue-configuration)):
 
 ```bash
-php artisan queue:work
+php artisan queue:work            # default connection and queue
+php artisan queue:work efactura-redis --queue=efactura   # with both set
 ```
 
 ### Known limitations
@@ -907,7 +940,9 @@ php artisan queue:work
   has the job's 120-second timeout for all its pages. At roughly 2–3 seconds a page (one ANAF call
   and 500 row writes) that is about 40 pages, some 20,000 messages in 60 days. A CUI with more times
   out every run and its later pages are never synced. The timeout is not raised, because your queue
-  connection's `retry_after` must stay above it (see [Requirements](#requirements)).
+  connection's `retry_after` must stay above it and, with the time a job waits in the queue, under
+  about 240 seconds (see [Requirements](#requirements)). If your default connection's `retry_after`
+  is larger, set `EFACTURA_QUEUE_CONNECTION` to a connection whose `retry_after` is about 180.
 - **Read batch capacity.** A status or download run reads at most 500 rows per company and starts no
   new read after 90 seconds; the rest lead the next run. One slow read can still run past the job's
   120-second timeout.
@@ -1281,7 +1316,8 @@ Rows with `failure_reason = indeterminate` are never retried — resolve them wi
 ### Nothing Uploads, But Nothing Errors
 
 `efactura:upload` and every batch job only *dispatch* work. Confirm a queue worker is running on
-`config('efactura.queue')`, or use `php artisan efactura:upload --sync`. A company whose grant is
+`config('efactura.queue')` of the connection `config('efactura.connection')` names (the default
+connection when it is not set), or use `php artisan efactura:upload --sync`. A company whose grant is
 paused, deactivated or stored under a non-canonical CUI is skipped: its uploads wait in `pending`,
 and a job run for that CUI logs `EFactura: no usable token for CUI`.
 

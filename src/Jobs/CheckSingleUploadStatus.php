@@ -38,7 +38,7 @@ class CheckSingleUploadStatus implements ShouldQueue
     public function __construct(
         public EfacturaUpload $upload,
     ) {
-        $this->onQueue(config('efactura.queue'));
+        $this->onConnection(config('efactura.connection') ?: null)->onQueue(config('efactura.queue'));
     }
 
     public function handle(DownloadService $downloadService): void

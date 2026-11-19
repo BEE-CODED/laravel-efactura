@@ -60,7 +60,7 @@ abstract class CompanyBatchJob implements ShouldBeUniqueUntilProcessing, ShouldQ
     {
         // Never throws: the scheduler builds its jobs on every artisan boot. An invalid CUI fails when the job runs.
         $this->cui = $cui === null ? null : (VatNumberValidator::canonical($cui) ?? $cui);
-        $this->onQueue(config('efactura.queue'));
+        $this->onConnection(config('efactura.connection') ?: null)->onQueue(config('efactura.queue'));
     }
 
     /**

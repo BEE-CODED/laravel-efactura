@@ -21023,7 +21023,7 @@ function section(slug) {
   if (found) return text(found.text);
   return text(`Unknown topic "${slug}". Valid topics: changelog, ${sections.map((s) => s.slug).join(", ")}`, true);
 }
-var server = new McpServer({ name: "efactura", version: "1.0.0" });
+var server = new McpServer({ name: "efactura", version: "4.1.0" });
 server.registerTool(
   "get-wrapper-docs",
   {

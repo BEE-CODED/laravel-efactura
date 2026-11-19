@@ -51,7 +51,7 @@ function section(slug: string) {
   return text(`Unknown topic "${slug}". Valid topics: changelog, ${sections.map((s) => s.slug).join(", ")}`, true);
 }
 
-const server = new McpServer({ name: "efactura", version: "1.0.0" });
+const server = new McpServer({ name: "efactura", version: "4.1.0" });
 
 server.registerTool(
   "get-wrapper-docs",

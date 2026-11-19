@@ -254,8 +254,19 @@ jobs:
         run: vendor/bin/pest
 
   static-analysis:
-    name: PHPStan
+    # Analysed against both supported Laravel versions: a framework API that differs between
+    # them would otherwise pass here and break only on the version not installed.
+    name: PHPStan / Laravel ${{ matrix.laravel }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        laravel: ['12.*', '13.*']
+        include:
+          - laravel: '12.*'
+            testbench: '10.*'
+          - laravel: '13.*'
+            testbench: '11.*'
     steps:
       - uses: actions/checkout@v5
       - uses: shivammathur/setup-php@v2
@@ -263,7 +274,10 @@ jobs:
           php-version: '8.4'
           extensions: dom, curl, libxml, mbstring, zip, sqlite3, pdo_sqlite
           coverage: none
-      - run: composer update --prefer-dist --no-interaction
+      - name: Install dependencies
+        run: |
+          composer require "laravel/framework:${{ matrix.laravel }}" "orchestra/testbench:${{ matrix.testbench }}" --no-interaction --no-update
+          composer update --prefer-dist --no-interaction
       # Keep this honest: an ignoreErrors entry is exactly how the message-sync
       # bug (reading a property the SDK never declared) stayed hidden.
       - run: vendor/bin/phpstan analyse --no-progress

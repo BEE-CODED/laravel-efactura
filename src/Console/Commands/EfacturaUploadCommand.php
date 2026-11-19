@@ -92,8 +92,11 @@ class EfacturaUploadCommand extends Command
         $this->info("Queued {$count} pending upload(s) for processing.");
 
         if ($count > 0) {
+            $connection = config('efactura.connection') ?: null;
+
             $this->comment('Ensure a queue worker is running on the "'
-                .(config('efactura.queue') ?: config('queue.connections.'.config('queue.default').'.queue', 'default')).'" queue.');
+                .(config('efactura.queue') ?: config('queue.connections.'.($connection ?? config('queue.default')).'.queue', 'default')).'" queue'
+                .($connection === null ? '.' : ' of the "'.$connection.'" connection.'));
         }
 
         return self::SUCCESS;

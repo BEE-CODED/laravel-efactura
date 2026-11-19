@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Entries start at 4.0.0. To
 upgrade from 2.x, follow the v3.1.1 README first.
 
+## [4.1.0] - 2026-11-19
+
+### Added
+
+- `efactura.connection` (`EFACTURA_QUEUE_CONNECTION`): the queue connection every job the package
+  dispatches goes on — the scheduled batch jobs, the per-company jobs they dispatch,
+  `ProcessSingleUpload` and `CheckSingleUploadStatus`. Before, these jobs always ran on the app's
+  default connection, so an app whose default connection has a large `retry_after` (for example
+  1020 for its own long jobs) could not give them the `retry_after` they need: above their
+  120-second timeout, and with the time a job waits in the queue, under about 240 seconds (README,
+  [Requirements](README.md#requirements)). Set it to a connection whose `retry_after` is about 180,
+  and give the package jobs a queue (`EFACTURA_QUEUE`) that no worker of another connection reads on
+  the same Redis database or jobs table: the worker that takes a job applies its own connection's
+  `retry_after`. Null or blank keeps the app's default connection, as before. A `connection:` passed to
+  `$schedule->job()` and a `dispatchSync()` still win. `efactura:upload` names the connection in its
+  queue-worker hint when one is set.
+
+### Changed
+
+- Requires `bee-coded/laravel-efactura-sdk` ^4.0.1, which accepts brick/math 0.20 and 1.x, so
+  `composer require bee-coded/laravel-efactura` installs in a fresh Laravel 13 application (which
+  locks brick/math 1.0) without `-W`.
+- `composer.json` declares `laravel/framework` `^12.27.1|^13.0`. 4.0.0 needed 12.27.1 too, but
+  Composer enforced it only through the SDK's brick/math range.
+- Release archives ship no maintainer files: tests, CI, static-analysis and style configs, the MCP
+  server's sources and tests and local notes are left out (`.gitattributes`). `mcp/dist` and
+  `mcp/package.json` still ship.
+- The MCP server reports its version as 4.1.0 instead of 1.0.0.
+
 ## [4.0.0] - 2026-11-18
 
 Every behaviour change since 3.1.1.
@@ -81,14 +110,20 @@ Follow the steps in order. Each step names the section that has the details.
 16. Before you deploy, check the `retry_after` of the queue connection the package jobs use on every
     host: it must be above the jobs' 120-second timeout (Laravel's default of 90 is not), and
     `retry_after` plus the time a job waits in the queue must stay under about 240 seconds, because
-    of the 300-second dispatch lease (README, [Requirements](README.md#requirements)). Keep
-    `APP_TIMEZONE` unchanged in this deploy: migration `000009` converts the stored token expiry
-    times with it (Added). Change `APP_TIMEZONE`, if at all, in a later release. Then deploy the
-    branch to every host: code, `composer.lock` (installed with `composer install`), schedule,
-    config (including any `retry_after` change) and caller changes together. Keep every host in
-    maintenance mode, and do not start workers or the scheduler.
+    of the 300-second dispatch lease (README, [Requirements](README.md#requirements)). If your
+    default connection's `retry_after` must stay larger for your own jobs, set
+    `EFACTURA_QUEUE_CONNECTION` (available from 4.1.0) to a connection whose `retry_after` is about
+    180, and run the package's workers on that connection. Keep `APP_TIMEZONE` unchanged in this
+    deploy: migration `000009` converts the stored token expiry times with it (Added). Change
+    `APP_TIMEZONE`, if at all, in a later release. Then deploy the branch to every host: code,
+    `composer.lock` (installed with `composer install`), schedule, config (including any
+    `retry_after` change) and caller changes together. Keep every host in maintenance mode, and do
+    not start workers or the scheduler.
 17. Run `php artisan migrate --force` once. The package loads migrations `000008` to `000011` itself,
-    also when you published the older ones (Added).
+    also when you published the older ones (Added). On PostgreSQL, migrations `000010`
+    (`efactura_uploads`) and `000011` (`efactura_messages`) each run in one transaction and build
+    their indexes inside it: their table is locked against writes, and also against reads, until
+    the migration finishes. The app is down in this step, so nothing waits.
 18. Run `php artisan up`, then start the 4.0 workers, then re-enable the scheduler.
 19. Expect a burst of ANAF reads on the first runs: every `processing` upload is due for a status
     read at once (`next_poll_at` is null), and a 3.x response that stopped after 3 download attempts
@@ -826,4 +861,5 @@ Follow the steps in order. Each step names the section that has the details.
   the host's default disk, a blank prefix mounted the OAuth routes at the site root, a `null` redirect
   reported a stored authorization as failed, and a blank retry count turned lookup retries off.
 
+[4.1.0]: https://github.com/BEE-CODED/laravel-efactura/compare/v4.0.0...v4.1.0
 [4.0.0]: https://github.com/BEE-CODED/laravel-efactura/compare/v3.1.1...v4.0.0

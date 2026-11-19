@@ -1,6 +1,6 @@
 {
   "name": "efactura-mcp",
-  "version": "1.0.0",
+  "version": "4.1.0",
   "description": "MCP server that reads the Laravel e-Factura wrapper README, CHANGELOG and config",
   "type": "module",
   "main": "dist/index.js",

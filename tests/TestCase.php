@@ -130,6 +130,7 @@ abstract class TestCase extends Orchestra
         $app['config']->set('efactura.storage.disk', 'local');
         $app['config']->set('efactura.storage.path', 'efactura-test');
         $app['config']->set('efactura.queue', null);
+        $app['config']->set('efactura.connection', null);
         $app['config']->set('efactura.routes.enabled', true);
         $app['config']->set('efactura.routes.prefix', 'efactura');
         $app['config']->set('efactura.routes.middleware', ['web']);
